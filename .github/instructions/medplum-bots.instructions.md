@@ -1,0 +1,15 @@
+---
+description: "Use when reviewing a platform integration with separately owned Hiive Medplum Bots or Subscriptions."
+---
+# Medplum Bot Safety
+
+- Hiive Bot implementation is owned outside this platform checkout. Do not add tenant-specific Bot deployment code here or infer that platform tests validate Hiive Bot behavior; consult the owning application repository when it is available.
+- Follow [root FHIR and security rules](../../AGENTS.md#domain-and-delivery-guidance): use FHIR **4.0.1 (R4)** resource types, elements, and datatypes, not newer specification constructs. Verify Medplum behavior against the installed SDK and available upstream references before choosing an API.
+- Define each bot's accepted input, trigger criteria, intended effects, and idempotency key. Derive the key from stable source identity and the business action, scoped to the project; include a source version only when each version should cause a distinct action. Do not generate a new key on each retry.
+- Make repeated and concurrent executions converge on the same intended state. Prefer supported atomic conditional creates and version-aware updates; a separate search followed by an unconditional create is not duplicate-safe. Re-read after a version conflict and recompute the change without overwriting unrelated updates.
+- Prevent subscription loops with narrow trigger criteria and state checks. Skip writes when the intended state already exists; do not rely solely on an in-memory flag to suppress a retriggered event.
+- Design for partial completion and ambiguous outcomes, including a successful write followed by a timeout. Track completed steps durably where needed, reconcile before retrying, and never mark the whole workflow complete before its required effects succeed.
+- Distinguish transient failures from invalid input and authorization failures. Use bounded retries with backoff for transient errors; do not blindly retry permanent failures or stale writes. Preserve actionable, sanitized failure information.
+- Treat external effects such as messages, payments, or webhooks separately from FHIR writes. Use the destination's supported idempotency mechanism or a durable deduplication/reconciliation design; do not promise exactly-once delivery or repeat an ambiguous external action blindly.
+- Use least-privilege bot access and validate input and project boundaries before acting. Never embed credentials, log tokens or patient payloads, or bypass access controls to make a workflow succeed. Obtain explicit authorization before live deployment or execution that mutates data or sends external communications.
+- Once test tooling exists, use synthetic fixtures to cover first execution, repeated and concurrent execution, self-triggered events, partial failure, timeout after a successful effect, invalid input, and unauthorized or cross-project access. Assert final state and effect counts, not just successful return values; mocks do not establish live server authorization.
