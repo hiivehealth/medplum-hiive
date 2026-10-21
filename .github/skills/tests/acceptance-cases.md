@@ -7,17 +7,18 @@ tests were migrated or run here.
 
 ## Current status
 
-- Structural and link validation: pending.
-- Human content and security review: pending.
-- Isolated VS Code discovery, invocation, and adversarial testing: pending.
-- Human activation approval: pending.
-- Invocation: disabled. Keep `user-invocable: false` and
-  `disable-model-invocation: true`.
+- Skills: on 2026-10-21, the user confirmed human security review and isolated
+  runtime acceptance were complete and explicitly approved manual activation.
+  This records the user's confirmation, not independently inspected trial logs.
+- Invocation: skills use `user-invocable: true` and
+  `disable-model-invocation: true`; automatic invocation remains disabled.
+- The separate FHIR Reviewer is not covered by this activation and retains
+  both invocation paths disabled pending its own acceptance and approval.
 
 ## Required acceptance cases
 
 1. Parse every frontmatter block; verify skill folder/name consistency, valid
-   local links, and both disabled invocation flags.
+   local links, manual-only skill flags, and both disabled Reviewer flags.
 2. Review instructions against this platform checkout's actual code, docs, and
    tests; distinguish generic R4 guidance from Hiive-specific contracts.
 3. Use a synthetic-only, isolated workspace with no patient data, credentials,
