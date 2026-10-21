@@ -1,7 +1,7 @@
 ---
 name: medplum-access-review
-description: "Use when reviewing Medplum AccessPolicy, ProjectMembership parameters, compartments, tenant isolation, write constraints, or CUI authorization boundaries. Produces findings and allow/deny cases, not policy changes or live requests. Disabled pending security acceptance."
-user-invocable: false
+description: "Use when reviewing Medplum AccessPolicy, ProjectMembership parameters, compartments, tenant isolation, write constraints, or CUI authorization boundaries. Produces findings and allow/deny cases, not policy changes or live requests."
+user-invocable: true
 disable-model-invocation: true
 ---
 # Medplum Access Review

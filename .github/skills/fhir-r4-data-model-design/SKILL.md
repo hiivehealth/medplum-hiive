@@ -1,7 +1,7 @@
 ---
 name: fhir-r4-data-model-design
-description: "Use when turning Hiive clinical or administrative requirements into an R4 resource model, relationships, lifecycle, profiles, extensions, or terminology bindings. Produces a reviewed design, not implementation or automatic document replacement. Disabled pending security acceptance."
-user-invocable: false
+description: "Use when turning Hiive clinical or administrative requirements into an R4 resource model, relationships, lifecycle, profiles, extensions, or terminology bindings. Produces a reviewed design, not implementation or automatic document replacement."
+user-invocable: true
 disable-model-invocation: true
 ---
 # FHIR R4 Data Model Design

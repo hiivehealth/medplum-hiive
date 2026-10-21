@@ -82,8 +82,10 @@ this reference does not supersede higher-priority instructions or grant approval
 
 ## Review and Activation
 
-- Definitions ship with both invocation paths disabled. Keep them disabled until
-  human security review and isolated VS Code behavior tests are complete. Review
+- Skills are enabled for manual invocation following user-confirmed completion
+  of human security review and isolated runtime acceptance on 2026-10-21.
+  Automatic invocation remains disabled; the separate Reviewer remains disabled
+  pending its own acceptance and activation approval. Review
   includes frontmatter, body, referenced assets, commands, source provenance,
   tool expansion, and changes to the existing instructions they depend on.
 - Behavioral testing uses a synthetic-only workspace without host credentials,

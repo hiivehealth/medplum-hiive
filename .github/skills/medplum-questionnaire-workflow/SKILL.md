@@ -1,7 +1,7 @@
 ---
 name: medplum-questionnaire-workflow
-description: "Use when designing or reviewing Questionnaire/QuestionnaireResponse workflows, SDC template extraction, scoring ownership, persistence, or resubmission behavior in Hiive. Report-only; no live extraction or writes. Disabled pending security acceptance."
-user-invocable: false
+description: "Use when designing or reviewing Questionnaire/QuestionnaireResponse workflows, SDC template extraction, scoring ownership, persistence, or resubmission behavior in Hiive. Report-only; no live extraction or writes."
+user-invocable: true
 disable-model-invocation: true
 ---
 # Medplum Questionnaire Workflow
