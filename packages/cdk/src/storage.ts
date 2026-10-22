@@ -72,13 +72,15 @@ export class Storage extends Construct {
 
     if (region === 'us-east-1') {
       const storageAllowedOrigins = Array.from(
-        new Set([
-          config.appDomainName,
-          `https://${config.appDomainName}`,
-          config.patientAppDomainName ? `https://${config.patientAppDomainName}` : undefined,
-          config.providerAppDomainName ? `https://${config.providerAppDomainName}` : undefined,
-          'https://ccda.medplum.com',
-        ].filter((origin): origin is string => !!origin))
+        new Set(
+          [
+            config.appDomainName,
+            `https://${config.appDomainName}`,
+            config.patientAppDomainName ? `https://${config.patientAppDomainName}` : undefined,
+            config.providerAppDomainName ? `https://${config.providerAppDomainName}` : undefined,
+            'https://ccda.medplum.com',
+          ].filter((origin): origin is string => !!origin)
+        )
       );
 
       // Public key in PEM format

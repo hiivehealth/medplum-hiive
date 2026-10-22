@@ -618,26 +618,15 @@ async function applySupervisorLoginUpsert(medplum, supervisorPolicy) {
 }
 
 async function findSupervisorAccessPolicy(medplum) {
-  const policies = await medplum.searchResources(
-    'AccessPolicy',
-    new URLSearchParams([
-      ['_count', '200'],
-    ])
-  );
+  const policies = await medplum.searchResources('AccessPolicy', new URLSearchParams([['_count', '200']]));
   return policies.find((policy) => policy.name === 'Ubix Demo Supervisor/HR Minimum Necessary');
 }
 
 async function findSupervisorMembership(medplum) {
-  const memberships = await medplum.searchResources(
-    'ProjectMembership',
-    new URLSearchParams([
-      ['_count', '200'],
-    ])
-  );
+  const memberships = await medplum.searchResources('ProjectMembership', new URLSearchParams([['_count', '200']]));
   return memberships.find(
     (membership) =>
-      hasDemoIdentifier(membership, SUPERVISOR_MEMBERSHIP_IDENTIFIER) ||
-      membership.userName === DEMO.supervisor.email
+      hasDemoIdentifier(membership, SUPERVISOR_MEMBERSHIP_IDENTIFIER) || membership.userName === DEMO.supervisor.email
   );
 }
 
@@ -1163,9 +1152,7 @@ function demoIdentifier(value) {
 }
 
 function hasDemoIdentifier(resource, value) {
-  return resource?.identifier?.some(
-    (identifier) => identifier.system === CODE_SYSTEM && identifier.value === value
-  );
+  return resource?.identifier?.some((identifier) => identifier.system === CODE_SYSTEM && identifier.value === value);
 }
 
 function mergeIdentifiers(existingIdentifiers, identifier) {

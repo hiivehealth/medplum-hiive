@@ -167,7 +167,9 @@ export class StaticApp extends Construct {
           },
         ],
         webAclId: this.waf.attrArn,
-        logBucket: options.loggingBucket ? s3.Bucket.fromBucketName(this, 'LoggingBucket', options.loggingBucket) : undefined,
+        logBucket: options.loggingBucket
+          ? s3.Bucket.fromBucketName(this, 'LoggingBucket', options.loggingBucket)
+          : undefined,
         logFilePrefix: options.loggingPrefix,
       });
 

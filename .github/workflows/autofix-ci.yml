@@ -42,4 +42,9 @@ jobs:
       - run: npm run prettier
       - run: npm run lint:fix
 
+      - name: Check formatting and lint fixes
+        if: github.repository != 'medplum/medplum'
+        run: git diff --exit-code --stat
+
       - uses: autofix-ci/action@c5b2d67aa2274e7b5a18224e8171550871fc7e4a # v1.3.4
+        if: github.repository == 'medplum/medplum'

@@ -17,7 +17,7 @@ permissions:
 jobs:
   build:
     name: Build
-    runs-on: medplum-build-16core
+    runs-on: ${{ github.repository == 'medplum/medplum' && 'medplum-build-16core' || 'ubuntu-latest' }}
     timeout-minutes: 45
     permissions:
       pull-requests: write
@@ -80,8 +80,8 @@ jobs:
 
   preview:
     name: Deploy previews
-    if: ${{ github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork }}
-    runs-on: medplum-build-16core
+    if: ${{ github.repository == 'medplum/medplum' && github.event_name == 'pull_request' && !github.event.pull_request.head.repo.fork }}
+    runs-on: ${{ github.repository == 'medplum/medplum' && 'medplum-build-16core' || 'ubuntu-latest' }}
     timeout-minutes: 20
     needs: [build]
     permissions:
@@ -300,7 +300,7 @@ jobs:
 
   eslint:
     name: Run eslint
-    runs-on: medplum-build-16core
+    runs-on: ${{ github.repository == 'medplum/medplum' && 'medplum-build-16core' || 'ubuntu-latest' }}
     timeout-minutes: 20
     needs: [build]
     env:
@@ -383,7 +383,7 @@ jobs:
 
   test:
     name: Run tests
-    runs-on: medplum-build-16core
+    runs-on: ${{ github.repository == 'medplum/medplum' && 'medplum-build-16core' || 'ubuntu-latest' }}
     timeout-minutes: 45
     needs: [build]
     strategy:
@@ -508,7 +508,7 @@ jobs:
 
   test-examples:
     name: Run example tests
-    runs-on: medplum-build-16core
+    runs-on: ${{ github.repository == 'medplum/medplum' && 'medplum-build-16core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     needs: [build]
     strategy:
@@ -561,7 +561,7 @@ jobs:
 
   e2e:
     name: Run e2e tests
-    runs-on: medplum-build-16core
+    runs-on: ${{ github.repository == 'medplum/medplum' && 'medplum-build-16core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     needs: [build]
     strategy:
@@ -735,7 +735,7 @@ jobs:
 
   build-docs:
     name: Build the docs
-    runs-on: medplum-build-16core
+    runs-on: ${{ github.repository == 'medplum/medplum' && 'medplum-build-16core' || 'ubuntu-latest' }}
     timeout-minutes: 30
     permissions:
       pull-requests: write
