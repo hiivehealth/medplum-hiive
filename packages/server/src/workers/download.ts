@@ -8,23 +8,23 @@ import {
   isGone,
   normalizeOperationOutcome,
   pathToJSONPointer,
+  Pointer,
   toTypedValue,
 } from '@medplum/core';
 import type { Binary, Project, Resource, ResourceType } from '@medplum/fhirtypes';
-import type { Job, QueueBaseOptions } from 'bullmq';
+import type { Job } from 'bullmq';
 import { Queue, Worker } from 'bullmq';
-import fetch from 'node-fetch';
-import type { Readable } from 'node:stream';
-import { Pointer } from 'rfc6902';
+import { Readable } from 'node:stream';
 import { getConfig } from '../config/loader';
 import { tryGetRequestContext, tryRunInRequestContext } from '../context';
-import { getShardSystemRepo } from '../fhir/repo';
-import { PLACEHOLDER_SHARD_ID } from '../fhir/sharding';
 import { getLogger, globalLogger } from '../logger';
 import { getBinaryStorage } from '../storage/loader';
-import { parseTraceparent } from '../traceparent';
+import { buildTraceparent } from '../util/tracing';
+import { isAllowedOutboundUrlForQueue, safeFetch } from '../util/url';
+import type { ProjectJobTarget } from './base';
+import { getJobSystemRepo, getProjectJobTarget } from './base';
 import type { WorkerInitializer, WorkerInitializerOptions } from './utils';
-import { getBullmqRedisConnectionOptions, getWorkerBullmqConfig, queueRegistry } from './utils';
+import { defaultQueueOptions, getWorkerBullmqConfig, queueRegistry, trackJobMetrics } from './utils';
 
 /*
  * The download worker inspects resources,
@@ -38,6 +38,7 @@ import { getBullmqRedisConnectionOptions, getWorkerBullmqConfig, queueRegistry }
  */
 
 export interface DownloadJobData {
+  readonly target: ProjectJobTarget;
   readonly resourceType: ResourceType;
   readonly id: string;
   readonly url: string;
@@ -49,31 +50,17 @@ const queueName = 'DownloadQueue';
 const jobName = 'DownloadJobData';
 
 export const initDownloadWorker: WorkerInitializer = (config, options?: WorkerInitializerOptions) => {
-  const defaultOptions: QueueBaseOptions = {
-    connection: getBullmqRedisConnectionOptions(config),
-  };
-
-  const queue = new Queue<DownloadJobData>(queueName, {
-    ...defaultOptions,
-    defaultJobOptions: {
-      attempts: 3,
-      backoff: {
-        type: 'exponential',
-        delay: 1000,
-      },
-    },
-  });
+  const queueOptions = defaultQueueOptions(config);
+  const queue = new Queue<DownloadJobData>(queueName, queueOptions);
 
   let worker: Worker<DownloadJobData> | undefined;
   if (options?.workerEnabled !== false) {
-    const workerBullmq = getWorkerBullmqConfig(config, 'download');
     worker = new Worker<DownloadJobData>(
       queueName,
-      (job) => tryRunInRequestContext(job.data.requestId, job.data.traceId, () => execDownloadJob(job)),
-      {
-        ...defaultOptions,
-        ...workerBullmq,
-      }
+      trackJobMetrics('download', (job) =>
+        tryRunInRequestContext(job.data.requestId, job.data.traceId, () => execDownloadJob(job))
+      ),
+      getWorkerBullmqConfig(config, 'download', queueOptions)
     );
     worker.on('completed', (job) => globalLogger.info(`Completed job ${job.id} successfully`));
     worker.on('failed', (job, err) => globalLogger.info(`Failed job ${job?.id} with ${err}`));
@@ -144,6 +131,7 @@ export async function addDownloadJobs(
     }
 
     await addDownloadJobData({
+      target: getProjectJobTarget(resource),
       resourceType: resource.resourceType,
       id: resource.id,
       url,
@@ -164,13 +152,18 @@ export async function addDownloadJobs(
  * @returns True if the URL is an external URL.
  */
 function isExternalUrl(url: string | undefined): url is string {
-  return !!(
-    url &&
-    url.startsWith('https://') &&
-    !url.startsWith(getConfig().baseUrl + 'fhir/R4/Binary/') &&
-    !url.startsWith(getConfig().storageBaseUrl) &&
-    !url.startsWith('Binary/')
-  );
+  if (
+    !url ||
+    url.startsWith('Binary/') ||
+    url.startsWith(getConfig().baseUrl + 'fhir/R4/Binary/') ||
+    url.startsWith(getConfig().storageBaseUrl)
+  ) {
+    return false;
+  }
+  if (!isAllowedOutboundUrlForQueue(url, getConfig())) {
+    return false;
+  }
+  return true;
 }
 
 /**
@@ -218,7 +211,7 @@ async function addDownloadJobData(job: DownloadJobData): Promise<void> {
  * @param job - The download job details.
  */
 export async function execDownloadJob<T extends Resource = Resource>(job: Job<DownloadJobData>): Promise<void> {
-  const systemRepo = getShardSystemRepo(PLACEHOLDER_SHARD_ID); // shardId will be part of job.data in future
+  const systemRepo = await getJobSystemRepo(job.data.target);
   const log = getLogger();
   const { resourceType, id, url } = job.data;
 
@@ -253,8 +246,9 @@ export async function execDownloadJob<T extends Resource = Resource>(job: Job<Do
   const traceId = job.data.traceId;
   if (traceId) {
     headers['x-trace-id'] = traceId;
-    if (parseTraceparent(traceId)) {
-      headers['traceparent'] = traceId;
+    const traceparent = buildTraceparent(traceId);
+    if (traceparent) {
+      headers['traceparent'] = traceparent;
     }
   }
 
@@ -262,7 +256,7 @@ export async function execDownloadJob<T extends Resource = Resource>(job: Job<Do
 
   try {
     log.info('Requesting content at: ' + url);
-    const response = await fetch(url, {
+    const response = await safeFetch(url, {
       headers,
     });
 
@@ -287,9 +281,12 @@ export async function execDownloadJob<T extends Resource = Resource>(job: Job<Do
       throw new Error('Received null response body');
     }
 
-    // From node-fetch docs:
-    // Note that while the Fetch Standard requires the property to always be a WHATWG ReadableStream, in node-fetch it is a Node.js Readable stream.
-    await getBinaryStorage().writeBinary(binary, contentDisposition, contentType, response.body as Readable);
+    await getBinaryStorage().writeBinary(
+      binary,
+      contentDisposition,
+      contentType,
+      Readable.fromWeb(response.body as Parameters<typeof Readable.fromWeb>[0])
+    );
     log.info('Downloaded content successfully', { binaryId: binary.id });
 
     // re-fetch resource so we are mutating as recent a copy as possible

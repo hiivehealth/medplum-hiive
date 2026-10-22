@@ -7,7 +7,8 @@ import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
 import { DatabaseMode, getDatabasePool } from '../../database';
-import { initTestAuth, waitForAsyncJob } from '../../test.setup';
+import { getSuperAdminAccessToken, TEST_SHARD_ID, waitForAsyncJob } from '../../test.setup';
+import { GLOBAL_SHARD_ID } from '../sharding';
 
 describe('db-configure-indexes', () => {
   const app = express();
@@ -18,18 +19,19 @@ describe('db-configure-indexes', () => {
   const escapedTableName = escapeIdentifier(tableName);
 
   beforeAll(async () => {
-    const config = await loadTestConfig();
+    const config = await loadTestConfig({ sharded: true });
     await initApp(app, config);
-    accessToken = await initTestAuth({ project: { superAdmin: true } });
+    accessToken = await getSuperAdminAccessToken();
 
-    // Create a test table
-    const client = getDatabasePool(DatabaseMode.WRITER);
-    await client.query(`DROP TABLE IF EXISTS ${escapedTableName}`);
-    await client.query(`CREATE TABLE ${escapedTableName} (aaa UUID[], bbb TEXT[])`);
-    await client.query(
+    // Only the test shard has the table, so the success tests see its indexes only if the work ran there
+    await getDatabasePool(DatabaseMode.WRITER, GLOBAL_SHARD_ID).query(`DROP TABLE IF EXISTS ${escapedTableName}`);
+    const pool = getDatabasePool(DatabaseMode.WRITER, TEST_SHARD_ID);
+    await pool.query(`DROP TABLE IF EXISTS ${escapedTableName}`);
+    await pool.query(`CREATE TABLE ${escapedTableName} (aaa UUID[], bbb TEXT[])`);
+    await pool.query(
       `CREATE INDEX CONCURRENTLY "${tableName}_aaa_idx" ON ${escapedTableName} USING gin (aaa) WITH (fastupdate = ye, gin_pending_list_limit = 1024)`
     );
-    await client.query(`CREATE INDEX CONCURRENTLY "${tableName}_bbb_idx" ON ${escapedTableName} USING gin (bbb)`);
+    await pool.query(`CREATE INDEX CONCURRENTLY "${tableName}_bbb_idx" ON ${escapedTableName} USING gin (bbb)`);
   });
 
   afterAll(async () => {
@@ -50,7 +52,7 @@ describe('db-configure-indexes', () => {
           },
         ],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
       issue: [
@@ -78,7 +80,7 @@ describe('db-configure-indexes', () => {
           },
         ],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
       issue: [
@@ -100,13 +102,14 @@ describe('db-configure-indexes', () => {
       .send({
         resourceType: 'Parameters',
         parameter: [
+          { name: 'shardId', valueString: TEST_SHARD_ID },
           {
             name: 'tableName',
             valueString: tableName,
           },
         ],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
       issue: [
@@ -128,6 +131,7 @@ describe('db-configure-indexes', () => {
       .send({
         resourceType: 'Parameters',
         parameter: [
+          { name: 'shardId', valueString: TEST_SHARD_ID },
           {
             name: 'tableName',
             valueString: tableName,
@@ -150,13 +154,13 @@ describe('db-configure-indexes', () => {
           },
         ],
       });
-    expect(res.status).toBe(202);
+    expect(res).toHaveStatus(202);
 
     const asyncJob = await waitForAsyncJob(res.headers['content-location'], app, accessToken);
 
     expect(asyncJob.output).toStrictEqual({
       resourceType: 'Parameters',
-      parameter: [
+      parameter: expect.toContainExactly([
         {
           name: 'action',
           part: [
@@ -177,7 +181,7 @@ describe('db-configure-indexes', () => {
             },
           ],
         },
-      ],
+      ]),
     });
   });
 
@@ -190,6 +194,7 @@ describe('db-configure-indexes', () => {
       .send({
         resourceType: 'Parameters',
         parameter: [
+          { name: 'shardId', valueString: TEST_SHARD_ID },
           {
             name: 'tableName',
             valueString: tableName,
@@ -208,13 +213,13 @@ describe('db-configure-indexes', () => {
           },
         ],
       });
-    expect(res.status).toBe(202);
+    expect(res).toHaveStatus(202);
 
     const asyncJob = await waitForAsyncJob(res.headers['content-location'], app, accessToken);
 
     expect(asyncJob.output).toStrictEqual({
       resourceType: 'Parameters',
-      parameter: [
+      parameter: expect.toContainExactly([
         {
           name: 'action',
           part: [
@@ -264,7 +269,7 @@ describe('db-configure-indexes', () => {
             },
           ],
         },
-      ],
+      ]),
     });
   });
 
@@ -277,6 +282,7 @@ describe('db-configure-indexes', () => {
       .send({
         resourceType: 'Parameters',
         parameter: [
+          { name: 'shardId', valueString: TEST_SHARD_ID },
           {
             name: 'tableName',
             valueString: 'Robert"; DROP TABLE Students;',
@@ -287,7 +293,7 @@ describe('db-configure-indexes', () => {
           },
         ],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
       issue: [

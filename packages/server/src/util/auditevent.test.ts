@@ -1,37 +1,50 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { WithId } from '@medplum/core';
-import type { AuditEvent, Bot, Observation, ProjectMembership } from '@medplum/fhirtypes';
-import 'aws-sdk-client-mock-jest';
+import type { AuditEvent, Bot, Observation, Project, ProjectMembership } from '@medplum/fhirtypes';
 import { randomUUID } from 'node:crypto';
+import type { MockInstance } from 'vitest';
 import type { BotExecutionRequest } from '../bots/types';
 import { loadTestConfig } from '../config/loader';
+import { globalLogger } from '../logger';
 import {
+  ApplicationAgentType,
   AuditEventOutcome,
   createAuditEvent,
   createBotAuditEvent,
   CreateInteraction,
   logAuditEvent,
+  ReadInteraction,
   RestfulOperationType,
+  SearchInteraction,
 } from './auditevent';
 
 describe('AuditEvent utils', () => {
-  test('AuditEvents disabled', async () => {
-    console.info = jest.fn();
-    console.log = jest.fn();
+  const project: WithId<Project> = { resourceType: 'Project', id: randomUUID() };
+  const redactingProject: WithId<Project> = {
+    ...project,
+    setting: [{ name: 'redactAuditEvents', valueBoolean: true }],
+  };
+  let writeSpy: MockInstance;
 
+  beforeEach(() => {
+    writeSpy = vi.spyOn(globalLogger, 'write' as any).mockImplementation(() => undefined);
+  });
+
+  afterEach(() => {
+    writeSpy.mockRestore();
+  });
+
+  test('AuditEvents disabled', async () => {
     const config = await loadTestConfig();
     config.logAuditEvents = false;
 
     logAuditEvent({ resourceType: 'AuditEvent' } as AuditEvent);
 
-    expect(console.info).not.toHaveBeenCalled();
-    expect(console.log).not.toHaveBeenCalled();
+    expect(writeSpy).not.toHaveBeenCalled();
   });
 
-  test('AuditEvent to console.log', async () => {
-    console.log = jest.fn();
-
+  test('AuditEvent to log', async () => {
     const config = await loadTestConfig();
     config.logAuditEvents = true;
 
@@ -39,12 +52,10 @@ describe('AuditEvent utils', () => {
     logAuditEvent({ resourceType: 'AuditEvent' } as AuditEvent);
 
     // It should have been logged
-    expect(console.log).toHaveBeenCalledWith('{"resourceType":"AuditEvent"}');
+    expect(writeSpy).toHaveBeenCalledWith('{"resourceType":"AuditEvent"}');
   });
 
   test('Redacts display text when config flag set', async () => {
-    console.log = jest.fn();
-
     const config = await loadTestConfig();
     config.logAuditEvents = true;
     config.redactAuditEvents = true;
@@ -60,7 +71,7 @@ describe('AuditEvent utils', () => {
     const auditEvent = createAuditEvent(
       RestfulOperationType,
       CreateInteraction,
-      randomUUID(),
+      project,
       { reference: 'Practitioner/123', display: 'Test User' },
       undefined,
       AuditEventOutcome.Success,
@@ -69,12 +80,146 @@ describe('AuditEvent utils', () => {
     logAuditEvent(auditEvent);
 
     // It should have been logged
-    expect(console.log).toHaveBeenCalledTimes(1);
-    const auditLog = (console.log as jest.Mock).mock.calls[0][0];
+    expect(writeSpy).toHaveBeenCalledTimes(1);
+    const auditLog = writeSpy.mock.calls[0][0] as string;
     expect(auditLog).toContain(`{"resourceType":"AuditEvent",`);
     expect(auditLog).not.toContain('HIV');
     expect(auditLog).not.toContain('Test');
     expect(auditLog).not.toContain('User');
+  });
+
+  test("Redacts display text when the AuditEvent's project redacts AuditEvents", async () => {
+    const config = await loadTestConfig();
+    config.redactAuditEvents = false;
+
+    const auditEvent = createAuditEvent(
+      RestfulOperationType,
+      CreateInteraction,
+      redactingProject,
+      { reference: 'Practitioner/123', display: 'Test User' },
+      undefined,
+      AuditEventOutcome.Success,
+      { resource: { reference: 'Patient/123', display: 'Alice Smith' } }
+    );
+    expect(auditEvent.meta?.project).toBe(project.id);
+    expect(auditEvent.agent?.[0].who).toMatchObject({ reference: 'Practitioner/123', display: undefined });
+    expect(auditEvent.entity?.[0].what).toMatchObject({ reference: 'Patient/123', display: undefined });
+  });
+
+  test('Includes entityDetail on the search entity', async () => {
+    await loadTestConfig();
+
+    const auditEvent = createAuditEvent(
+      RestfulOperationType,
+      SearchInteraction,
+      project,
+      { reference: 'Practitioner/123', display: 'Test User' },
+      undefined,
+      AuditEventOutcome.Success,
+      { searchQuery: 'Patient?name=foo', entityDetail: [{ type: 'numResults', valueString: '42' }] }
+    );
+
+    expect(auditEvent.entity).toStrictEqual([
+      { query: 'Patient?name=foo', detail: [{ type: 'numResults', valueString: '42' }] },
+    ]);
+  });
+
+  test('Includes entityDetail on a resource entity', async () => {
+    await loadTestConfig();
+
+    const resource: Observation = { resourceType: 'Observation', id: randomUUID(), status: 'final', code: {} };
+
+    const auditEvent = createAuditEvent(
+      RestfulOperationType,
+      CreateInteraction,
+      project,
+      { reference: 'Practitioner/123', display: 'Test User' },
+      undefined,
+      AuditEventOutcome.Success,
+      { resource, entityDetail: [{ type: 'reason', valueString: 'backfill' }] }
+    );
+
+    expect(auditEvent.entity).toStrictEqual([
+      {
+        what: { reference: `Observation/${resource.id}` },
+        detail: [{ type: 'reason', valueString: 'backfill' }],
+      },
+    ]);
+  });
+
+  test('Omits detail when entityDetail is not provided', async () => {
+    await loadTestConfig();
+
+    const auditEvent = createAuditEvent(
+      RestfulOperationType,
+      SearchInteraction,
+      project,
+      { reference: 'Practitioner/123', display: 'Test User' },
+      undefined,
+      AuditEventOutcome.Success,
+      { searchQuery: 'Patient?name=foo' }
+    );
+
+    expect(auditEvent.entity).toStrictEqual([{ query: 'Patient?name=foo' }]);
+  });
+
+  test('Appends authenticating client as a non-requestor agent', async () => {
+    await loadTestConfig();
+
+    const auditEvent = createAuditEvent(
+      RestfulOperationType,
+      ReadInteraction,
+      project,
+      { reference: 'Practitioner/user-123' },
+      undefined,
+      AuditEventOutcome.Success,
+      { client: { reference: 'ClientApplication/agent-client' } }
+    );
+
+    expect(auditEvent.agent).toHaveLength(2);
+    expect(auditEvent.agent?.[0]).toMatchObject({
+      who: { reference: 'Practitioner/user-123' },
+      requestor: true,
+    });
+    expect(auditEvent.agent?.[1]).toMatchObject({
+      who: { reference: 'ClientApplication/agent-client' },
+      requestor: false,
+      type: { coding: [ApplicationAgentType] },
+    });
+  });
+
+  test('Does not duplicate client agent when client is the actor', async () => {
+    await loadTestConfig();
+
+    // client_credentials: the client is itself the author/actor (agent[0]).
+    const clientRef = { reference: 'ClientApplication/agent-client' };
+    const auditEvent = createAuditEvent(
+      RestfulOperationType,
+      ReadInteraction,
+      project,
+      clientRef,
+      undefined,
+      AuditEventOutcome.Success,
+      { client: clientRef }
+    );
+
+    expect(auditEvent.agent).toHaveLength(1);
+    expect(auditEvent.agent?.[0]).toMatchObject({ who: clientRef, requestor: true });
+  });
+
+  test('Omits client agent when no client is present', async () => {
+    await loadTestConfig();
+
+    const auditEvent = createAuditEvent(
+      RestfulOperationType,
+      ReadInteraction,
+      project,
+      { reference: 'Practitioner/user-123' },
+      undefined,
+      AuditEventOutcome.Success
+    );
+
+    expect(auditEvent.agent).toHaveLength(1);
   });
 
   test.each<Bot['auditEventTrigger']>(['never', 'on-error', 'on-output'])(
@@ -96,13 +241,21 @@ describe('AuditEvent utils', () => {
       const req: BotExecutionRequest = { bot, runAs, input: 'foo', contentType: 'text/plain' };
 
       // Successful execution with no output won't trigger on-error or on-output
-      console.log = jest.fn();
-      await createBotAuditEvent(req, new Date().toISOString(), AuditEventOutcome.Success, '');
-      expect(console.log).not.toHaveBeenCalled();
+      await createBotAuditEvent(
+        req,
+        { resourceType: 'Project' },
+        new Date().toISOString(),
+        AuditEventOutcome.Success,
+        ''
+      );
+      expect(writeSpy).not.toHaveBeenCalled();
     }
   );
 
   test('Logs Bot output', async () => {
+    const config = await loadTestConfig();
+    config.logAuditEvents = true;
+
     const bot: WithId<Bot> = {
       resourceType: 'Bot',
       id: randomUUID(),
@@ -118,8 +271,40 @@ describe('AuditEvent utils', () => {
     };
     const req: BotExecutionRequest = { bot, runAs, input: 'foo', contentType: 'text/plain' };
 
-    console.log = jest.fn();
-    await createBotAuditEvent(req, new Date().toISOString(), AuditEventOutcome.Success, 'foo');
-    expect(console.log).toHaveBeenCalledWith(expect.stringContaining(`,"outcomeDesc":"foo"`));
+    await createBotAuditEvent(
+      req,
+      { resourceType: 'Project' },
+      new Date().toISOString(),
+      AuditEventOutcome.Success,
+      'foo'
+    );
+    expect(writeSpy).toHaveBeenCalledWith(expect.stringContaining(`,"outcomeDesc":"foo"`));
+  });
+
+  test("Redacts Bot AuditEvent display text when the bot's project redacts AuditEvents", async () => {
+    const config = await loadTestConfig();
+    config.logAuditEvents = true;
+    config.redactAuditEvents = false;
+
+    const bot: WithId<Bot> = {
+      resourceType: 'Bot',
+      id: randomUUID(),
+      name: 'Test Bot',
+      auditEventDestination: ['log'],
+    };
+    const runAs: WithId<ProjectMembership> = {
+      resourceType: 'ProjectMembership',
+      id: randomUUID(),
+      project: { reference: `Project/${randomUUID()}` },
+      user: { reference: `User/${randomUUID()}` },
+      profile: { reference: `Practitioner/${randomUUID()}`, display: 'Alice Smith' },
+    };
+    const req: BotExecutionRequest = { bot, runAs, input: 'foo', contentType: 'text/plain' };
+
+    await createBotAuditEvent(req, redactingProject, new Date().toISOString(), AuditEventOutcome.Success, 'foo');
+    const logged = writeSpy.mock.calls[0][0] as string;
+    expect(logged).toContain(runAs.profile.reference);
+    expect(logged).not.toContain('Alice Smith');
+    expect(logged).not.toContain('Test Bot');
   });
 });

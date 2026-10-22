@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest';
-import { config } from 'dotenv';
+import { existsSync } from 'node:fs';
 import { HealthieClient } from './client';
 import {
   fetchHealthiePatients,
@@ -11,7 +11,9 @@ import {
 } from './patient';
 
 // Load environment variables from .env file
-config({ quiet: true });
+if (existsSync('.env')) {
+  process.loadEnvFile();
+}
 
 const originalFetch = global.fetch;
 
@@ -74,13 +76,12 @@ describe('fetchHealthiePatients', () => {
       });
     });
 
-    mockFetch.mockImplementationOnce(
-      (): Promise<MockResponse> =>
-        Promise.resolve({
-          json: () => Promise.resolve({ data: { users: mockPatients } }),
-          ok: true,
-          status: 200,
-        })
+    mockFetch.mockImplementationOnce((): Promise<MockResponse> =>
+      Promise.resolve({
+        json: () => Promise.resolve({ data: { users: mockPatients } }),
+        ok: true,
+        status: 200,
+      })
     );
 
     const result = await fetchHealthiePatients(healthieClient);

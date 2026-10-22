@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { OperationOutcome, OperationOutcomeIssue } from '@medplum/fhirtypes';
+import { arrayify } from './array';
 import type { Constraint } from './typeschema/types';
+import { EMPTY } from './utils';
 
 const OK_ID = 'ok';
 const CREATED_ID = 'created';
@@ -13,9 +15,11 @@ const CONFLICT_ID = 'conflict';
 const UNAUTHORIZED_ID = 'unauthorized';
 const FORBIDDEN_ID = 'forbidden';
 const PRECONDITION_FAILED_ID = 'precondition-failed';
+const CONTENT_TOO_LARGE_ID = 'content-too-large';
 const UNSUPPORTED_MEDIA_TYPE_ID = 'unsupported-media-type';
 const MULTIPLE_MATCHES_ID = 'multiple-matches';
 const TOO_MANY_REQUESTS_ID = 'too-many-requests';
+export const RATE_LIMIT_RESET_EXTENSION_URL = 'https://medplum.com/fhir/StructureDefinition/rate-limit-reset';
 const ACCEPTED_ID = 'accepted';
 const SERVER_TIMEOUT_ID = 'server-timeout';
 const BUSINESS_RULE = 'business-rule';
@@ -160,6 +164,20 @@ export const preconditionFailed: OperationOutcome = {
   ],
 };
 
+export function contentTooLarge(text: string): OperationOutcome {
+  return {
+    resourceType: 'OperationOutcome',
+    id: CONTENT_TOO_LARGE_ID,
+    issue: [
+      {
+        severity: 'error',
+        code: 'too-long',
+        details: { text },
+      },
+    ],
+  };
+}
+
 export const unsupportedMediaType: OperationOutcome = {
   resourceType: 'OperationOutcome',
   id: UNSUPPORTED_MEDIA_TYPE_ID,
@@ -202,6 +220,45 @@ export const tooManyRequests: OperationOutcome = {
   ],
 };
 
+/**
+ * Adds the rate limit reset delay to an OperationOutcome.
+ * @param outcome - The rate limit outcome.
+ * @param msBeforeNext - Milliseconds until the rate limit resets.
+ */
+export function setRateLimitReset(outcome: OperationOutcome, msBeforeNext: number): void {
+  outcome.extension = [
+    ...(outcome.extension ?? EMPTY).filter((e) => e.url !== RATE_LIMIT_RESET_EXTENSION_URL),
+    {
+      url: RATE_LIMIT_RESET_EXTENSION_URL,
+      valueUnsignedInt: Math.ceil(msBeforeNext / 1000),
+    },
+  ];
+}
+
+/**
+ * Returns the number of milliseconds until a rate limit resets.
+ * @param outcome - The rate limit outcome.
+ * @returns Milliseconds until reset, or undefined if not present.
+ */
+export function getRateLimitReset(outcome: OperationOutcome): number | undefined {
+  const seconds = outcome.extension?.find((e) => e.url === RATE_LIMIT_RESET_EXTENSION_URL)?.valueUnsignedInt;
+  if (seconds !== undefined) {
+    return seconds * 1000;
+  }
+
+  for (const issue of outcome.issue) {
+    try {
+      const diagnostics = JSON.parse(issue.diagnostics ?? '') as { msBeforeNext?: unknown };
+      if (typeof diagnostics.msBeforeNext === 'number') {
+        return diagnostics.msBeforeNext;
+      }
+    } catch {
+      // Ignore diagnostics that are not JSON rate limit metadata.
+    }
+  }
+  return undefined;
+}
+
 export function accepted(location: string): OperationOutcome {
   return {
     resourceType: 'OperationOutcome',
@@ -219,7 +276,7 @@ export function accepted(location: string): OperationOutcome {
   };
 }
 
-export function badRequest(details: string, expression?: string): OperationOutcome {
+export function badRequest(details: string, expression?: string | string[]): OperationOutcome {
   return {
     resourceType: 'OperationOutcome',
     issue: [
@@ -229,7 +286,7 @@ export function badRequest(details: string, expression?: string): OperationOutco
         details: {
           text: details,
         },
-        ...(expression ? { expression: [expression] } : undefined),
+        ...(expression ? { expression: arrayify(expression) } : undefined),
       },
     ],
   };
@@ -322,6 +379,14 @@ export function redirect(url: URL): OperationOutcome {
       },
     ],
   };
+}
+
+export function redirectOk(url: URL): OperationOutcome {
+  return { ...redirect(url), id: OK_ID };
+}
+
+export function getOutcomeRedirectUrl(outcome: OperationOutcome | undefined): string | undefined {
+  return outcome?.issue?.[0]?.details?.coding?.find((c) => c.system === 'urn:ietf:rfc:3986')?.code;
 }
 
 export function businessRule(key: string, message: string): OperationOutcome {
@@ -428,6 +493,8 @@ export function getStatus(outcome: OperationOutcome): number {
     case PRECONDITION_FAILED_ID:
     case MULTIPLE_MATCHES_ID:
       return 412;
+    case CONTENT_TOO_LARGE_ID:
+      return 413;
     case UNSUPPORTED_MEDIA_TYPE_ID:
       return 415;
     case BUSINESS_RULE:
@@ -536,7 +603,7 @@ export function operationOutcomeIssueToString(issue: OperationOutcomeIssue): str
 }
 
 export type IssueSeverity = 'error' | 'fatal' | 'warning' | 'information';
-export type IssueType = 'structure' | 'invariant' | 'processing';
+export type IssueType = 'structure' | 'invariant' | 'processing' | 'required';
 
 export function createOperationOutcomeIssue(
   severity: IssueSeverity,

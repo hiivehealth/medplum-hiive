@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { ClientApplication, Project, ProjectSetting } from '@medplum/fhirtypes';
+import type { ClientApplication, IdentityProvider, Project, ProjectSetting } from '@medplum/fhirtypes';
 import type { KeepJobs } from 'bullmq';
 
 export interface MedplumServerConfig {
@@ -53,8 +53,11 @@ export interface MedplumServerConfig {
    * Separating background job queues from other purposes can improve performance under high load by isolating job queue operations.
    */
   backgroundJobsRedis?: MedplumRedisConfig;
+  shards?: Record<string, MedplumShardConfig>;
   emailProvider?: 'none' | 'awsses' | 'smtp';
   smtp?: MedplumSmtpConfig;
+  /** Allow projects to configure their own SMTP transport via Project.secret entries. Default is `true`. */
+  allowProjectSmtp?: boolean;
   bullmq?: MedplumBullmqConfig;
   googleClientId?: string;
   googleClientSecret?: string;
@@ -69,6 +72,8 @@ export interface MedplumServerConfig {
   botLambdaRoleArn: string;
   botLambdaLayerName: string;
   botCustomFunctionsEnabled?: boolean;
+  /** Write each bot invocation's input to binary storage (e.g. S3) for debugging and analytics. Default is `true`. */
+  storeBotInput?: boolean;
   logRequests?: boolean;
   logAuditEvents?: boolean;
   saveAuditEvents?: boolean;
@@ -84,6 +89,7 @@ export interface MedplumServerConfig {
   accurateCountThreshold: number;
   maxSearchOffset?: number;
   base64BinaryMaxBytes?: number;
+  inlineAttachmentsMaxTotalBytes?: number;
   defaultSuperAdminEmail?: string;
   defaultSuperAdminPassword?: string;
   defaultSuperAdminClientId?: string;
@@ -91,10 +97,13 @@ export interface MedplumServerConfig {
   defaultBotRuntimeVersion: 'awslambda' | 'vmcontext';
   defaultProjectFeatures?: Project['features'];
   defaultProjectSystemSetting?: ProjectSetting[];
+  /** Enables HTTP request rate limits, FHIR quota, and resource cap accounting. Default is `true`. */
+  rateLimitsEnabled?: boolean;
   /** Number of HTTP requests per minute users can make by default; overridable by Project settings */
   defaultRateLimit?: number;
   defaultAuthRateLimit?: number;
   defaultLoginRateLimit?: number;
+  defaultMfaRateLimit?: number;
   /** Number of FHIR interaction rate limit units per minute users can consume by default; overridable by Project settings */
   defaultFhirQuota?: number;
   /** Milliseconds of delay added per quota unit in async context, in lieu of consuming quota units. */
@@ -114,11 +123,39 @@ export interface MedplumServerConfig {
   /** Number of milliseconds to use as a base for exponential backoff in transaction retries */
   transactionExpBackoffBaseDelayMs?: number;
 
+  /** Optional threshold in milliseconds for logging and recording high idle time within transactions */
+  idleInTransactionLogThresholdMs?: number;
+
+  /**
+   * Flag to enable/disable the background worker dispatch service. (default 'true' for enabled)
+   * Dispatch is the entry point for most background jobs including subscriptions and auto-download.
+   */
+  dispatchEnabled?: boolean;
+
+  /** Flag to enable/disable FHIR subscriptions. (default 'true' for enabled) */
+  subscriptionsEnabled?: boolean;
+
   /** Flag to enable/disable the binary storage auto-downloader service (default 'true' for enabled) */
   autoDownloadEnabled?: boolean;
 
+  /**
+   * Whether writes create resource cache entries (default 'true').
+   * When 'false', writes only update cache entries that already exist, and entries are created only
+   * when a read misses the cache. This prevents bulk writes from filling the cache.
+   */
+  cacheResourcesOnWrite?: boolean;
+
   /** Flag to enable pre-commit subscriptions for the interceptor pattern (default: false) */
   preCommitSubscriptionsEnabled?: boolean;
+
+  /**
+   * Flag to enable server-scoped rest-hook subscriptions (default: false).
+   * When enabled, the subscription worker evaluates not only the subscriptions within a
+   * resource's own project, but also subscriptions that are not scoped to any project
+   * (i.e. stored in the system project). This allows a single set of subscriptions to
+   * apply across every project on the server.
+   */
+  serverScopedSubscriptionsEnabled?: boolean;
 
   /** Optional list of external authentication providers. */
   externalAuthProviders?: MedplumExternalAuthConfig[];
@@ -183,11 +220,93 @@ export interface MedplumServerConfig {
    */
   mtlsCertHeader?: string;
 
+  rangeSearch?: boolean;
+
   /**
    * Optional URL for AI real-time transcription service.
    * Default is `wss://api.openai.com/v1/realtime?intent=transcription`.
    */
   aiRealtimeTranscriptionUrl?: string;
+
+  /**
+   * Optional flag to require email verification before allowing users to create projects.
+   */
+  requireVerifiedEmailForProjectCreation?: boolean;
+
+  /**
+   * Optional list of email domains that are blocked server-wide, regardless of
+   * any project-level `allowedPractitionerEmailDomain` setting (e.g. disposable email providers).
+   * Matched case-insensitively against the domain portion of the email address.
+   */
+  blockedEmailDomains?: string[];
+
+  /**
+   * Optional flag to allow outbound fetch requests to private/local networks.
+   * Intended only for on-premises deployments that connect to trusted local services.
+   * Do not enable in hosted or cloud-managed environments.
+   */
+  allowUnsafeOutbound?: boolean;
+
+  /**
+   * Optional list of enabled search parameters by SearchParameter.id.  Default is all search parameters enabled.
+   * Note that Medplum resource type search params are always enabled regardless of this setting,
+   * as they are necesary for system functionality.
+   */
+  enabledSearchParameters?: string[];
+
+  /**
+   * Optional list of resource types for which chained search is disabled.
+   * References from these types are no longer written to the `<ResourceType>_References` lookup table,
+   * and chained searches (including `_has`) that require that table are rejected.
+   * Re-enabling chained search for a type requires a reindex of that type.
+   * Project Admin types are ignored, since their references may be required for system functionality.
+   */
+  disableChainedSearch?: string[];
+
+  /**
+   * Optional customizations to the server generated CapabilityStatement.
+   */
+  capabilityStatement?: MedplumCapabilityStatementConfig;
+}
+
+export interface MedplumCapabilityStatementConfig {
+  /**
+   * Partial CapabilityStatement merged over the server generated statement.
+   * Top level fields replace the generated values wholesale, so setting `rest` here replaces the
+   * generated `rest` entirely; prefer the filters below to restrict it.
+   */
+  overlay?: Record<string, unknown>;
+
+  /**
+   * Optional allowlist of advertised resource types. Cannot be combined with `excludeResourceTypes`.
+   */
+  includeResourceTypes?: string[];
+
+  /**
+   * Optional denylist of advertised resource types. Cannot be combined with `includeResourceTypes`.
+   */
+  excludeResourceTypes?: string[];
+
+  /**
+   * Optional advertised interactions, keyed by resource type.
+   * The `*` key sets the default for resource types that are not listed explicitly.
+   * An empty array advertises no interactions for that resource type.
+   */
+  interactions?: Record<string, string[]>;
+
+  /**
+   * Optional advertised system level interactions, such as `transaction` and `batch`.
+   */
+  systemInteractions?: string[];
+
+  /**
+   * Controls the advertised `supportedProfile` for each resource type.
+   * - `true` or omitted: advertise the server generated profiles (US Core).
+   * - `false`: omit `supportedProfile` entirely.
+   * - object: per resource type override, keyed by resource type. Listed types replace the generated
+   *   profiles (an empty array advertises none for that type); unlisted types keep the generated defaults.
+   */
+  supportedProfiles?: boolean | Record<string, string[]>;
 }
 
 export interface SubscriptionAutoDisableTrigger {
@@ -240,6 +359,14 @@ export interface MedplumDatabaseConfig {
    */
   disableRunPostDeployMigrations?: boolean;
   maxConnections?: number;
+  /** Minimum number of clients the pool retains and _not_ destroy via idleTimeoutMs. Default is 0 */
+  minConnections?: number;
+  /** Maximum times a pool client can be used before being replaced. Active connection pruner. Default is Infinity */
+  maxConnectionUses?: number;
+  /** Duration a client must sit idle before being disconnected. Idle connection pruner. Default is 10,000ms */
+  idleTimeoutMs?: number; // idle pruner
+  /** Duration to wait before timing out when connecting a new client. Defaults to no timeout */
+  connectionTimeoutMs?: number;
   disableConnectionConfiguration?: boolean;
 }
 
@@ -257,6 +384,8 @@ export interface MedplumSmtpConfig {
   port: number;
   username: string;
   password: string;
+  /** Use TLS when connecting. If not specified, inferred from `port === 465`. */
+  secure?: boolean;
 }
 
 export interface MedplumBullmqConfig {
@@ -265,13 +394,29 @@ export interface MedplumBullmqConfig {
    * @see {@link https://docs.bullmq.io/guide/workers/concurrency}
    */
   concurrency?: number;
+  /**
+   * Maximum number of jobs processed simultaneously across all workers for a queue (cluster-wide).
+   * Unlike `concurrency` (which is per-worker), this limit is enforced globally via Redis.
+   * When omitted, any previously-set global concurrency limit is removed.
+   * @see {@link https://docs.bullmq.io/guide/queues/global-concurrency}
+   */
+  globalConcurrency?: number;
+  /**
+   * Duration of the job lock in milliseconds while a worker is processing.
+   * @see {@link https://docs.bullmq.io/guide/workers/stalled-jobs}
+   */
+  lockDuration?: number;
   removeOnComplete: KeepJobs;
   removeOnFail: KeepJobs;
 }
 
 export interface MedplumExternalAuthConfig {
   readonly issuer: string;
-  readonly userInfoUrl: string;
+  /** Optional client ID used to select this external auth provider during token exchange. */
+  readonly clientId?: string;
+  /** @deprecated Use identityProvider.userInfoUrl instead. */
+  readonly userInfoUrl?: string;
+  readonly identityProvider?: IdentityProvider;
 }
 
 export type WorkerName =
@@ -281,8 +426,11 @@ export type WorkerName =
   | 'cron'
   | 'reindex'
   | 'batch'
+  | 'bulk-export'
   | 'post-deploy-migration'
-  | 'set-accounts';
+  | 'set-accounts'
+  | 'lambda-cleaner'
+  | 'dicom';
 
 export interface MedplumWorkersConfig {
   /**
@@ -305,4 +453,11 @@ export interface MedplumFissionConfig {
   readonly environmentName: string;
   readonly routerHost: string;
   readonly routerPort: number;
+}
+
+export interface MedplumShardConfig {
+  /** Place new projects on this shard. Only one shard may set this; when none do, new projects go on the global shard. */
+  isDefaultShard?: boolean;
+  database: MedplumDatabaseConfig;
+  readonlyDatabase?: MedplumDatabaseConfig;
 }

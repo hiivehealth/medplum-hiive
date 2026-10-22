@@ -1,22 +1,34 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { MantineProvider } from '@mantine/core';
-import { Notifications } from '@mantine/notifications';
+import { Notifications, notifications } from '@mantine/notifications';
+import type { WithId } from '@medplum/core';
 import { createReference } from '@medplum/core';
-import type { Patient, Schedule } from '@medplum/fhirtypes';
-import { DrAliceSmith, HomerSimpson, MockClient } from '@medplum/mock';
+import type { Appointment, Patient, Schedule } from '@medplum/fhirtypes';
+import { DrAliceSmith, HomerEncounter, HomerSimpson, MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react';
+import type { DateTimeRange } from '@medplum/react-scheduling';
 import { act, render, screen, waitFor } from '@testing-library/react';
+import type { UserEvent } from '@testing-library/user-event';
 import userEvent from '@testing-library/user-event';
-import type { SlotInfo } from 'react-big-calendar';
-import { MemoryRouter } from 'react-router';
+import { MemoryRouter, Route, Routes } from 'react-router';
 import { beforeEach, describe, expect, test, vi } from 'vitest';
+import { createAppointment, createEncounter } from '../../utils/encounter';
 import { CreateVisit } from './CreateVisit';
+
+vi.mock('../../utils/encounter', () => ({ createAppointment: vi.fn(), createEncounter: vi.fn() }));
+const practitioner = createReference(DrAliceSmith);
+const appointment: WithId<Appointment> = { resourceType: 'Appointment', id: 'a1', status: 'booked', participant: [] };
+
+async function selectPatient(user: UserEvent): Promise<void> {
+  await user.type(await screen.findByLabelText(/Patient/i), 'Homer');
+  await user.click((await screen.findAllByText('Homer Simpson'))[0]);
+}
 
 describe('CreateVisit', () => {
   let medplum: MockClient;
   let mockPatient: Patient;
-  let mockSlotInfo: SlotInfo;
+  let range: DateTimeRange;
 
   beforeEach(async () => {
     medplum = new MockClient();
@@ -30,13 +42,12 @@ describe('CreateVisit', () => {
 
     const startDate = new Date('2024-01-15T10:00:00Z');
     const endDate = new Date('2024-01-15T10:30:00Z');
-    mockSlotInfo = {
+    range = {
       start: startDate,
       end: endDate,
-      slots: [],
-      action: 'select',
     };
 
+    notifications.clean();
     await medplum.createResource(mockPatient);
     medplum.getProfile = vi.fn().mockResolvedValue({
       resourceType: 'Practitioner',
@@ -45,17 +56,21 @@ describe('CreateVisit', () => {
     });
   });
 
-  const setup = (appointmentSlot?: SlotInfo, schedule?: Schedule): ReturnType<typeof render> => {
+  const setup = (appointmentSlot?: DateTimeRange, schedule?: Schedule): ReturnType<typeof render> => {
     return render(
       <MemoryRouter>
         <MedplumProvider medplum={medplum}>
           <MantineProvider>
             <Notifications />
-            <CreateVisit
-              appointmentSlot={appointmentSlot}
-              schedule={schedule}
-              practitioner={createReference(DrAliceSmith)}
-            />
+            <Routes>
+              <Route
+                path="/"
+                element={
+                  <CreateVisit appointmentSlot={appointmentSlot} schedule={schedule} practitioner={practitioner} />
+                }
+              />
+              <Route path="/Patient/:patientId/Encounter/:encounterId" element={<div>Encounter Page</div>} />
+            </Routes>
           </MantineProvider>
         </MedplumProvider>
       </MemoryRouter>
@@ -65,7 +80,7 @@ describe('CreateVisit', () => {
   describe('Rendering', () => {
     test('renders form with all required fields', async () => {
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       await waitFor(() => {
@@ -95,7 +110,7 @@ describe('CreateVisit', () => {
         actor: [{ reference: 'Practitioner/practitioner-1' }],
       };
       await act(async () => {
-        setup(mockSlotInfo, schedule);
+        setup(range, schedule);
       });
 
       await waitFor(() => {
@@ -109,7 +124,7 @@ describe('CreateVisit', () => {
     test('shows error notification when submitting with missing required fields', async () => {
       const user = userEvent.setup();
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       await waitFor(() => {
@@ -127,7 +142,7 @@ describe('CreateVisit', () => {
     test('does not proceed with submission when required fields are missing', async () => {
       const user = userEvent.setup();
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       await waitFor(() => {
@@ -137,19 +152,26 @@ describe('CreateVisit', () => {
       const submitButton = screen.getByRole('button', { name: /Create Visit/i });
       await user.click(submitButton);
 
-      // Verify error notification is shown instead of proceeding
-      // Use getAllByText since notifications may persist from previous tests
       await waitFor(() => {
         const notifications = screen.getAllByText(/Please fill out required fields/i);
         expect(notifications.length).toBeGreaterThan(0);
       });
+    });
+
+    test('requires a class even when a patient is selected', async () => {
+      const user = userEvent.setup();
+      setup(range);
+      await selectPatient(user);
+      await user.click(screen.getByRole('button', { name: /Create Visit/i }));
+      expect(await screen.findByText(/Please fill out required fields/i)).toBeInTheDocument();
+      expect(createAppointment).not.toHaveBeenCalled();
     });
   });
 
   describe('PlanDefinition Actions', () => {
     test('does not display included tasks card initially', async () => {
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       await waitFor(() => {
@@ -161,18 +183,16 @@ describe('CreateVisit', () => {
   describe('Date/Time Formatting', () => {
     test('updates formatted date/time when appointmentSlot changes', async () => {
       const { rerender } = await act(async () => {
-        return setup(mockSlotInfo);
+        return setup(range);
       });
 
       await waitFor(() => {
         expect(screen.getByText(/Jan.*15.*2024/i)).toBeInTheDocument();
       });
 
-      const newSlotInfo: SlotInfo = {
+      const newSlot: DateTimeRange = {
         start: new Date('2024-02-20T14:00:00Z'),
         end: new Date('2024-02-20T14:30:00Z'),
-        slots: [],
-        action: 'select',
       };
 
       await act(async () => {
@@ -181,7 +201,7 @@ describe('CreateVisit', () => {
             <MedplumProvider medplum={medplum}>
               <MantineProvider>
                 <Notifications />
-                <CreateVisit appointmentSlot={newSlotInfo} practitioner={createReference(DrAliceSmith)} />
+                <CreateVisit appointmentSlot={newSlot} practitioner={createReference(DrAliceSmith)} />
               </MantineProvider>
             </MedplumProvider>
           </MemoryRouter>
@@ -197,7 +217,7 @@ describe('CreateVisit', () => {
   describe('Button State', () => {
     test('submit button is initially enabled', async () => {
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       await waitFor(() => {
@@ -211,7 +231,7 @@ describe('CreateVisit', () => {
   describe('Form Field Changes', () => {
     test('updates patient when patient is selected', async () => {
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       const patientInput = await screen.findByLabelText(/Patient/i);
@@ -221,7 +241,7 @@ describe('CreateVisit', () => {
     test('updates start time when changed', async () => {
       const user = userEvent.setup();
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       await waitFor(() => {
@@ -240,7 +260,7 @@ describe('CreateVisit', () => {
     test('updates end time when changed', async () => {
       const user = userEvent.setup();
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       const endInput = await screen.findByLabelText(/End Time/i);
@@ -255,24 +275,55 @@ describe('CreateVisit', () => {
     test('updates class when class is selected', async () => {
       const user = userEvent.setup();
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       const classInput = await screen.findByLabelText(/Class/i);
-      await act(async () => {
-        await user.click(classInput);
-      });
+      await user.click(classInput);
 
       expect(classInput).toBeInTheDocument();
     });
 
     test('updates care template when template is selected', async () => {
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       const templateInput = await screen.findByLabelText(/Care template/i);
       expect(templateInput).toBeInTheDocument();
+    });
+  });
+
+  describe('Submission', () => {
+    const setupFilled = async (user: UserEvent): Promise<void> => {
+      vi.mocked(createAppointment).mockResolvedValue(appointment);
+      vi.mocked(createEncounter).mockResolvedValue(HomerEncounter as WithId<typeof HomerEncounter>);
+      setup(range);
+      await selectPatient(user);
+      await user.type(screen.getByLabelText(/Class/i), 'Test');
+      await user.click(await screen.findByText('Test Display'));
+    };
+
+    test('creates the appointment and encounter, then navigates to the new encounter', async () => {
+      const user = userEvent.setup();
+      await setupFilled(user);
+      await user.click(screen.getByRole('button', { name: /Create Visit/i }));
+      expect(await screen.findByText('Visit created')).toBeInTheDocument();
+      expect(await screen.findByText('Encounter Page')).toBeInTheDocument();
+      const patient = expect.objectContaining({ resourceType: 'Patient' });
+      const coding = expect.objectContaining({ code: 'test-code' });
+      expect(createAppointment).toHaveBeenCalledWith(medplum, range.start, range.end, patient, practitioner, undefined);
+      expect(createEncounter).toHaveBeenCalledWith(medplum, coding, patient, undefined, appointment, practitioner);
+    });
+
+    test('shows an error notification and re-enables the button when creation fails', async () => {
+      const user = userEvent.setup();
+      await setupFilled(user);
+      vi.mocked(createAppointment).mockRejectedValue(new Error('Slot already booked'));
+      await user.click(screen.getByRole('button', { name: /Create Visit/i }));
+      expect(await screen.findByText('Slot already booked')).toBeInTheDocument();
+      expect(createEncounter).not.toHaveBeenCalled();
+      expect(screen.getByRole('button', { name: /Create Visit/i })).not.toBeDisabled();
     });
   });
 
@@ -290,7 +341,7 @@ describe('CreateVisit', () => {
       await medplum.createResource(planDefinition);
 
       await act(async () => {
-        setup(mockSlotInfo);
+        setup(range);
       });
 
       const templateInput = await screen.findByLabelText(/Care template/i);

@@ -1,18 +1,23 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
+import { ResourceNotFoundException } from '@aws-sdk/client-lambda';
 import type { BackgroundJobContext, BackgroundJobInteraction, WithId } from '@medplum/core';
-import type { Project, Resource, ResourceType } from '@medplum/fhirtypes';
-import type { Job, QueueBaseOptions } from 'bullmq';
+import type { DicomInstance, Project, Resource, ResourceType } from '@medplum/fhirtypes';
+import type { Job } from 'bullmq';
 import { Queue, Worker } from 'bullmq';
+import { deleteLambda, getLambdaNameForBot } from '../cloud/aws/deploy';
+import { getBotManagementLambdaClient } from '../cloud/aws/lambda';
+import { getConfig } from '../config/loader';
 import { tryGetRequestContext, tryRunInRequestContext } from '../context';
-import { getShardSystemRepo } from '../fhir/repo';
-import { PLACEHOLDER_SHARD_ID } from '../fhir/sharding';
 import { getLogger } from '../logger';
+import type { ProjectJobTarget } from './base';
+import { getJobSystemRepo, getProjectJobTarget } from './base';
 import { addCronJobs } from './cron';
+import { addDicomJobs } from './dicom';
 import { addDownloadJobs } from './download';
 import { addSubscriptionJobs } from './subscription';
 import type { WorkerInitializer, WorkerInitializerOptions } from './utils';
-import { getBullmqRedisConnectionOptions, getWorkerBullmqConfig, queueRegistry } from './utils';
+import { defaultQueueOptions, getWorkerBullmqConfig, queueRegistry, trackJobMetrics } from './utils';
 
 /*
  * The dispatch worker dispatches resource changes to other async jobs.
@@ -24,6 +29,7 @@ import { getBullmqRedisConnectionOptions, getWorkerBullmqConfig, queueRegistry }
  */
 
 export interface DispatchJobData {
+  readonly target: ProjectJobTarget;
   readonly interaction: BackgroundJobInteraction;
   readonly resourceType: ResourceType;
   readonly id: string;
@@ -37,31 +43,17 @@ const queueName = 'DispatchQueue';
 const jobName = 'DispatchJobData';
 
 export const initDispatchWorker: WorkerInitializer = (config, options?: WorkerInitializerOptions) => {
-  const defaultOptions: QueueBaseOptions = {
-    connection: getBullmqRedisConnectionOptions(config),
-  };
-
-  const queue = new Queue<DispatchJobData>(queueName, {
-    ...defaultOptions,
-    defaultJobOptions: {
-      attempts: 3,
-      backoff: {
-        type: 'exponential',
-        delay: 1000,
-      },
-    },
-  });
+  const queueOptions = defaultQueueOptions(config);
+  const queue = new Queue<DispatchJobData>(queueName, queueOptions);
 
   let worker: Worker<DispatchJobData> | undefined;
   if (options?.workerEnabled !== false) {
-    const workerBullmq = getWorkerBullmqConfig(config, 'dispatch');
     worker = new Worker<DispatchJobData>(
       queueName,
-      (job) => tryRunInRequestContext(job.data.requestId, job.data.traceId, () => execDispatchJob(job)),
-      {
-        ...defaultOptions,
-        ...workerBullmq,
-      }
+      trackJobMetrics('dispatch', (job) =>
+        tryRunInRequestContext(job.data.requestId, job.data.traceId, () => execDispatchJob(job))
+      ),
+      getWorkerBullmqConfig(config, 'dispatch', queueOptions)
     );
   }
 
@@ -97,6 +89,7 @@ export async function addDispatchJobs(
 ): Promise<void> {
   const ctx = tryGetRequestContext();
   await addDispatchJobData({
+    target: getProjectJobTarget(resource),
     resourceType: resource.resourceType,
     id: resource.id,
     versionId: resource.meta?.versionId as string,
@@ -120,7 +113,11 @@ async function addDispatchJobData(job: DispatchJobData): Promise<void> {
  * @param job - The dispatch job details.
  */
 export async function execDispatchJob(job: Job<DispatchJobData>): Promise<void> {
-  const systemRepo = getShardSystemRepo(PLACEHOLDER_SHARD_ID); // shardId will be part of job.data in future
+  if (!getConfig().dispatchEnabled) {
+    return;
+  }
+
+  const systemRepo = await getJobSystemRepo(job.data.target);
   const { resourceType, id, versionId, previousVersionId } = job.data;
   const resource = await systemRepo.readVersion(resourceType, id, versionId);
   const previousVersion = previousVersionId
@@ -131,10 +128,41 @@ export async function execDispatchJob(job: Job<DispatchJobData>): Promise<void> 
   const interaction = job.data.interaction;
   const context = { interaction, project, systemRepo } as BackgroundJobContext;
 
+  // Check if this resource was a Bot deployed to Lambda, if it was and this was a delete operation, we should remove the corresponding Lambda
+  if (resource.resourceType === 'Bot' && resource.runtimeVersion === 'awslambda' && interaction === 'delete') {
+    const name = getLambdaNameForBot(resource);
+    try {
+      const client = getBotManagementLambdaClient();
+      await deleteLambda(client, name);
+      getLogger().info('Lambda for Bot deleted', { botId: resource.id, lambdaName: name });
+    } catch (err) {
+      if (err instanceof ResourceNotFoundException) {
+        getLogger().info('Lambda for Bot does not exist. Skipping delete', { botId: resource.id, lambdaName: name });
+        return;
+      }
+      getLogger().error('Error deleting Lambda for Bot', {
+        botId: resource.id,
+        lambdaName: name,
+        err,
+      });
+    }
+  }
+
   try {
     await addSubscriptionJobs(resource, previousVersion, context);
   } catch (err) {
     getLogger().error('Error adding subscription jobs', {
+      resourceType: resource.resourceType,
+      resource: resource.id,
+      err,
+    });
+  }
+
+  // Runs on delete as well: a deleted resource still has a schedule to tear down.
+  try {
+    await addCronJobs(resource, previousVersion, context);
+  } catch (err) {
+    getLogger().error('Error adding cron jobs', {
       resourceType: resource.resourceType,
       resource: resource.id,
       err,
@@ -152,14 +180,16 @@ export async function execDispatchJob(job: Job<DispatchJobData>): Promise<void> 
       });
     }
 
-    try {
-      await addCronJobs(resource, previousVersion, context);
-    } catch (err) {
-      getLogger().error('Error adding cron jobs', {
-        resourceType: resource.resourceType,
-        resource: resource.id,
-        err,
-      });
+    if (resource.resourceType === 'DicomInstance') {
+      try {
+        await addDicomJobs(resource, previousVersion as DicomInstance);
+      } catch (err) {
+        getLogger().error('Error adding DICOM jobs', {
+          resourceType: resource.resourceType,
+          resource: resource.id,
+          err,
+        });
+      }
     }
   }
 }

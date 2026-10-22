@@ -16,6 +16,7 @@ import type {
   CompositionSection,
   Condition,
   ContactPoint,
+  DosageDoseAndRate,
   Encounter,
   EncounterDiagnosis,
   Extension,
@@ -35,6 +36,7 @@ import type {
   PractitionerQualification,
   PractitionerRole,
   Procedure,
+  Quantity,
   Reference,
   RelatedPerson,
   Resource,
@@ -316,11 +318,11 @@ class CcdaToFhirConverter {
     }
     return addresses?.map((addr) => ({
       use: addr['@_use'] ? ADDRESS_USE_MAPPER.mapCcdaToFhir(addr['@_use']) : undefined,
-      line: addr.streetAddressLine,
-      city: addr.city,
-      state: addr.state,
-      postalCode: addr.postalCode,
-      country: addr.country,
+      line: addr.streetAddressLine?.map(nodeToString).filter(Boolean) as string[] | undefined,
+      city: nodeToString(addr.city),
+      state: nodeToString(addr.state),
+      postalCode: nodeToString(addr.postalCode),
+      country: nodeToString(addr.country),
     }));
   }
 
@@ -689,21 +691,29 @@ class CcdaToFhirConverter {
                 }
               : undefined,
           },
-          doseAndRate: doseQuantity
-            ? [
-                {
-                  doseQuantity: {
-                    system: UCUM,
-                    value: Number(doseQuantity['@_value']),
-                    code: '[IU]',
-                    unit: '[IU]',
-                  },
-                },
-              ]
-            : undefined,
+          doseAndRate: this.mapDoseAndRate(doseQuantity),
         },
       ],
     };
+  }
+
+  private mapDoseAndRate(doseQuantity: CcdaQuantity | undefined): DosageDoseAndRate[] | undefined {
+    if (doseQuantity?.low || doseQuantity?.high) {
+      const low = this.mapQuantity(doseQuantity.low);
+      const high = this.mapQuantity(doseQuantity.high);
+      return low || high ? [{ doseRange: { low, high } }] : undefined;
+    }
+    const quantity = this.mapQuantity(doseQuantity);
+    return quantity ? [{ doseQuantity: quantity }] : undefined;
+  }
+
+  private mapQuantity(quantity: CcdaQuantity | undefined): Quantity | undefined {
+    const value = Number.parseFloat(quantity?.['@_value'] ?? '');
+    if (!Number.isFinite(value)) {
+      return undefined;
+    }
+    const unit = quantity?.['@_unit'];
+    return { value, unit, system: unit ? UCUM : undefined, code: unit };
   }
 
   private processImmunizationSubstanceAdministration(

@@ -5,8 +5,7 @@ import type { Condition } from '@medplum/fhirtypes';
 import { HomerSimpson, MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { ReactNode } from 'react';
-import { MemoryRouter } from 'react-router';
-import { act, fireEvent, render, screen } from '../test-utils/render';
+import { act, fireEvent, render, screen, typeInAutocomplete } from '../test-utils/render';
 import { ProblemList } from './ProblemList';
 
 const medplum = new MockClient();
@@ -14,23 +13,19 @@ const medplum = new MockClient();
 describe('PatientSummary - ProblemList', () => {
   async function setup(children: ReactNode): Promise<void> {
     await act(async () => {
-      render(
-        <MemoryRouter>
-          <MedplumProvider medplum={medplum}>{children}</MedplumProvider>
-        </MemoryRouter>
-      );
+      render(<MedplumProvider medplum={medplum}>{children}</MedplumProvider>);
     });
   }
 
   beforeEach(() => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
   });
 
   afterEach(async () => {
     await act(async () => {
-      jest.runOnlyPendingTimers();
+      vi.runOnlyPendingTimers();
     });
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   test('Renders empty', async () => {
@@ -63,24 +58,10 @@ describe('PatientSummary - ProblemList', () => {
       fireEvent.click(screen.getByLabelText('Add item'));
     });
 
-    // Enter problem "Dizziness"
     const input = (await screen.findAllByRole('searchbox'))[0] as HTMLInputElement;
-    await act(async () => {
-      fireEvent.change(input, { target: { value: 'Dizziness' } });
-    });
-
-    // Wait for the drop down
-    await act(async () => {
-      jest.advanceTimersByTime(1000);
-    });
-
-    // Press the down arrow
+    await typeInAutocomplete(input, 'Dizziness');
     await act(async () => {
       fireEvent.keyDown(input, { key: 'ArrowDown', code: 'ArrowDown' });
-    });
-
-    // Press "Enter"
-    await act(async () => {
       fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
     });
 
@@ -109,24 +90,10 @@ describe('PatientSummary - ProblemList', () => {
       fireEvent.click(screen.getByText('Dizziness'));
     });
 
-    // Enter problem "Dizziness"
     const input = (await screen.findAllByRole('searchbox'))[0] as HTMLInputElement;
-    await act(async () => {
-      fireEvent.change(input, { target: { value: 'Dizziness' } });
-    });
-
-    // Wait for the drop down
-    await act(async () => {
-      jest.advanceTimersByTime(1000);
-    });
-
-    // Press the down arrow
+    await typeInAutocomplete(input, 'Dizziness');
     await act(async () => {
       fireEvent.keyDown(input, { key: 'ArrowDown', code: 'ArrowDown' });
-    });
-
-    // Press "Enter"
-    await act(async () => {
       fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
     });
 

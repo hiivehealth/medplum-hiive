@@ -2,47 +2,45 @@
 // SPDX-License-Identifier: Apache-2.0
 import { accepted, badRequest, concatUrls, OperationOutcomeError } from '@medplum/core';
 import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
-import type { OperationDefinition } from '@medplum/fhirtypes';
-import type { Pool, PoolClient } from 'pg';
 import { escapeIdentifier } from 'pg';
-import { requireSuperAdmin } from '../../admin/super';
 import { getConfig } from '../../config/loader';
-import { DatabaseMode } from '../../database';
+import { requireSuperAdmin } from '../../context';
 import { withLongRunningDatabaseClient } from '../../migrations/migration-utils';
 import { getShardSystemRepo } from '../repo';
-import { PLACEHOLDER_SHARD_ID } from '../sharding';
-import { isValidTableName } from '../sql';
+import { GLOBAL_SHARD_ID } from '../sharding';
+import type { PgQueryable } from '../sql';
+import { isValidPostgresIdentifier } from '../sql';
+import { makeOperationDefinition } from './definitions';
 import { AsyncJobExecutor } from './utils/asyncjobexecutor';
 import {
   buildOutputParameters,
+  getShardIdParam,
   makeOperationDefinitionParameter as param,
   parseInputParameters,
 } from './utils/parameters';
 
-const operation: OperationDefinition = {
-  resourceType: 'OperationDefinition',
-  name: 'db-configure-indexes',
-  status: 'active',
-  kind: 'operation',
-  code: 'db-configure-indexes',
-  experimental: true,
-  system: true,
-  type: false,
-  instance: false,
-  parameter: [
-    param('in', 'tableName', 'string', 1, '*'),
-    param('in', 'fastUpdateAction', 'string', 0, '1'),
-    param('in', 'fastUpdateValue', 'boolean', 0, '1'),
-    param('in', 'ginPendingListLimitAction', 'string', 0, '1'),
-    param('in', 'ginPendingListLimitValue', 'integer', 0, '1'),
-    param('out', 'action', undefined, 0, '*', [
-      param('out', 'sql', 'string', 1, '1'),
-      param('out', 'durationMs', 'integer', 0, '1'),
-    ]),
-  ],
-};
+const operation = makeOperationDefinition(
+  { scope: 'system' },
+  {
+    name: 'db-configure-indexes',
+    code: 'db-configure-indexes',
+    parameter: [
+      param('in', 'shardId', 'string', 0, '1'),
+      param('in', 'tableName', 'string', 1, '*'),
+      param('in', 'fastUpdateAction', 'string', 0, '1'),
+      param('in', 'fastUpdateValue', 'boolean', 0, '1'),
+      param('in', 'ginPendingListLimitAction', 'string', 0, '1'),
+      param('in', 'ginPendingListLimitValue', 'integer', 0, '1'),
+      param('out', 'action', undefined, 0, '*', [
+        param('out', 'sql', 'string', 1, '1'),
+        param('out', 'durationMs', 'integer', 0, '1'),
+      ]),
+    ],
+  }
+);
 
 type InputParameters = {
+  shardId?: string;
   tableName: string[];
   fastUpdateAction?: 'set' | 'reset';
   fastUpdateValue?: boolean;
@@ -50,7 +48,7 @@ type InputParameters = {
   ginPendingListLimitValue?: number;
 };
 
-type OutputAction = {
+export type OutputAction = {
   sql: string;
   durationMs?: number;
 };
@@ -62,10 +60,11 @@ export async function dbConfigureIndexesHandler(req: FhirRequest): Promise<FhirR
   }
 
   const params = parseInputParameters<InputParameters>(operation, req);
+  const shardId = getShardIdParam(params);
   const config: GinIndexConfig = {};
 
   for (const table of params.tableName) {
-    if (!isValidTableName(table)) {
+    if (!isValidPostgresIdentifier(table)) {
       throw new OperationOutcomeError(badRequest('Invalid tableName'));
     }
   }
@@ -99,22 +98,19 @@ export async function dbConfigureIndexesHandler(req: FhirRequest): Promise<FhirR
     );
   }
 
-  const systemRepo = getShardSystemRepo(PLACEHOLDER_SHARD_ID); // shardId will be an input to this handler
+  // The AsyncJob stays on the global shard so the job status endpoint can find it; only the index work targets shardId
+  const systemRepo = getShardSystemRepo(GLOBAL_SHARD_ID);
   const { baseUrl } = getConfig();
   const exec = new AsyncJobExecutor(systemRepo);
   await exec.init(concatUrls(baseUrl, 'fhir/R4' + req.url));
   exec.start(async () => {
     const action: OutputAction[] = [];
-    await withLongRunningDatabaseClient(async (client) => {
-      await configureGinIndexes(client, action, tableNames, config);
-
-      // Vacuum if the fastupdate is disabled to flush GIN pending lists
-      if (config.fastUpdate === false) {
-        for (const tableName of tableNames) {
-          await vacuumTable(client, action, tableName);
-        }
-      }
-    }, DatabaseMode.WRITER);
+    await withLongRunningDatabaseClient(
+      async (client) => {
+        await configureGinIndexes(client, action, tableNames, config);
+      },
+      { shardId }
+    );
     return buildOutputParameters(operation, { action });
   });
   return [accepted(exec.getContentLocation(baseUrl))];
@@ -125,8 +121,8 @@ type GinIndexConfig = {
   ginPendingListLimit?: 'reset' | number;
 };
 
-async function configureGinIndexes(
-  client: PoolClient | Pool,
+export async function configureGinIndexes(
+  client: PgQueryable,
   actions: OutputAction[],
   tableNames: string[],
   config: GinIndexConfig
@@ -213,9 +209,17 @@ async function configureGinIndexes(
       actions.push({ sql: action.setSql });
     }
   }
+
+  // Vacuum if the fastupdate is disabled to flush GIN pending lists
+  if (config.fastUpdate === false) {
+    // intentionally vacuum serially to avoid overloading the database
+    for (const tableName of tableNames) {
+      await vacuumTable(client, actions, tableName);
+    }
+  }
 }
 
-async function vacuumTable(client: PoolClient | Pool, actions: OutputAction[], tableName: string): Promise<void> {
+async function vacuumTable(client: PgQueryable, actions: OutputAction[], tableName: string): Promise<void> {
   const sql = `VACUUM ${escapeIdentifier(tableName)}`;
   const startTime = Date.now();
   await client.query(sql);

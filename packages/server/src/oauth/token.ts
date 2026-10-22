@@ -1,32 +1,46 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { ProfileResource, WithId } from '@medplum/core';
+import type { JWTPayload, Operation, ProfileResource, WithId } from '@medplum/core';
 import {
   ContentType,
   OAuthClientAssertionType,
   OAuthGrantType,
   OAuthSigningAlgorithm,
   OAuthTokenType,
+  OperationOutcomeError,
   Operator,
+  badRequest,
   createReference,
   getStatus,
   isJwt,
+  isString,
   normalizeErrorString,
   normalizeOperationOutcome,
   parseJWTPayload,
   resolveId,
 } from '@medplum/core';
-import type { ClientApplication, Login, ProjectMembership, Reference, User } from '@medplum/fhirtypes';
+import type {
+  ClientApplication,
+  IdentityProvider,
+  Login,
+  ProjectMembership,
+  Reference,
+  User,
+} from '@medplum/fhirtypes';
 import type { Request, RequestHandler, Response } from 'express';
 import type { JWTVerifyOptions } from 'jose';
-import { createRemoteJWKSet, jwtVerify } from 'jose';
-import { randomUUID } from 'node:crypto';
+import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
+import { createHash, randomUUID } from 'node:crypto';
 import { getUserConfiguration } from '../auth/me';
 import { getProjectIdByClientId } from '../auth/utils';
 import { getConfig } from '../config/loader';
+import { AUTH_CODE_EXPIRATION_MS } from '../constants';
 import { getAccessPolicyForLogin } from '../fhir/accesspolicy';
+import { getInactiveReason } from '../fhir/projectmembership';
 import { getGlobalSystemRepo } from '../fhir/repo';
 import { getTopicForUser } from '../fhircast/utils';
+import { getLogger } from '../logger';
+import { getProjectIdFromUrl, getProjectScopedUrl, safeFetch } from '../util/url';
 import { validateClientCert } from './cert';
 import type { MedplumRefreshTokenClaims } from './keys';
 import { generateSecret, verifyJwt } from './keys';
@@ -45,6 +59,13 @@ import {
 
 type ClientIdAndSecret = { error?: string; clientId?: string; clientSecret?: string };
 type FhircastProps = { 'hub.topic': string; 'hub.url': string };
+
+/**
+ * How long after a rotation the previous refresh token is still accepted from the same IP address,
+ * so that a retry after a lost response, or a concurrent refresh with the same token, does not
+ * revoke the login.
+ */
+const REFRESH_GRACE_PERIOD_MS = 30_000;
 
 /**
  * Handles the OAuth/OpenID Token Endpoint.
@@ -82,6 +103,9 @@ export const tokenHandler: RequestHandler = async (req: Request, res: Response):
       break;
     case OAuthGrantType.TokenExchange:
       await handleTokenExchange(req, res);
+      break;
+    case OAuthGrantType.PreAuthorizedCode:
+      await handlePreAuthorizedCode(req, res);
       break;
     default:
       sendTokenError(res, 'invalid_request', 'Unsupported grant_type');
@@ -129,14 +153,24 @@ async function handleClientCredentials(req: Request, res: Response): Promise<voi
     return;
   }
 
-  const membership = await getClientApplicationMembership(systemRepo, client);
+  const membership = await getClientApplicationMembership(systemRepo, client, getProjectIdFromUrl(req.originalUrl));
   if (!membership) {
     sendTokenError(res, 'invalid_request', 'Invalid client');
     return;
   }
 
   const project = await systemRepo.readReference(membership.project);
+  const inactiveReason = getInactiveReason(project, membership);
+  if (inactiveReason) {
+    sendTokenError(res, 'access_denied', inactiveReason);
+    return;
+  }
+
   const scope = (req.body.scope || 'openid') as string;
+
+  if (scope.includes('patient/')) {
+    throw new OperationOutcomeError(badRequest('Cannot use client credentials with patient scope'));
+  }
 
   const login = await systemRepo.createResource<Login>({
     resourceType: 'Login',
@@ -162,7 +196,7 @@ async function handleClientCredentials(req: Request, res: Response): Promise<voi
     return;
   }
 
-  await sendTokenResponse(res, login, client);
+  await sendTokenResponse(req, res, login, client);
 }
 
 /**
@@ -224,6 +258,12 @@ async function handleAuthorizationCode(req: Request, res: Response): Promise<voi
     return;
   }
 
+  const issuedAt = Date.parse(login.meta?.lastUpdated ?? '');
+  if (!Number.isFinite(issuedAt) || Date.now() - issuedAt >= AUTH_CODE_EXPIRATION_MS) {
+    sendTokenError(res, 'invalid_grant', 'Authorization code expired');
+    return;
+  }
+
   let client: ClientApplication | undefined;
   try {
     if (clientId) {
@@ -258,7 +298,7 @@ async function handleAuthorizationCode(req: Request, res: Response): Promise<voi
     }
   }
 
-  await sendTokenResponse(res, login, client);
+  await sendTokenResponse(req, res, login, client);
 }
 
 /**
@@ -276,7 +316,8 @@ async function handleRefreshToken(req: Request, res: Response): Promise<void> {
 
   let claims: MedplumRefreshTokenClaims;
   try {
-    claims = (await verifyJwt(refreshToken)).payload as MedplumRefreshTokenClaims;
+    claims = (await verifyJwt(refreshToken, getProjectScopedUrl(req.originalUrl, getConfig().issuer)))
+      .payload as MedplumRefreshTokenClaims;
   } catch {
     sendTokenError(res, 'invalid_request', 'Invalid refresh token');
     return;
@@ -296,11 +337,25 @@ async function handleRefreshToken(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  // Use a timing-safe-equal here so that we don't expose timing information which could be
-  // used to infer the secret value
-  if (!timingSafeEqualStr(login.refreshSecret, claims.refresh_secret)) {
-    sendTokenError(res, 'invalid_request', 'Invalid token');
-    return;
+  if (login.membership) {
+    const membership = await systemRepo.readReference<ProjectMembership>(login.membership);
+    const project = await systemRepo.readReference(membership.project);
+    const inactiveReason = getInactiveReason(project, membership);
+    if (inactiveReason) {
+      sendTokenError(res, 'access_denied', inactiveReason);
+      return;
+    }
+  }
+
+  let client: ClientApplication | undefined;
+  if (login.client) {
+    const clientId = resolveId(login.client) ?? '';
+    try {
+      client = await systemRepo.readResource<ClientApplication>('ClientApplication', clientId);
+    } catch {
+      sendTokenError(res, 'invalid_request', 'Invalid client');
+      return;
+    }
   }
 
   const authHeader = req.headers.authorization;
@@ -320,29 +375,132 @@ async function handleRefreshToken(req: Request, res: Response): Promise<void> {
       sendTokenError(res, 'invalid_grant', 'Incorrect client secret');
       return;
     }
-  }
-
-  let client: ClientApplication | undefined;
-  if (login.client) {
-    const clientId = resolveId(login.client) ?? '';
-    try {
-      client = await systemRepo.readResource<ClientApplication>('ClientApplication', clientId);
-    } catch {
-      sendTokenError(res, 'invalid_request', 'Invalid client');
+    if (!(await validateClientIdAndSecret(res, client, clientSecret))) {
       return;
     }
   }
 
-  // Refresh token rotation
-  // Generate a new refresh secret and update the login
-  const updatedLogin = await systemRepo.updateResource<Login>({
-    ...login,
-    refreshSecret: generateSecret(32),
-    remoteAddress: req.ip,
-    userAgent: req.get('User-Agent'),
-  });
+  // Use a timing-safe-equal here so that we don't expose timing information which could be
+  // used to infer the secret value. A mismatch skips the rotation and goes straight to the
+  // grace period and reuse checks below.
+  const updatedLogin = timingSafeEqualStr(login.refreshSecret, claims.refresh_secret)
+    ? await rotateLoginRefreshSecret(login, claims.refresh_secret, {
+        remoteAddress: req.ip,
+        userAgent: req.get('User-Agent'),
+      })
+    : undefined;
 
-  await sendTokenResponse(res, updatedLogin, client);
+  if (updatedLogin) {
+    await sendTokenResponse(req, res, updatedLogin, client);
+    return;
+  }
+
+  // Re-read, because `login` is stale if this request lost a race with a concurrent refresh.
+  const currentLogin = await systemRepo.readResource<Login>('Login', login.id);
+  if (isWithinRefreshGracePeriod(currentLogin, claims.refresh_secret, req.ip)) {
+    // The secret was rotated moments ago from the same IP, so this is most likely a retry after a
+    // lost response or a concurrent refresh. Issue tokens for the current secret without rotating.
+    await sendTokenResponse(req, res, currentLogin, client);
+    return;
+  }
+
+  // `verifyJwt` proved this server minted the token for this login, so a stale secret outside the
+  // grace period is treated as reuse. See the OAuth 2.0 Security BCP, 4.14.2.
+  //
+  // Patched rather than `revokeLogin`, which writes back the caller's snapshot and could restore a
+  // superseded secret along with `revoked`.
+  await systemRepo.patchResource<Login>('Login', login.id, [{ op: 'add', path: '/revoked', value: true }]);
+  getLogger().warn('Refresh token reuse detected, login revoked', {
+    login: login.id,
+    remoteAddress: req.ip,
+  });
+  sendTokenError(res, 'invalid_grant', 'Token revoked');
+}
+
+/**
+ * Returns true if the presented secret is the one replaced by the most recent rotation, and that
+ * rotation happened within the grace period, from the same IP address as this request.
+ * @param login - The current login, read after the rotation attempt failed.
+ * @param presentedSecret - The refresh secret presented by the caller.
+ * @param remoteAddress - The IP address of this request.
+ * @returns True if the refresh should succeed with the current secret.
+ */
+function isWithinRefreshGracePeriod(login: Login, presentedSecret: string, remoteAddress: string | undefined): boolean {
+  if (login.revoked || !login.refreshSecret || !login.previousRefreshSecret || !login.refreshSecretRotatedAt) {
+    return false;
+  }
+  // The rotation records the IP it came from, so a replay from anywhere else is treated as reuse
+  if (!remoteAddress || remoteAddress !== login.remoteAddress) {
+    return false;
+  }
+  if (!timingSafeEqualStr(login.previousRefreshSecret, presentedSecret)) {
+    return false;
+  }
+  const elapsed = Date.now() - new Date(login.refreshSecretRotatedAt).getTime();
+  return elapsed >= 0 && elapsed < REFRESH_GRACE_PERIOD_MS;
+}
+
+/**
+ * Consumes a login's refresh secret and rotates it, as one atomic step.
+ *
+ * The `test` operation makes this a compare-and-swap: `patchResource` reads the login from the
+ * database inside its own transaction, so the test runs against the committed secret and the whole
+ * patch is rejected if it has moved on. A concurrent caller writing the same row raises a
+ * serialization failure, which `withTransaction` retries by re-running the callback; the retry
+ * re-reads, fails the test, and so takes the same path as any other replay.
+ *
+ * The replaced secret and the rotation time are recorded so that a retry with the previous token
+ * can be recognized within the grace period.
+ *
+ * The rotation is applied via `patchResource` rather than a full
+ * `updateResource` of a `{ ...login }` snapshot. `patchResource` re-reads the
+ * login inside its own transaction and mutates only the patched fields, so it
+ * cannot drop fields that a concurrent request set after the caller's read — in
+ * particular the single-use email-MFA challenge code on `login.emailMfa`, which
+ * is written by `/send-email-challenge` and read by `/enroll`. A full overwrite
+ * of a stale snapshot would clobber it, making the user's subsequent code
+ * submission fail with a spurious "Invalid token" while enrolling in email MFA.
+ *
+ * @param login - The login to rotate; only its `id` is authoritative.
+ * @param expectedSecret - The refresh secret presented by the caller.
+ * @param details - Request metadata to record on the login.
+ * @param details.remoteAddress - The client IP address to record, if any.
+ * @param details.userAgent - The client user agent to record, if any.
+ * @returns The updated login, or undefined if the presented secret was not the current one.
+ */
+export async function rotateLoginRefreshSecret(
+  login: WithId<Login>,
+  expectedSecret: string,
+  details?: { remoteAddress?: string; userAgent?: string }
+): Promise<WithId<Login> | undefined> {
+  const systemRepo = getGlobalSystemRepo();
+  const patch: Operation[] = [
+    { op: 'test', path: '/refreshSecret', value: expectedSecret },
+    { op: 'replace', path: '/refreshSecret', value: generateSecret(32) },
+    { op: 'add', path: '/previousRefreshSecret', value: expectedSecret },
+    { op: 'add', path: '/refreshSecretRotatedAt', value: new Date().toISOString() },
+  ];
+  if (details?.remoteAddress !== undefined) {
+    patch.push({ op: 'add', path: '/remoteAddress', value: details.remoteAddress });
+  }
+  if (details?.userAgent !== undefined) {
+    patch.push({ op: 'add', path: '/userAgent', value: details.userAgent });
+  }
+
+  try {
+    return await systemRepo.patchResource<Login>('Login', login.id, patch);
+  } catch (err) {
+    // A 400 means the test operation failed, unless the presented secret is still current, in which
+    // case the patch was rejected for some other reason. That, like a connection loss or an
+    // exhausted retry, says nothing about reuse.
+    if (err instanceof OperationOutcomeError && getStatus(err.outcome) === 400) {
+      const current = await systemRepo.readResource<Login>('Login', login.id);
+      if (!timingSafeEqualStr(current.refreshSecret, expectedSecret)) {
+        return undefined;
+      }
+    }
+    throw err;
+  }
 }
 
 /**
@@ -381,54 +539,65 @@ export async function exchangeExternalAuthToken(
   subjectTokenType: OAuthTokenType,
   membershipId?: string
 ): Promise<void> {
-  if (!clientId) {
-    sendTokenError(res, 'invalid_request', 'Invalid client');
-    return;
-  }
-
-  if (!subjectToken) {
-    sendTokenError(res, 'invalid_request', 'Invalid subject_token');
-    return;
-  }
-
-  if (subjectTokenType !== OAuthTokenType.AccessToken) {
-    sendTokenError(res, 'invalid_request', 'Invalid subject_token_type');
+  if (!validateExternalAuthTokenExchangeRequest(res, clientId, subjectToken, subjectTokenType)) {
     return;
   }
 
   const systemRepo = getGlobalSystemRepo();
-  const projectId = await getProjectIdByClientId(clientId, undefined);
-  const client = await systemRepo.readResource<ClientApplication>('ClientApplication', clientId);
-  const idp = client.identityProvider;
+  let client: ClientApplication | undefined;
+  // Server external auth providers are selected before ClientApplication lookup.
+  let idp = resolveExternalAuthProvider(clientId);
+  const useServerExternalAuth = !!idp;
+
+  if (!idp) {
+    client = await tryReadTokenExchangeClient(systemRepo, clientId);
+    if (!client) {
+      sendTokenError(res, 'invalid_request', 'Invalid client');
+      return;
+    }
+
+    idp = resolveExternalAuthProvider(clientId, client);
+  }
+
   if (!idp) {
     sendTokenError(res, 'invalid_request', 'Invalid client');
     return;
   }
 
-  let userInfo;
-  try {
-    userInfo = await getExternalUserInfo(idp.userInfoUrl, subjectToken, idp);
-  } catch (err: any) {
-    const outcome = normalizeOperationOutcome(err);
-    sendTokenError(res, 'invalid_request', normalizeErrorString(err), getStatus(outcome));
+  let projectId: string | undefined;
+  if (useServerExternalAuth) {
+    if (membershipId) {
+      let membership: ProjectMembership;
+      try {
+        membership = await systemRepo.readResource<ProjectMembership>('ProjectMembership', membershipId);
+      } catch {
+        sendTokenError(res, 'invalid_request', 'Invalid membership');
+        return;
+      }
+
+      projectId = resolveId(membership.project);
+      if (!projectId) {
+        sendTokenError(res, 'invalid_request', 'Invalid membership');
+        return;
+      }
+    }
+  } else {
+    projectId = await getProjectIdByClientId(clientId, undefined);
+  }
+
+  const userInfo = await tryGetExternalUserInfo(res, idp, subjectToken);
+  if (!userInfo) {
     return;
   }
 
-  let email: string | undefined = undefined;
-  let externalId: string | undefined = undefined;
-  if (idp.useSubject) {
-    externalId = userInfo.sub as string;
-  } else {
-    email = userInfo.email as string;
-  }
-
+  const { email, externalId } = getExternalAuthLoginIdentity(idp, userInfo);
   const login = await tryLogin({
     authMethod: 'exchange',
     email,
     externalId,
     projectId,
-    clientId,
-    scope: req.body.scope || 'openid offline',
+    clientId: client?.id,
+    scope: req.body.scope || 'openid offline_access',
     nonce: req.body.nonce || randomUUID(),
     remoteAddress: req.ip,
     userAgent: req.get('User-Agent'),
@@ -436,7 +605,187 @@ export async function exchangeExternalAuthToken(
     membershipId,
   });
 
-  await sendTokenResponse(res, login, client);
+  // Token exchange carries the same proof as the external auth callback, so verify on the
+  // same terms.
+  await systemRepo.patchResource<User>('User', resolveId(login.user) as string, [
+    { op: 'add', path: '/emailVerified', value: true },
+  ]);
+
+  await sendTokenResponse(req, res, login, client);
+}
+
+function validateExternalAuthTokenExchangeRequest(
+  res: Response,
+  clientId: string,
+  subjectToken: string,
+  subjectTokenType: OAuthTokenType
+): boolean {
+  if (!clientId) {
+    sendTokenError(res, 'invalid_request', 'Invalid client');
+    return false;
+  }
+
+  if (!subjectToken) {
+    sendTokenError(res, 'invalid_request', 'Invalid subject_token');
+    return false;
+  }
+
+  if (subjectTokenType !== OAuthTokenType.AccessToken) {
+    sendTokenError(res, 'invalid_request', 'Invalid subject_token_type');
+    return false;
+  }
+
+  return true;
+}
+
+async function tryReadTokenExchangeClient(
+  systemRepo: ReturnType<typeof getGlobalSystemRepo>,
+  clientId: string
+): Promise<ClientApplication | undefined> {
+  try {
+    return await systemRepo.readResource<ClientApplication>('ClientApplication', clientId);
+  } catch {
+    return undefined;
+  }
+}
+
+async function tryGetExternalUserInfo(
+  res: Response,
+  idp: IdentityProvider,
+  subjectToken: string
+): Promise<JWTPayload | undefined> {
+  if (!idp.userInfoUrl) {
+    sendTokenError(res, 'invalid_request', 'Missing user info URL', 400);
+    return undefined;
+  }
+  try {
+    return await getExternalUserInfo(idp.userInfoUrl, subjectToken, idp);
+  } catch (err: any) {
+    const outcome = normalizeOperationOutcome(err);
+    sendTokenError(res, 'invalid_request', normalizeErrorString(err), getStatus(outcome));
+    return undefined;
+  }
+}
+
+function getExternalAuthLoginIdentity(
+  idp: IdentityProvider,
+  userInfo: JWTPayload
+): { email?: string; externalId?: string } {
+  if (idp.useSubject) {
+    return { externalId: userInfo.sub };
+  }
+
+  return { email: userInfo.email as string };
+}
+
+function resolveExternalAuthProvider(clientId: string, client?: ClientApplication): IdentityProvider | undefined {
+  const externalAuthConfig = getConfig().externalAuthProviders?.find(
+    (provider) => (provider.clientId ?? provider.identityProvider?.clientId) === clientId
+  );
+  if (externalAuthConfig) {
+    if (externalAuthConfig.identityProvider) {
+      return externalAuthConfig.identityProvider;
+    }
+
+    const userInfoUrl = externalAuthConfig.userInfoUrl;
+    if (userInfoUrl) {
+      return { userInfoUrl };
+    }
+  }
+
+  return client?.identityProvider;
+}
+
+/**
+ * Handles the "Pre-Authorized Code Grant" flow.
+ * See: https://openid.net/specs/openid-4-verifiable-credential-issuance-1_0.html#name-urnietfparamsoauthgrant-typ
+ * @param req - The HTTP request.
+ * @param res - The HTTP response.
+ */
+async function handlePreAuthorizedCode(req: Request, res: Response): Promise<void> {
+  const clientId = req.body.client_id;
+  if (!isString(clientId)) {
+    sendTokenError(res, 'invalid_request', 'Missing client_id');
+    return;
+  }
+
+  const preAuthorizedCode = req.body['pre-authorized_code'];
+  if (!isString(preAuthorizedCode)) {
+    sendTokenError(res, 'invalid_request', 'Missing pre-authorized_code');
+    return;
+  }
+
+  let client;
+  try {
+    client = await getClientApplication(clientId);
+  } catch {
+    sendTokenError(res, 'invalid_client', 'Invalid client');
+    return;
+  }
+  if (client.status && client.status !== 'active') {
+    sendTokenError(res, 'invalid_request', 'Invalid client');
+    return;
+  }
+
+  const systemRepo = getGlobalSystemRepo();
+  const searchResult = await systemRepo.search<Login>({
+    resourceType: 'Login',
+    filters: [
+      {
+        code: 'pre-authorized-code-hash',
+        operator: Operator.EQUALS,
+        value: createHash('sha256').update(preAuthorizedCode).digest('hex'),
+      },
+    ],
+  });
+
+  const login = searchResult?.entry?.[0]?.resource;
+  if (login?.authMethod !== 'pre-authorized') {
+    sendTokenError(res, 'invalid_request', 'Invalid pre-authorized_code');
+    return;
+  }
+
+  if (login.client?.reference !== `ClientApplication/${clientId}`) {
+    sendTokenError(res, 'invalid_request', 'Invalid client');
+    return;
+  }
+
+  if (!login.membership) {
+    sendTokenError(res, 'invalid_request', 'Invalid profile');
+    return;
+  }
+
+  if (!login.expiresAt || new Date(login.expiresAt) < new Date()) {
+    sendTokenError(res, 'invalid_grant', 'Pre-authorized code expired');
+    return;
+  }
+
+  if (login.granted) {
+    await revokeLogin(systemRepo, login);
+    sendTokenError(res, 'invalid_grant', 'Token already granted');
+    return;
+  }
+
+  if (login.revoked) {
+    sendTokenError(res, 'invalid_grant', 'Token revoked');
+    return;
+  }
+
+  login.remoteAddress = req.ip;
+  login.userAgent = req.get('User-Agent');
+
+  try {
+    const membership = await systemRepo.readReference(login.membership);
+    const project = await systemRepo.readReference(membership.project);
+    const userConfig = await getUserConfiguration(systemRepo, project, membership);
+    const accessPolicy = await getAccessPolicyForLogin({ project, login, membership, userConfig });
+    await checkIpAccessRules(login, accessPolicy);
+  } catch (err) {
+    sendTokenError(res, 'invalid_request', normalizeErrorString(err));
+    return;
+  }
+
+  await sendTokenResponse(req, res, login, client);
 }
 
 /**
@@ -453,7 +802,7 @@ export async function exchangeExternalAuthToken(
  */
 async function getClientIdAndSecret(req: Request): Promise<ClientIdAndSecret> {
   if (req.body.client_assertion_type) {
-    return parseClientAssertion(req.body.client_assertion_type, req.body.client_assertion);
+    return parseClientAssertion(req, req.body.client_assertion_type, req.body.client_assertion);
   }
 
   const authHeader = req.headers.authorization;
@@ -490,11 +839,13 @@ async function getClientIdAndSecret(req: Request): Promise<ClientIdAndSecret> {
  * 2. https://www.hl7.org/fhir/smart-app-launch/example-backend-services.html#step-2-discovery
  * 3. https://docs.oracle.com/en/cloud/get-started/subscriptions-cloud/csimg/obtaining-access-token-using-self-signed-client-assertion.html
  * 4. https://darutk.medium.com/oauth-2-0-client-authentication-4b5f929305d4
+ * @param req - The HTTP request.
  * @param clientAssertionType - The client assertion type.
  * @param clientAssertion - The client assertion JWT.
  * @returns The parsed client ID and secret on success, or an error message on failure.
  */
 async function parseClientAssertion(
+  req: Request,
   clientAssertionType: OAuthClientAssertionType,
   clientAssertion: string
 ): Promise<ClientIdAndSecret> {
@@ -506,7 +857,8 @@ async function parseClientAssertion(
     return { error: 'Invalid client assertion' };
   }
 
-  const { tokenUrl } = getConfig();
+  const config = getConfig();
+  const tokenUrl = getProjectScopedUrl(req.originalUrl, config.baseUrl, config.tokenUrl);
   const claims = parseJWTPayload(clientAssertion);
 
   if (claims.aud !== tokenUrl) {
@@ -530,7 +882,7 @@ async function parseClientAssertion(
     return { error: 'Client must have a JWK Set URL' };
   }
 
-  const JWKS = createRemoteJWKSet(new URL(client.jwksUri));
+  const JWKS = createRemoteJWKSet(new URL(client.jwksUri), { [customFetch]: safeFetch });
 
   const verifyOptions: JWTVerifyOptions = {
     issuer: clientId,
@@ -647,11 +999,17 @@ async function validateClientIdAndSecret(
 
 /**
  * Sends a successful token response.
+ * @param req - The HTTP request.
  * @param res - The HTTP response.
  * @param login - The user login.
  * @param client - The client application. Optional.
  */
-async function sendTokenResponse(res: Response, login: WithId<Login>, client?: ClientApplication): Promise<void> {
+async function sendTokenResponse(
+  req: Request,
+  res: Response,
+  login: WithId<Login>,
+  client?: ClientApplication
+): Promise<void> {
   const config = getConfig();
 
   const systemRepo = getGlobalSystemRepo();
@@ -663,6 +1021,7 @@ async function sendTokenResponse(res: Response, login: WithId<Login>, client?: C
   const tokens = await getAuthTokens(user, login, membership.profile as Reference<ProfileResource>, {
     accessLifetime: client?.accessTokenLifetime,
     refreshLifetime: client?.refreshTokenLifetime,
+    issuer: getProjectScopedUrl(req.originalUrl, config.issuer),
   });
   let patient = undefined;
   let encounter = undefined;

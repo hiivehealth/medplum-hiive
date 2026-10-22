@@ -8,11 +8,11 @@ import type { FhirPathAtom } from '../fhirpath/atoms';
 import { evalFhirPathTyped } from '../fhirpath/parse';
 import { toTypedValue } from '../fhirpath/utils';
 import type { Logger } from '../logger';
-import { normalizeErrorString, OperationOutcomeError, serverError, validationError } from '../outcomes';
+import { normalizeErrorString, OperationOutcomeError, validationError } from '../outcomes';
 import { matchesSearchRequest } from '../search/match';
 import { parseSearchRequest } from '../search/search';
 import type { ProfileResource, WithId } from '../utils';
-import { deepEquals, extractAccountReferences, getExtension, getReferenceString, resolveId } from '../utils';
+import { deepEquals, EMPTY, extractAccountReferences, getExtension, getReferenceString, resolveId } from '../utils';
 import type { IReconnectingWebSocket, IReconnectingWebSocketCtor } from '../websockets/reconnecting-websocket';
 import { ReconnectingWebSocket } from '../websockets/reconnecting-websocket';
 import {
@@ -165,7 +165,11 @@ export class SubscriptionManager {
         }
         const bundle = parsedData;
         // Get criteria for event
-        const status = bundle?.entry?.[0]?.resource as SubscriptionStatus;
+        const status = bundle?.entry?.[0]?.resource as SubscriptionStatus | undefined;
+        if (!status) {
+          console.warn('Received WebSocket message without a SubscriptionStatus resource; ignoring', bundle);
+          return;
+        }
 
         // Handle heartbeat
         if (status.type === 'heartbeat') {
@@ -211,10 +215,22 @@ export class SubscriptionManager {
       }
     });
 
-    ws.addEventListener('error', () => {
+    ws.addEventListener('error', (event) => {
       const errorEvent = {
         type: 'error',
-        payload: new OperationOutcomeError(serverError(new Error('WebSocket error'))),
+        payload: new OperationOutcomeError({
+          resourceType: 'OperationOutcome',
+          issue: [
+            {
+              severity: 'error',
+              code: 'exception',
+              details: {
+                text: 'WebSocket connection closed due to an error',
+              },
+              diagnostics: event.error ? normalizeErrorString(event.error) : event.message,
+            },
+          ],
+        }),
       } as SubscriptionEventMap['error'];
       this.masterSubEmitter?.dispatchEvent(errorEvent);
       for (const emitter of this.getAllCriteriaEmitters()) {
@@ -407,6 +423,12 @@ export class SubscriptionManager {
     if (this.ws.readyState !== WebSocket.OPEN) {
       return;
     }
+    // If a user is not logged in, skip the rebind. Attempting it would 401 on
+    // $get-ws-binding-token. The entry stays idle and will be picked up by
+    // refreshAllSubscriptions once a connection is (re)established while authenticated.
+    if (!this.medplum.getProfile()) {
+      return;
+    }
     // Only subscribe idle entries — connecting/active/refreshing entries already have an operation in progress,
     // and removed entries are dead
     if (criteriaEntry.state !== 'idle') {
@@ -444,11 +466,12 @@ export class SubscriptionManager {
       if (criteriaEntry.token) {
         this.sendUnbind(criteriaEntry.token);
       }
-      // Reset binding state so the entry can be re-subscribed.
-      // We preserve subscriptionId so rebindCriteriaEntry can reuse
-      // the existing Subscription resource instead of creating a new one.
+      // Reset binding state so the entry can be re-subscribed. The server drops the
+      // Subscription bound to the closed connection, so clear subscriptionId too and
+      // let rebindCriteriaEntry recreate it on the new connection.
       criteriaEntry.token = undefined;
       criteriaEntry.tokenExpiry = undefined;
+      criteriaEntry.subscriptionId = undefined;
       criteriaEntry.state = 'idle';
       criteriaEntry.generation++;
       await this.subscribeToCriteria(criteriaEntry);
@@ -516,6 +539,10 @@ export class SubscriptionManager {
   }
 
   private checkTokenExpirations(): void {
+    // Don't attempt token refreshes while unauthenticated — they would 401 in a loop.
+    if (!this.medplum.getProfile()) {
+      return;
+    }
     const now = Date.now();
     for (const mapEntry of this.criteriaEntries.values()) {
       for (const criteriaEntry of getAllEntries(mapEntry)) {
@@ -729,14 +756,25 @@ export async function resourceMatchesSubscriptionCriteria({
     return false;
   }
 
-  const supportedInteractionExtension = getExtension(
-    subscription,
-    'https://medplum.com/fhir/StructureDefinition/subscription-supported-interaction'
-  );
-  if (supportedInteractionExtension && supportedInteractionExtension.valueCode !== context.interaction) {
-    logger?.debug(
-      `Ignore rest hook for different interaction (wanted "${supportedInteractionExtension.valueCode}", received "${context.interaction}")`
-    );
+  // A Subscription can declare one or more `subscription-supported-interaction` extensions.
+  // When present, the interaction is only supported if it matches one of the declared codes.
+  // When absent, all interactions ("create", "update", "delete") are supported by default.
+  let specifiedInteractions = false;
+  let supportsInteraction = false;
+  for (const ext of subscription.extension ?? EMPTY) {
+    if (ext.url === 'https://medplum.com/fhir/StructureDefinition/subscription-supported-interaction') {
+      specifiedInteractions = true;
+      if (ext.valueCode === context.interaction) {
+        supportsInteraction = true;
+        break;
+      }
+    }
+  }
+  if (specifiedInteractions && !supportsInteraction) {
+    logger?.debug(`Ignored rest hook for unsupported interaction`, {
+      subscription: subscription.id,
+      interaction: context.interaction,
+    });
     return false;
   }
 

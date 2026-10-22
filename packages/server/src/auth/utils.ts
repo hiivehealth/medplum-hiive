@@ -1,7 +1,14 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { ProfileResource, WithId } from '@medplum/core';
-import { badRequest, createReference, OperationOutcomeError, Operator, resolveId } from '@medplum/core';
+import {
+  badRequest,
+  createReference,
+  getReferenceString,
+  OperationOutcomeError,
+  Operator,
+  resolveId,
+} from '@medplum/core';
 import type {
   ContactPoint,
   Login,
@@ -13,17 +20,240 @@ import type {
 } from '@medplum/fhirtypes';
 import bcrypt from 'bcrypt';
 import type { Handler, NextFunction, Request, Response } from 'express';
-import fetch from 'node-fetch';
+import { randomInt } from 'node:crypto';
 import { authenticator } from 'otplib';
 import { toDataURL } from 'qrcode';
 import { getConfig } from '../config/loader';
+import { EMAIL_MFA_CODE_EXPIRATION_MS, MAX_PASSWORD_LENGTH } from '../constants';
+import { sendEmail } from '../email/email';
+import { getProjectAppName } from '../email/utils';
 import { sendOutcome } from '../fhir/outcomes';
+import { getInactiveReason } from '../fhir/projectmembership';
 import type { SystemRepository } from '../fhir/repo';
-import { getGlobalSystemRepo, getShardSystemRepo } from '../fhir/repo';
+import { getGlobalSystemRepo } from '../fhir/repo';
 import { rewriteAttachments, RewriteMode } from '../fhir/rewrite';
-import { TODO_SHARD_ID } from '../fhir/sharding';
 import { getLogger } from '../logger';
 import { getClientApplication, getMembershipsForLogin } from '../oauth/utils';
+
+export type MfaMethod = 'totp' | 'email';
+
+/** App name used in MFA emails for projects that have not been white-labeled. */
+const DEFAULT_APP_NAME = 'Medplum';
+
+/** Authenticator app issuer used for projects that have not been white-labeled. */
+const DEFAULT_MFA_ISSUER = 'medplum.com';
+
+/**
+ * Returns the MFA methods that a project allows users to enroll in.
+ * Controlled by the `allowedMfaMethods` project setting, a comma-delimited
+ * string (e.g. "totp", "email", or "totp,email"). When unset, only TOTP
+ * authenticator enrollment is offered, preserving the historical behavior.
+ * @param project - The project to read the setting from.
+ * @returns The list of allowed MFA methods.
+ */
+export function getAllowedMfaMethods(project: Project | undefined): MfaMethod[] {
+  const value = project?.setting?.find((s) => s.name === 'allowedMfaMethods')?.valueString;
+  if (!value) {
+    return ['totp'];
+  }
+  const methods = value
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s): s is MfaMethod => s === 'totp' || s === 'email');
+  return methods.length > 0 ? methods : ['totp'];
+}
+
+export function getAllowedEmailDomains(project: Project | undefined): string[] {
+  return (
+    project?.setting
+      ?.filter((s) => s.name === 'allowedPractitionerEmailDomain')
+      .map((s) => s.valueString?.trim().toLowerCase())
+      .filter((domain): domain is string => !!domain) ?? []
+  );
+}
+
+/**
+ * Determines whether an email address is allowed to be used for a new Practitioner user or invite.
+ *
+ * `blockedDomains` (typically the server-wide `blockedEmailDomains` config setting) always
+ * takes precedence: a blocked domain is rejected even if it also appears in the project's
+ * `allowedPractitionerEmailDomain` setting.
+ * @param email - The email address to check.
+ * @param project - The project the email is being used with, if known.
+ * @param blockedDomains - Domains that are never allowed, regardless of project settings.
+ * @returns True if the email's domain is allowed.
+ */
+export function isPractitionerEmailDomainAllowed(
+  email: string,
+  project: Project | undefined,
+  blockedDomains: string[] = []
+): boolean {
+  const atIndex = email.lastIndexOf('@');
+  const domain = atIndex === -1 ? '' : email.slice(atIndex + 1).toLowerCase();
+
+  if (blockedDomains.some((blocked) => blocked.trim().toLowerCase() === domain)) {
+    return false;
+  }
+
+  const allowedDomains = getAllowedEmailDomains(project);
+  if (allowedDomains.length === 0) {
+    return true;
+  }
+  return allowedDomains.includes(domain);
+}
+
+/**
+ * Determines whether a project accepts open self-registration.
+ * @param project - The project a user is attempting to register into.
+ * @returns An OperationOutcome describing the rejection, or undefined if registration is allowed.
+ */
+export function projectRegistrationAllowed(project: Project): OperationOutcome | undefined {
+  const inactiveReason = getInactiveReason(project);
+  if (inactiveReason) {
+    return badRequest(inactiveReason);
+  }
+  if (!project.defaultPatientAccessPolicy) {
+    return badRequest('Project does not allow open registration');
+  }
+  return undefined;
+}
+
+/**
+ * Determines whether MFA is required for a user logging in to a project.
+ *
+ * The project's `mfaRequired` setting (a boolean) can only *tighten* the
+ * requirement: enabling it forces MFA across the whole project even for users
+ * whose own `User.mfaRequired` flag is unset or `false`. It never relaxes a
+ * user who individually requires MFA.
+ * @param user - The user logging in.
+ * @param project - The project the user is logging in to, if known.
+ * @returns True if the user must use MFA.
+ */
+export function isMfaRequired(user: User, project: Project | undefined): boolean {
+  const projectMfaRequired = project?.setting?.find((s) => s.name === 'mfaRequired')?.valueBoolean;
+  return Boolean(projectMfaRequired) || Boolean(user.mfaRequired);
+}
+
+/**
+ * Builds the authenticator (TOTP) enrollment payload for a user, generating and
+ * persisting an `mfaSecret` first if the user does not have one.
+ *
+ * A secret is only created up front when a user is invited with `mfaRequired`,
+ * so a user who comes under a requirement later — for example when the
+ * project-wide `mfaRequired` setting is enabled — reaches enrollment without
+ * one. Generating on demand keeps the QR code usable in that case. Users who
+ * already have a secret keep it, so the URI is stable across repeated calls.
+ *
+ * The issuer is the project's app name and the account name identifies the user,
+ * so the entry reads as "Acme Health" / "alice@example.com" in the user's
+ * authenticator app. Authenticator apps show the issuer as the entry's title, so
+ * it is the part that carries the branding; the Key URI spec forbids colons in
+ * either field because apps split the label on the first one. Projects without an
+ * `appName` keep the `medplum.com` issuer.
+ * @param repo - The system repository used to persist a newly generated secret.
+ * @param user - The user enrolling in an authenticator app.
+ * @param project - The project the user is logging in to, if known.
+ * @returns The enrollment URI and a QR code data URL for it.
+ */
+export async function buildTotpEnrollment(
+  repo: SystemRepository,
+  user: WithId<User>,
+  project: Project | undefined
+): Promise<{ enrollUri: string; enrollQrCode: string }> {
+  let mfaSecret = user.mfaSecret;
+  if (!mfaSecret) {
+    mfaSecret = authenticator.generateSecret();
+    await repo.updateResource<User>({ ...user, mfaSecret });
+  }
+  const issuer = (getProjectAppName(project) ?? DEFAULT_MFA_ISSUER).replaceAll(':', '');
+  const enrollUri = authenticator.keyuri(user.email ?? user.id, issuer, mfaSecret);
+  return { enrollUri, enrollQrCode: await toDataURL(enrollUri) };
+}
+
+/**
+ * Returns the MFA methods that a user has enrolled in.
+ * Existing users enrolled before the introduction of `User.mfaMethod` are
+ * treated as TOTP, which was the only method at the time.
+ * @param user - The user.
+ * @returns The list of enrolled MFA methods, or an empty array if not enrolled.
+ */
+export function getEnrolledMfaMethods(user: User): MfaMethod[] {
+  if (user.mfaMethod && user.mfaMethod.length > 0) {
+    return user.mfaMethod;
+  }
+  return user.mfaEnrolled ? ['totp'] : [];
+}
+
+/**
+ * Clears the emailed MFA code from a login so it cannot be reused.
+ * Patched rather than written from `login`, which may predate a refresh-token rotation.
+ * @param login - The login holding the code.
+ */
+export async function clearMfaEmailCode(login: WithId<Login>): Promise<void> {
+  if (login.emailMfa) {
+    await getGlobalSystemRepo().patchResource<Login>('Login', login.id, [{ op: 'remove', path: '/emailMfa' }]);
+  }
+}
+
+/**
+ * Generates a single-use 6-digit code for email-based MFA, stores a hash of it
+ * (along with its expiration time) on the login, and emails the code to the user.
+ * The code is cleared once it is verified (see verifyMfaToken).
+ * @param login - The login to attach the hashed code to.
+ * @param user - The user to email.
+ * @param project - The project the user is logging in to, if known. Supplies the
+ * app name in the message and any project-level SMTP configuration.
+ */
+export async function sendMfaEmailCode(
+  login: WithId<Login>,
+  user: User,
+  project: WithId<Project> | undefined
+): Promise<void> {
+  const systemRepo = getGlobalSystemRepo();
+  const code = randomInt(0, 1_000_000).toString().padStart(6, '0');
+  const codeHash = await bcryptHashPassword(code);
+  const expiresAt = new Date(Date.now() + EMAIL_MFA_CODE_EXPIRATION_MS).toISOString();
+  // Patched rather than written from `login`, which may predate a refresh-token rotation
+  await systemRepo.patchResource<Login>('Login', login.id, [
+    { op: 'add', path: '/emailMfa', value: { codeHash, expiresAt } },
+  ]);
+  const expirationMinutes = Math.floor(EMAIL_MFA_CODE_EXPIRATION_MS / 60_000);
+  const appName = getProjectAppName(project) ?? DEFAULT_APP_NAME;
+  await sendEmail(
+    systemRepo,
+    {
+      to: user.email,
+      subject: `Your ${appName} verification code: ${code}`,
+      text: [
+        `Below is your requested ${appName} verification code. You can copy it into the open browser window to confirm your login.`,
+        '',
+        code,
+        '',
+        `This code will expire in ${expirationMinutes} minutes. If you did not try to sign in, you can safely ignore this email.`,
+        '',
+        'Thank you,',
+        `The ${appName} Team`,
+        '',
+      ].join('\n'),
+    },
+    project
+  );
+}
+
+/**
+ * Verifies that the supplied token matches the single-use email code stored on
+ * the login (and that it has not expired). Used both to complete email-based
+ * MFA enrollment and to satisfy the email factor when changing MFA settings.
+ * @param login - The login holding the hashed email code, if any.
+ * @param token - The user supplied 6-digit code.
+ * @returns True if the code matches and is unexpired.
+ */
+export async function verifyEmailMfaCode(login: Login, token: string | undefined): Promise<boolean> {
+  if (!token || !login.emailMfa) {
+    return false;
+  }
+  return new Date(login.emailMfa.expiresAt).getTime() >= Date.now() && bcrypt.compare(token, login.emailMfa.codeHash);
+}
 
 export async function createProfile(
   systemRepo: SystemRepository,
@@ -79,6 +309,23 @@ export async function createProjectMembership(
 }
 
 /**
+ * Reads the project associated with a login, if one is set.
+ * @param login - The login resource.
+ * @returns The project, or undefined if the login has no concrete project.
+ */
+export async function getLoginProject(login: Login): Promise<WithId<Project> | undefined> {
+  const reference = login.project?.reference;
+  if (!reference || reference === 'Project/new') {
+    return undefined;
+  }
+  try {
+    return await getGlobalSystemRepo().readReference<Project>(login.project as Reference<Project>);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * Sends a login response to the client.
  * If the user has multiple profiles, sends the list of profiles to choose from.
  * Otherwise, sends the authorization code.
@@ -88,18 +335,30 @@ export async function createProjectMembership(
 export async function sendLoginResult(res: Response, login: Login): Promise<void> {
   const systemRepo = getGlobalSystemRepo();
   const user = await systemRepo.readReference<User>(login.user as Reference<User>);
+  const project = await getLoginProject(login);
 
-  if (user.mfaRequired && !user.mfaEnrolled && login.authMethod === 'password' && !login.mfaVerified) {
-    const accountName = `Medplum - ${user.email}`;
-    const issuer = 'medplum.com';
-    const secret = user.mfaSecret as string;
-    const otp = authenticator.keyuri(accountName, issuer, secret);
-    res.json({ login: login.id, mfaEnrollRequired: true, enrollUri: otp, enrollQrCode: await toDataURL(otp) });
+  if (isMfaRequired(user, project) && !user.mfaEnrolled && login.authMethod === 'password' && !login.mfaVerified) {
+    const { enrollUri, enrollQrCode } = await buildTotpEnrollment(systemRepo, user, project);
+    res.json({
+      login: login.id,
+      mfaEnrollRequired: true,
+      enrollUri,
+      enrollQrCode,
+      allowedMfaMethods: getAllowedMfaMethods(project),
+    });
     return;
   }
 
   if (user.mfaEnrolled && login.authMethod === 'password' && !login.mfaVerified) {
-    res.json({ login: login.id, mfaRequired: true });
+    const mfaMethods = getEnrolledMfaMethods(user);
+    // If email is the user's only MFA method, send the verification code
+    // immediately so they can enter it without any further interaction. A set
+    // emailMfa means a code has already been issued for this login, so
+    // don't re-send (e.g. when the login status endpoint is queried again).
+    if (mfaMethods.length === 1 && mfaMethods[0] === 'email' && !login.emailMfa) {
+      await sendMfaEmailCode(login as WithId<Login>, user, project);
+    }
+    res.json({ login: login.id, mfaRequired: true, mfaMethods, email: user.email });
     return;
   }
 
@@ -123,9 +382,18 @@ export async function sendLoginResult(res: Response, login: Login): Promise<void
   // Safe to rewrite attachments,
   // because we know that these are all resources that the user has access to
   const memberships = await getMembershipsForLogin(login);
+  const uniqueRefs = [...new Map(memberships.map((m) => [m.project.reference, m.project])).values()];
+  const projects = await systemRepo.readReferences<Project>(uniqueRefs);
+  const freshProjectMap = new Map<string, Reference<Project>>();
+  for (const project of projects) {
+    if (!(project instanceof Error)) {
+      freshProjectMap.set(getReferenceString(project), createReference(project));
+    }
+  }
+
   const redactedMemberships = memberships.map((m) => ({
     id: m.id,
-    project: m.project,
+    project: m.project.reference ? freshProjectMap.get(m.project.reference) : m.project,
     profile: m.profile,
     identifier: m.identifier,
   }));
@@ -168,7 +436,7 @@ export async function verifyRecaptcha(secretKey: string, recaptchaToken: string)
     '&response=' +
     encodeURIComponent(recaptchaToken);
 
-  const response = await fetch(url, { method: 'POST' });
+  const response = await fetch(url, { method: 'POST', headers: { 'Accept-Encoding': 'identity' } });
   const json = (await response.json()) as { success: boolean };
   return json.success;
 }
@@ -203,7 +471,7 @@ export async function getProjectIdByClientId(
  * @param projectId - Optional project ID from the client.
  * @returns Project if found, otherwise undefined.
  */
-export function getProjectByRecaptchaSiteKey(
+function getProjectByRecaptchaSiteKey(
   recaptchaSiteKey: string,
   projectId: string | undefined
 ): Promise<WithId<Project> | undefined> {
@@ -223,16 +491,23 @@ export function getProjectByRecaptchaSiteKey(
     });
   }
 
-  const systemRepo = getShardSystemRepo(TODO_SHARD_ID); // not shard ready; would require searching all shards
-  return systemRepo.searchOne<Project>({ resourceType: 'Project', filters });
+  return getGlobalSystemRepo().searchOne<Project>({ resourceType: 'Project', filters });
 }
 
 /**
  * Returns the bcrypt hash of the password.
+ *
+ * Rejects passwords longer than {@link MAX_PASSWORD_LENGTH} bytes as a
+ * defense-in-depth backstop. Route validators are the front line, but enforcing
+ * the cap at the single hashing chokepoint means any current or future caller is
+ * protected regardless of the route it came through.
  * @param password - The input password.
  * @returns The bcrypt hash of the password.
  */
 export function bcryptHashPassword(password: string): Promise<string> {
+  if (Buffer.byteLength(password, 'utf8') > MAX_PASSWORD_LENGTH) {
+    throw new OperationOutcomeError(badRequest(`Password must be no more than ${MAX_PASSWORD_LENGTH} characters`));
+  }
   return bcrypt.hash(password, getConfig().bcryptHashSalt);
 }
 

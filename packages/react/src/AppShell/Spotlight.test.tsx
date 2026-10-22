@@ -9,6 +9,7 @@ import type { Bundle, Patient, SearchParameter } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import type { SpotlightProps } from './Spotlight';
 import { Spotlight } from './Spotlight';
 
 // Index the structure definitions and search parameters for MockClient
@@ -18,10 +19,12 @@ for (const filename of SEARCH_PARAMETER_BUNDLE_FILES) {
   indexSearchParameterBundle(readJson(filename) as Bundle<SearchParameter>);
 }
 
-const mockNavigate = jest.fn();
+const { mockNavigate } = vi.hoisted(() => ({
+  mockNavigate: vi.fn(),
+}));
 
-jest.mock('@medplum/react-hooks', () => {
-  const actual = jest.requireActual('@medplum/react-hooks');
+vi.mock(import('@medplum/react-hooks'), async (importOriginal) => {
+  const actual = await importOriginal();
   return {
     ...actual,
     useMedplumNavigate: () => mockNavigate,
@@ -40,11 +43,11 @@ async function openSpotlight(): Promise<void> {
 describe('Spotlight', () => {
   let medplum: MockClient;
 
-  async function setup(patientsOnly?: boolean): Promise<ReturnType<typeof render>> {
+  async function setup(patientsOnly?: boolean, props?: Partial<SpotlightProps>): Promise<ReturnType<typeof render>> {
     const result = render(
       <MedplumProvider medplum={medplum}>
         <MantineProvider>
-          <Spotlight patientsOnly={patientsOnly} />
+          <Spotlight patientsOnly={patientsOnly} {...props} />
         </MantineProvider>
       </MedplumProvider>
     );
@@ -53,7 +56,7 @@ describe('Spotlight', () => {
   }
 
   beforeEach(() => {
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     mockNavigate.mockReset();
     medplum = new MockClient();
 
@@ -89,6 +92,96 @@ describe('Spotlight', () => {
       const searchInput = screen.getByPlaceholderText('Start typing to search…');
       expect(searchInput).toHaveAttribute('placeholder', 'Start typing to search…');
     });
+
+    test('shows keyboard shortcut hints in the footer', async () => {
+      await setup();
+
+      expect(screen.getByText('Open search')).toBeInTheDocument();
+      expect(screen.getByText('Select')).toBeInTheDocument();
+      expect(screen.getByText('Open / Go')).toBeInTheDocument();
+    });
+  });
+
+  describe('staticActions', () => {
+    const staticActions = [
+      { id: 'action-new-task', href: '/Task/new', label: 'New Task', onClick: vi.fn() },
+      { id: 'action-send-fax', href: '/Fax/Communication/new', label: 'Send a Fax', onClick: vi.fn() },
+    ];
+
+    test('lists static actions in the empty state', async () => {
+      await setup(true, { staticActions });
+
+      // Mantine renders the group label through a `--spotlight-label` var on a ::before pseudo-element
+      expect(document.querySelector('.actionsGroup')?.getAttribute('style')).toContain("--spotlight-label: 'Actions'");
+      expect(screen.getByText('New Task')).toBeInTheDocument();
+      expect(screen.getByText('Send a Fax')).toBeInTheDocument();
+      // Static actions replace the keyboard hint as the empty state
+      expect(screen.queryByText(/to open Search next time/)).not.toBeInTheDocument();
+    });
+
+    test('clicking a static action invokes its onClick', async () => {
+      await setup(true, { staticActions });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('New Task'));
+      });
+
+      expect(staticActions[0].onClick).toHaveBeenCalled();
+    });
+
+    test('hides static actions once a query is entered', async () => {
+      await setup(true, { staticActions });
+
+      const searchInput = screen.getByPlaceholderText('Start typing to search…');
+      await act(async () => {
+        fireEvent.change(searchInput, { target: { value: 'Jane' } });
+      });
+
+      expect(screen.queryByText('New Task')).not.toBeInTheDocument();
+      expect(screen.getByText('Searching...')).toBeInTheDocument();
+    });
+
+    test('navigates to href when an action has no onClick', async () => {
+      await setup(true, { staticActions: [{ id: 'action-new-task', href: '/Task/new', label: 'New Task' }] });
+
+      await act(async () => {
+        fireEvent.click(screen.getByText('New Task'));
+      });
+
+      expect(mockNavigate).toHaveBeenCalledWith('/Task/new');
+    });
+
+    test('renders actions with an href as anchors', async () => {
+      await setup(true, { staticActions });
+
+      const action = document.querySelector('[data-action][group="Actions"]') as HTMLAnchorElement;
+      expect(action.tagName).toBe('A');
+      expect(action).toHaveAttribute('href', '/Task/new');
+    });
+
+    test('leaves modified clicks to the browser so the link opens in a new tab', async () => {
+      await setup(true, { staticActions });
+
+      // Runs after the component's handler; also stops jsdom from acting on the anchor
+      const defaultPrevented: boolean[] = [];
+      document.addEventListener(
+        'click',
+        (event) => {
+          defaultPrevented.push(event.defaultPrevented);
+          event.preventDefault();
+        },
+        { once: true }
+      );
+
+      const action = document.querySelector('[data-action][group="Actions"]') as HTMLElement;
+      await act(async () => {
+        fireEvent.click(action, { metaKey: true });
+      });
+
+      // The browser opens the new tab; the SPA must neither swallow the click nor navigate the current tab
+      expect(defaultPrevented).toEqual([false]);
+      expect(staticActions[0].onClick).not.toHaveBeenCalled();
+    });
   });
 
   describe('Search functionality', () => {
@@ -104,7 +197,7 @@ describe('Spotlight', () => {
     });
 
     test('performs search and shows results', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: [
             {
@@ -119,7 +212,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: {
@@ -205,7 +298,7 @@ describe('Spotlight', () => {
 
   describe('patientsOnly mode', () => {
     test('searches only patients when patientsOnly is true', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: [
             {
@@ -250,7 +343,7 @@ describe('Spotlight', () => {
 
   describe('Action clicks and navigation', () => {
     test('clicking search result patient navigates to patient page', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: [
             {
@@ -265,7 +358,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: { timestamp: new Date().toISOString(), contains: [] },
@@ -286,6 +379,9 @@ describe('Spotlight', () => {
       );
 
       const patientAction = document.querySelector('[data-action][group="Patients"]') as HTMLElement;
+      // Results are anchors, so they support right-click "Open in new tab"
+      expect(patientAction).toHaveAttribute('href', '/Patient/patient-123');
+
       await act(async () => {
         fireEvent.click(patientAction);
       });
@@ -297,7 +393,7 @@ describe('Spotlight', () => {
     });
 
     test('clicking search result service request navigates to service request page', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: undefined,
           Patients2: undefined,
@@ -311,7 +407,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: { timestamp: new Date().toISOString(), contains: [] },
@@ -343,7 +439,7 @@ describe('Spotlight', () => {
     });
 
     test('clicking resource type navigates to resource type page', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: undefined,
           Patients2: undefined,
@@ -351,7 +447,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: {
@@ -388,7 +484,7 @@ describe('Spotlight', () => {
 
   describe('Resource display', () => {
     test('displays patient name when available', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: [
             {
@@ -403,7 +499,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: { timestamp: new Date().toISOString(), contains: [] },
@@ -431,7 +527,7 @@ describe('Spotlight', () => {
     });
 
     test('displays patient ID when name is not available', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: [
             {
@@ -445,7 +541,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: { timestamp: new Date().toISOString(), contains: [] },
@@ -471,7 +567,7 @@ describe('Spotlight', () => {
     });
 
     test('displays birthDate as description for patients', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: [
             {
@@ -486,7 +582,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: { timestamp: new Date().toISOString(), contains: [] },
@@ -511,7 +607,7 @@ describe('Spotlight', () => {
     });
 
     test('displays "Resource Type" as description for resource type actions', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: undefined,
           Patients2: undefined,
@@ -519,7 +615,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: {
@@ -547,7 +643,7 @@ describe('Spotlight', () => {
     });
 
     test('displays service request subject display', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: undefined,
           Patients2: undefined,
@@ -561,7 +657,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: { timestamp: new Date().toISOString(), contains: [] },
@@ -588,7 +684,7 @@ describe('Spotlight', () => {
 
   describe('Deduplication', () => {
     test('deduplicates patients from multiple search results', async () => {
-      const graphqlSpy = jest.spyOn(medplum, 'graphql').mockResolvedValue({
+      const graphqlSpy = vi.spyOn(medplum, 'graphql').mockResolvedValue({
         data: {
           Patients1: [
             {
@@ -608,7 +704,7 @@ describe('Spotlight', () => {
         },
       });
 
-      const valueSetSpy = jest.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
+      const valueSetSpy = vi.spyOn(medplum, 'valueSetExpand').mockResolvedValue({
         resourceType: 'ValueSet',
         status: 'active',
         expansion: { timestamp: new Date().toISOString(), contains: [] },

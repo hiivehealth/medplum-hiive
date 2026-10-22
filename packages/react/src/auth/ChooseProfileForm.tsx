@@ -1,16 +1,18 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { Anchor, Box, Combobox, Flex, Group, Stack, Text, TextInput, Title, useCombobox } from '@mantine/core';
+import { Anchor, Combobox, Flex, Stack, Text, TextInput, Title, useCombobox } from '@mantine/core';
+import { useLocalStorage } from '@mantine/hooks';
 import type { LoginAuthenticationResponse } from '@medplum/core';
-import { normalizeOperationOutcome } from '@medplum/core';
+import { getIdentifier, normalizeOperationOutcome } from '@medplum/core';
 import type { OperationOutcome, ProjectMembership } from '@medplum/fhirtypes';
 import { useMedplum } from '@medplum/react-hooks';
-import { IconBriefcase, IconSearch } from '@tabler/icons-react';
+import { IconSearch } from '@tabler/icons-react';
 import type { JSX } from 'react';
 import { useState } from 'react';
 import { Logo } from '../Logo/Logo';
 import { OperationOutcomeAlert } from '../OperationOutcomeAlert/OperationOutcomeAlert';
-import classes from './ChooseProfileForm.module.css';
+import { ProjectMembershipLoginOption } from './ProjectLoginOption';
+import projectLoginClasses from './ProjectLoginOption.module.css';
 
 export interface ChooseProfileFormProps {
   readonly login: string;
@@ -18,11 +20,19 @@ export interface ChooseProfileFormProps {
   readonly handleAuthResponse: (response: LoginAuthenticationResponse) => void;
 }
 
+const RECENT_PROJECTS_KEY = 'medplum.recentProjects';
+const MAX_RECENT_PROJECTS = 10;
+
 export function ChooseProfileForm(props: ChooseProfileFormProps): JSX.Element {
   const medplum = useMedplum();
   const combobox = useCombobox();
   const [search, setSearch] = useState('');
   const [outcome, setOutcome] = useState<OperationOutcome>();
+  const [recentProjects, setRecentProjects] = useLocalStorage<Record<string, number>>({
+    key: RECENT_PROJECTS_KEY,
+    defaultValue: {},
+    getInitialValueInEffect: false,
+  });
 
   function filterDisplay(display: string | undefined): boolean {
     return !!display?.toLowerCase()?.includes(search.toLowerCase());
@@ -36,22 +46,36 @@ export function ChooseProfileForm(props: ChooseProfileFormProps): JSX.Element {
     );
   }
 
+  function compareMembershipRecency(m1: ProjectMembership, m2: ProjectMembership): number {
+    const t1 = (m1.id && recentProjects[m1.id]) || 0;
+    const t2 = (m2.id && recentProjects[m2.id]) || 0;
+    return t2 - t1;
+  }
+
   function handleValueSelect(membershipId: string): void {
     medplum
       .post<LoginAuthenticationResponse>('auth/profile', {
         login: props.login,
         profile: membershipId,
       })
-      .then(props.handleAuthResponse)
+      .then((response) => {
+        setRecentProjects((prev) => {
+          const next = { ...prev, [membershipId]: Date.now() };
+          const entries = Object.entries(next).sort((a, b) => b[1] - a[1]);
+          return Object.fromEntries(entries.slice(0, MAX_RECENT_PROJECTS));
+        });
+        props.handleAuthResponse(response);
+      })
       .catch((err) => setOutcome(normalizeOperationOutcome(err)));
   }
 
   const options = props.memberships
     .filter(filterMembership)
+    .sort(compareMembershipRecency)
     .slice(0, 10)
     .map((item) => (
-      <Combobox.Option value={item.id as string} key={item.id} className={classes.option}>
-        <SelectOption {...item} />
+      <Combobox.Option value={item.id as string} key={item.id} className={projectLoginClasses.interactive}>
+        <ProjectMembershipLoginOption membership={item} label={getMembershipLabel(item)} />
       </Combobox.Option>
     ));
 
@@ -101,24 +125,5 @@ export function ChooseProfileForm(props: ChooseProfileFormProps): JSX.Element {
 }
 
 function getMembershipLabel(membership: ProjectMembership): string | undefined {
-  return membership.identifier?.find((i) => i.system === 'https://medplum.com/identifier/label')?.value;
-}
-
-function SelectOption(membership: ProjectMembership): JSX.Element {
-  const label = getMembershipLabel(membership);
-  return (
-    <Group gap="xs" align="center">
-      <Box className={classes.iconBox}>
-        <IconBriefcase size={16} stroke={2} />
-      </Box>
-      <div>
-        <Text size="sm" fw={500}>
-          {membership.project?.display} {label ? ` - ${label}` : ''}
-        </Text>
-        <Text size="xs" c="dimmed">
-          {membership.profile?.display}
-        </Text>
-      </div>
-    </Group>
-  );
+  return getIdentifier(membership, 'https://medplum.com/identifier/label');
 }

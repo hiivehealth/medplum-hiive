@@ -12,7 +12,8 @@ import type {
   ResourceType,
   SearchParameter,
 } from '@medplum/fhirtypes';
-import type { Pool, PoolClient } from 'pg';
+import { systemResourceProjectId } from '../../constants';
+import type { PgQueryable } from '../sql';
 import { DeleteQuery } from '../sql';
 import type { LookupTableRow } from './lookuptable';
 import { LookupTable } from './lookuptable';
@@ -23,6 +24,7 @@ type HumanNameResourceType = (typeof resourceTypes)[number];
 export type HumanNameResource = Patient | Person | Practitioner | RelatedPerson;
 
 export interface HumanNameTableRow extends LookupTableRow {
+  projectId: string;
   name: string | undefined;
   given: string | undefined;
   family: string | undefined;
@@ -56,6 +58,7 @@ export class HumanNameTable extends LookupTable {
   }
 
   protected readonly CONTAINS_SQL_OPERATOR: LookupTable['CONTAINS_SQL_OPERATOR'] = 'ILIKE';
+  protected readonly hasProjectIdColumn = true;
 
   /**
    * Returns the table name.
@@ -96,6 +99,7 @@ export class HumanNameTable extends LookupTable {
 
       const extracted = {
         resourceId: resource.id,
+        projectId: resource.meta?.project ?? systemResourceProjectId,
         // logical OR coalesce to ensure that empty strings are inserted as NULL
         name: getNameString(name) || undefined,
         given: formatGivenName(name) || undefined,
@@ -118,7 +122,7 @@ export class HumanNameTable extends LookupTable {
   }
 
   async batchIndexResources<T extends Resource>(
-    client: PoolClient,
+    client: PgQueryable,
     resources: WithId<T>[],
     create: boolean,
     resourceBatchSize?: number
@@ -135,7 +139,7 @@ export class HumanNameTable extends LookupTable {
    * @param client - The database client.
    * @param resource - The resource to delete.
    */
-  async deleteValuesForResource(client: Pool | PoolClient, resource: Resource): Promise<void> {
+  async deleteValuesForResource(client: PgQueryable, resource: Resource): Promise<void> {
     if (!HumanNameTable.hasHumanName(resource.resourceType)) {
       return;
     }
@@ -152,7 +156,7 @@ export class HumanNameTable extends LookupTable {
    * @param resourceType - The FHIR resource type.
    * @param before - The date before which resources should be purged.
    */
-  async purgeValuesBefore(client: Pool | PoolClient, resourceType: ResourceType, before: string): Promise<void> {
+  async purgeValuesBefore(client: PgQueryable, resourceType: ResourceType, before: string): Promise<void> {
     if (!HumanNameTable.hasHumanName(resourceType)) {
       return;
     }

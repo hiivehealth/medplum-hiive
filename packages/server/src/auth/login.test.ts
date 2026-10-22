@@ -4,25 +4,23 @@ import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
 import type { WithId } from '@medplum/core';
 import { createReference, LOINC } from '@medplum/core';
 import type { ClientApplication, Project } from '@medplum/fhirtypes';
+import type { AwsClientStub } from 'aws-sdk-client-mock';
+import { mockClient } from 'aws-sdk-client-mock';
 import { randomUUID } from 'crypto';
 import express from 'express';
-import { pwnedPassword } from 'hibp';
 import { simpleParser } from 'mailparser';
-import fetch from 'node-fetch';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { inviteUser } from '../admin/invite';
 import { initApp, shutdownApp } from '../app';
 import { loadTestConfig } from '../config/loader';
 import type { Repository } from '../fhir/repo';
 import { getGlobalSystemRepo, getProjectSystemRepo } from '../fhir/repo';
-import { createTestProject, setupPwnedPasswordMock, setupRecaptchaMock, withTestContext } from '../test.setup';
+import { createTestProject, setupRecaptchaMock, withTestContext } from '../test.setup';
 import { registerNew } from './register';
 import { setPassword } from './setpassword';
 
-jest.mock('@aws-sdk/client-sesv2');
-jest.mock('hibp');
-jest.mock('node-fetch');
-
+const fetchMock = vi.spyOn(globalThis, 'fetch');
 const app = express();
 const email = randomUUID() + '@example.com';
 const password = randomUUID();
@@ -30,9 +28,13 @@ let project: WithId<Project>;
 let repo: Repository;
 let client: WithId<ClientApplication>;
 let corsClient: WithId<ClientApplication>;
+let mockSESv2Client: AwsClientStub<SESv2Client>;
 
 describe('Login', () => {
   beforeAll(async () => {
+    mockSESv2Client = mockClient(SESv2Client);
+    mockSESv2Client.on(SendEmailCommand).resolves({ MessageId: 'ID_TEST_123' });
+
     const config = await loadTestConfig();
     const systemRepo = getGlobalSystemRepo();
 
@@ -70,16 +72,16 @@ describe('Login', () => {
   });
 
   afterAll(async () => {
+    mockSESv2Client.restore();
     await shutdownApp();
   });
 
   beforeEach(() => {
-    (SESv2Client as unknown as jest.Mock).mockClear();
-    (SendEmailCommand as unknown as jest.Mock).mockClear();
-    (fetch as unknown as jest.Mock).mockClear();
-    (pwnedPassword as unknown as jest.Mock).mockClear();
-    setupPwnedPasswordMock(pwnedPassword as unknown as jest.Mock, 0);
-    setupRecaptchaMock(fetch as unknown as jest.Mock, true);
+    mockSESv2Client.reset();
+    mockSESv2Client.on(SendEmailCommand).resolves({ MessageId: 'ID_TEST_123' });
+
+    fetchMock.mockClear();
+    setupRecaptchaMock(true);
   });
 
   test('Invalid client UUID', async () => {
@@ -89,7 +91,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(404);
+    expect(res).toHaveStatus(404);
   });
 
   test('Invalid client ID', async () => {
@@ -99,7 +101,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(404);
+    expect(res).toHaveStatus(404);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Not found');
   });
@@ -110,7 +112,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Valid email address is required');
   });
@@ -121,7 +123,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Valid email address is required');
   });
@@ -132,9 +134,9 @@ describe('Login', () => {
       password: '',
       scope: 'openid',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
-    expect(res.body.issue[0].details.text).toBe('Invalid password, must be at least 8 characters');
+    expect(res.body.issue[0].details.text).toBe('Password must be at least 8 characters');
   });
 
   test('Wrong password', async () => {
@@ -143,7 +145,7 @@ describe('Login', () => {
       password: 'wrong-password',
       scope: 'openid',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Email or password is invalid');
   });
@@ -156,7 +158,7 @@ describe('Login', () => {
       password: 'medplum_admin',
       scope: 'openid',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Invalid projectId');
   });
 
@@ -167,7 +169,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.code).toBeDefined();
   });
 
@@ -177,7 +179,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.code).toBeDefined();
   });
 
@@ -188,7 +190,7 @@ describe('Login', () => {
       scope: 'openid',
       projectId: 'new',
     });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.login).toBeDefined();
     expect(res.body.code).not.toBeDefined();
   });
@@ -225,7 +227,7 @@ describe('Login', () => {
         ],
       });
 
-    expect(resX.status).toBe(201);
+    expect(resX).toHaveStatus(201);
 
     // Invite a new member
     const res2 = await request(app)
@@ -238,13 +240,13 @@ describe('Login', () => {
         email: memberEmail,
       });
 
-    expect(res2.status).toBe(200);
-    expect(SESv2Client).toHaveBeenCalledTimes(1);
-    expect(SendEmailCommand).toHaveBeenCalledTimes(1);
+    expect(res2).toHaveStatus(200);
+    expect(mockSESv2Client.send.callCount).toBe(1);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
 
     // Parse the email for the "set password" link
-    const args = (SendEmailCommand as unknown as jest.Mock).mock.calls[0][0];
-    const parsed = await simpleParser(args.Content.Raw.Data);
+    const args = mockSESv2Client.commandCalls(SendEmailCommand)[0].args[0].input;
+    const parsed = await simpleParser(args.Content?.Raw?.Data as Buffer);
     const content = parsed.text as string;
     const url = /(https?:\/\/[^\s]+)/g.exec(content)?.[0] as string;
     const paths = url.split('/');
@@ -255,7 +257,7 @@ describe('Login', () => {
     const res4 = await request(app)
       .get('/admin/projects/' + project.id + '/members/' + res2.body.id)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res4.status).toBe(200);
+    expect(res4).toHaveStatus(200);
 
     // Set the new member's access policy
     const res5 = await request(app)
@@ -266,7 +268,7 @@ describe('Login', () => {
         ...res4.body,
         accessPolicy: createReference(resX.body),
       });
-    expect(res5.status).toBe(200);
+    expect(res5).toHaveStatus(200);
 
     // Get the project details
     // Make sure the access policy is set
@@ -274,7 +276,7 @@ describe('Login', () => {
     const res6 = await request(app)
       .get('/admin/projects/' + project.id + '/members/' + res2.body.id)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res6.status).toBe(200);
+    expect(res6).toHaveStatus(200);
     expect(res6.body.accessPolicy).toBeDefined();
 
     // Now try to login as the new member
@@ -284,17 +286,17 @@ describe('Login', () => {
       secret,
       password: 'my-new-password',
     });
-    expect(res7.status).toBe(200);
+    expect(res7).toHaveStatus(200);
 
     // Then login
     const res8 = await request(app).post('/auth/login').type('json').send({
       email: memberEmail,
       password: 'my-new-password',
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
-    expect(res8.status).toBe(200);
+    expect(res8).toHaveStatus(200);
     expect(res8.body.code).toBeDefined();
 
     // Then get access token
@@ -303,9 +305,9 @@ describe('Login', () => {
       code: res8.body.code,
       code_verifier: 'xyz',
     });
-    expect(res9.status).toBe(200);
+    expect(res9).toHaveStatus(200);
     expect(res9.body.token_type).toBe('Bearer');
-    expect(res9.body.scope).toBe('openid offline');
+    expect(res9.body.scope).toBe('openid offline_access');
     expect(res9.body.expires_in).toBe(3600);
     expect(res9.body.id_token).toBeDefined();
     expect(res9.body.access_token).toBeDefined();
@@ -326,7 +328,7 @@ describe('Login', () => {
           },
         ],
       });
-    expect(res10.status).toBe(201);
+    expect(res10).toHaveStatus(201);
 
     // Should not be able to create an observation
     const res11 = await request(app)
@@ -346,7 +348,7 @@ describe('Login', () => {
         },
         subject: createReference(res10.body),
       });
-    expect(res11.status).toBe(403);
+    expect(res11).toHaveStatus(403);
   });
 
   test('Require Google auth', async () => {
@@ -376,9 +378,9 @@ describe('Login', () => {
     const res8 = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
     });
-    expect(res8.status).toBe(400);
+    expect(res8).toHaveStatus(400);
     expect(res8.body).toMatchObject({
       resourceType: 'OperationOutcome',
       issue: [
@@ -419,11 +421,11 @@ describe('Login', () => {
     const res1 = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.code).toBeUndefined();
     expect(res1.body.memberships).toHaveLength(2);
 
@@ -433,11 +435,11 @@ describe('Login', () => {
       resourceType: 'Practitioner',
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
 
     // Try to login as a Patient
@@ -446,11 +448,11 @@ describe('Login', () => {
       resourceType: 'Patient',
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
-    expect(res3.status).toBe(200);
+    expect(res3).toHaveStatus(200);
     expect(res3.body.code).toBeDefined();
   });
 
@@ -475,11 +477,11 @@ describe('Login', () => {
     const res1 = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.code).toBeDefined();
 
     // Try to login with mixed case email
@@ -487,11 +489,11 @@ describe('Login', () => {
     const res2 = await request(app).post('/auth/login').type('json').send({
       email: email.toLowerCase(),
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
     });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
   });
 
@@ -504,7 +506,7 @@ describe('Login', () => {
       scope: 'openid',
       projectId: otherTestProject.project.id,
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.login).toBeUndefined();
     expect(res.body.code).toBeUndefined();
     expect(res.body.memberships).toBeUndefined();
@@ -534,16 +536,41 @@ describe('Login', () => {
     const res = await request(app).post('/auth/login').type('json').send({
       email,
       password,
-      scope: 'openid offline',
+      scope: 'openid offline_access',
       codeChallenge: 'xyz',
       codeChallengeMethod: 'plain',
       projectId: project.id,
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.login).toBeUndefined();
     expect(res.body.code).toBeUndefined();
     expect(res.body.memberships).toBeUndefined();
     expect(res.body.issue[0].details.text).toBe('User not found');
+  });
+
+  test('Inactive project', async () => {
+    const email = `inactive-project-${randomUUID()}@example.com`;
+    const password = 'password!@#';
+    const { project: inactiveProject } = await createTestProject();
+    const { project: activeProject } = await createTestProject();
+    await withTestContext(async () => {
+      for (const p of [inactiveProject, activeProject]) {
+        await inviteUser({ project: p, resourceType: 'Practitioner', firstName: 'T', lastName: 'U', email, password });
+      }
+    });
+    await getGlobalSystemRepo().updateResource({ ...inactiveProject, active: false });
+
+    // The inactive project is hidden, so the remaining one is chosen without prompting
+    const res1 = await request(app).post('/auth/login').type('json').send({ email, password, scope: 'openid' });
+    expect(res1).toHaveStatus(200);
+    expect(res1.body.code).toBeDefined();
+
+    const res2 = await request(app)
+      .post('/auth/login')
+      .type('json')
+      .send({ email, password, scope: 'openid', projectId: inactiveProject.id });
+    expect(res2).toHaveStatus(400);
+    expect(res2.body.issue[0].details.text).toBe('Project not active');
   });
 
   test('Success with no origin', async () => {
@@ -553,7 +580,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.code).toBeDefined();
   });
 
@@ -564,7 +591,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.code).toBeDefined();
   });
 
@@ -575,7 +602,7 @@ describe('Login', () => {
       password,
       scope: 'openid',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Invalid origin');
   });
 });

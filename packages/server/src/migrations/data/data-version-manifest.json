@@ -132,5 +132,61 @@
   },
   "v34": {
     "serverVersion": "5.1.9"
+  },
+  "v35": {
+    "serverVersion": "5.1.10"
+  },
+  "v36": {
+    "serverVersion": "5.1.12"
+  },
+  "v37": {
+    "serverVersion": "5.1.12"
+  },
+  "v38": {
+    "serverVersion": "5.1.13"
+  },
+  "v39": {
+    "serverVersion": "5.1.23"
+  },
+  "v40": {
+    "serverVersion": "5.1.24"
+  },
+  "v41": {
+    "serverVersion": "5.1.27"
+  },
+  "v42": {
+    "serverVersion": "5.1.30"
+  },
+  "v43": {
+    "serverVersion": "5.1.32"
+  },
+  "v44": {
+    "serverVersion": "5.1.33"
+  },
+  "v45": {
+    "serverVersion": "5.1.37"
+  },
+  "v46": {
+    "serverVersion": "5.1.39"
+  },
+  "v47": {
+    "serverVersion": "5.1.40"
+  },
+  "v48": {
+    "serverVersion": "5.1.42"
+  },
+  "v49": {
+    "serverVersion": "5.1.43",
+    "requiredBefore": "5.2.0"
+  },
+  "v50": {
+    "serverVersion": "5.1.44",
+    "requiredBefore": "5.2.0"
+  },
+  "v51": {
+    "serverVersion": "5.2.1"
+  },
+  "v52": {
+    "serverVersion": "5.2.2"
   }
 }

@@ -2,16 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import { MEDPLUM_VERSION, normalizeErrorString } from '@medplum/core';
 import { CommanderError, Option } from 'commander';
-import dotenv from 'dotenv';
+import { existsSync } from 'node:fs';
 import { agent } from './agent';
 import { login, token, whoami } from './auth';
 import { buildAwsCommand } from './aws/index';
 import { bot, createBotDeprecate, deployBotDeprecate, saveBotDeprecate } from './bots';
 import { bulk } from './bulk';
+import { dicomweb } from './dicomweb';
 import { hl7 } from './hl7';
 import { profile } from './profiles';
 import { project } from './project';
 import { deleteObject, get, patch, post, put } from './rest';
+import { generateTypes } from './types';
 import { addSubcommand, MedplumCommand } from './utils';
 
 export async function main(argv: string[]): Promise<void> {
@@ -23,7 +25,7 @@ export async function main(argv: string[]): Promise<void> {
     .option('--token-url <tokenUrl>', 'FHIR server token URL, absolute or relative to base URL')
     .option('--authorize-url <authorizeUrl>', 'FHIR server authorize URL, absolute or relative to base URL')
     .option('--fhir-url, --fhir-url-path <fhirUrlPath>', 'FHIR server URL, absolute or relative to base URL')
-    .option('--scope <scope>', 'JWT scope')
+    .option('--scope <scope>', 'OAuth scope (e.g., "openid offline_access")')
     .option('--access-token <accessToken>', 'Access token for token exchange authentication')
     .option('--callback-url <callbackUrl>', 'Callback URL for authorization code flow')
     .option('--subject <subject>', 'Subject for JWT authentication')
@@ -89,6 +91,12 @@ export async function main(argv: string[]): Promise<void> {
   // HL7 commands
   addSubcommand(index, hl7);
 
+  // DICOMweb commands
+  addSubcommand(index, dicomweb);
+
+  // Code generation commands
+  addSubcommand(index, generateTypes);
+
   try {
     await index.parseAsync(argv);
   } catch (err) {
@@ -137,7 +145,9 @@ function writeErrorToStderr(err: unknown, verbose = false): void {
 }
 
 export async function run(): Promise<void> {
-  dotenv.config({ quiet: true });
+  if (existsSync('.env')) {
+    process.loadEnvFile();
+  }
   await main(process.argv);
 }
 

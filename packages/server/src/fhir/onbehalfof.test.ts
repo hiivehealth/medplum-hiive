@@ -1,13 +1,21 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { ContentType, getReferenceString } from '@medplum/core';
-import type { OperationOutcome, OperationOutcomeIssue, Patient } from '@medplum/fhirtypes';
+import { ContentType, createReference, getReferenceString } from '@medplum/core';
+import type {
+  OperationOutcome,
+  OperationOutcomeIssue,
+  Patient,
+  Practitioner,
+  Project,
+  ProjectMembership,
+} from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../app';
 import { loadTestConfig } from '../config/loader';
-import { addTestUser, createTestProject, withTestContext } from '../test.setup';
+import { addTestUser, createTestProject, getSuperAdminTestProject, withTestContext } from '../test.setup';
+import { getGlobalSystemRepo, getProjectSystemRepo } from './repo';
 
 describe('On Behalf Of', () => {
   const app = express();
@@ -42,16 +50,20 @@ describe('On Behalf Of', () => {
 
       const org1 = 'Organization/' + randomUUID();
       const testAccount1 = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        compartment: { reference: org1 },
-        resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org1 }],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          compartment: { reference: org1 },
+          resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org1 }],
+        },
       });
 
       const org2 = 'Organization/' + randomUUID();
       const testAccount2 = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        compartment: { reference: org2 },
-        resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org2 }],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          compartment: { reference: org2 },
+          resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org2 }],
+        },
       });
 
       // Create a patient on behalf of test account 1
@@ -62,7 +74,7 @@ describe('On Behalf Of', () => {
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount1.profile))
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ resourceType: 'Patient' });
-      expect(res1.status).toBe(201);
+      expect(res1).toHaveStatus(201);
       expect(res1.body.resourceType).toStrictEqual('Patient');
       expect(res1.headers.location).toContain('Patient');
       expect(res1.headers.location).toContain(res1.body.id);
@@ -78,7 +90,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', basicAuth)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount1.profile));
-      expect(res2.status).toBe(200);
+      expect(res2).toHaveStatus(200);
 
       const patient2 = res2.body;
       expect(patient2.resourceType).toBe('Patient');
@@ -94,7 +106,7 @@ describe('On Behalf Of', () => {
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount2.profile))
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ resourceType: 'Patient' });
-      expect(res3.status).toBe(201);
+      expect(res3).toHaveStatus(201);
       expect(res3.body.resourceType).toStrictEqual('Patient');
       expect(res3.headers.location).toContain('Patient');
       expect(res3.headers.location).toContain(res3.body.id);
@@ -110,7 +122,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', basicAuth)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount2.profile));
-      expect(res4.status).toBe(200);
+      expect(res4).toHaveStatus(200);
 
       const patient4 = res4.body;
       expect(patient4.resourceType).toBe('Patient');
@@ -125,7 +137,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', basicAuth)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount2.profile));
-      expect(res5.status).toBe(404);
+      expect(res5).toHaveStatus(404);
 
       // Try to read the second patient on behalf of test account 1
       // This should fail because the patient was created on behalf of test account 2
@@ -134,7 +146,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', basicAuth)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount1.profile));
-      expect(res6.status).toBe(404);
+      expect(res6).toHaveStatus(404);
     }));
 
   test('Set meta onBehalfOf with client credentials', () =>
@@ -154,16 +166,20 @@ describe('On Behalf Of', () => {
 
       const org1 = 'Organization/' + randomUUID();
       const testAccount1 = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        compartment: { reference: org1 },
-        resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org1 }],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          compartment: { reference: org1 },
+          resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org1 }],
+        },
       });
 
       const org2 = 'Organization/' + randomUUID();
       const testAccount2 = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        compartment: { reference: org2 },
-        resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org2 }],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          compartment: { reference: org2 },
+          resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + org2 }],
+        },
       });
 
       // Create a patient on behalf of test account 1
@@ -174,7 +190,7 @@ describe('On Behalf Of', () => {
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount1.profile))
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ resourceType: 'Patient' });
-      expect(res1.status).toBe(201);
+      expect(res1).toHaveStatus(201);
       expect(res1.body.resourceType).toStrictEqual('Patient');
       expect(res1.headers.location).toContain('Patient');
       expect(res1.headers.location).toContain(res1.body.id);
@@ -190,7 +206,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount1.profile));
-      expect(res2.status).toBe(200);
+      expect(res2).toHaveStatus(200);
 
       const patient2 = res2.body;
       expect(patient2.resourceType).toBe('Patient');
@@ -206,7 +222,7 @@ describe('On Behalf Of', () => {
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount2.profile))
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ resourceType: 'Patient' });
-      expect(res3.status).toBe(201);
+      expect(res3).toHaveStatus(201);
       expect(res3.body.resourceType).toStrictEqual('Patient');
       expect(res3.headers.location).toContain('Patient');
       expect(res3.headers.location).toContain(res3.body.id);
@@ -222,7 +238,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount2.profile));
-      expect(res4.status).toBe(200);
+      expect(res4).toHaveStatus(200);
 
       const patient4 = res4.body;
       expect(patient4.resourceType).toBe('Patient');
@@ -237,7 +253,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount2.profile));
-      expect(res5.status).toBe(404);
+      expect(res5).toHaveStatus(404);
 
       // Try to read the second patient on behalf of test account 1
       // This should fail because the patient was created on behalf of test account 2
@@ -246,7 +262,7 @@ describe('On Behalf Of', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('X-Medplum', 'extended')
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount1.profile));
-      expect(res6.status).toBe(404);
+      expect(res6).toHaveStatus(404);
     }));
 
   test('Forbidden for non-admin', () =>
@@ -270,7 +286,7 @@ describe('On Behalf Of', () => {
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount2.profile))
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ resourceType: 'Patient' });
-      expect(res1.status).toBe(400);
+      expect(res1).toHaveStatus(400);
       expect(res1.body).toMatchObject<OperationOutcome>({
         resourceType: 'OperationOutcome',
         issue: [
@@ -310,7 +326,7 @@ describe('On Behalf Of', () => {
         .set('X-Medplum-On-Behalf-Of', getReferenceString(adminAccount2.client))
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ resourceType: 'Patient' });
-      expect(res1.status).toBe(400);
+      expect(res1).toHaveStatus(400);
       expect(res1.body).toMatchObject<OperationOutcome>({
         resourceType: 'OperationOutcome',
         issue: [
@@ -322,6 +338,156 @@ describe('On Behalf Of', () => {
           }),
         ],
       });
+    }));
+
+  test('Allowed by ProjectMembership reference', () =>
+    withTestContext(async () => {
+      const adminAccount = await createTestProject({
+        withClient: true,
+        withAccessToken: true,
+        membership: { admin: true },
+      });
+
+      const { client, project } = adminAccount;
+      const basicAuth = 'Basic ' + Buffer.from(client.id + ':' + client.secret).toString('base64');
+      const testAccount = await addTestUser(project);
+
+      const res1 = await request(app)
+        .post(`/fhir/R4/Patient`)
+        .set('Authorization', basicAuth)
+        .set('X-Medplum', 'extended')
+        .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount.membership))
+        .set('Content-Type', ContentType.FHIR_JSON)
+        .send({ resourceType: 'Patient' });
+      expect(res1).toHaveStatus(201);
+      expect(res1.body.meta.onBehalfOf.reference).toStrictEqual(getReferenceString(testAccount.profile));
+    }));
+
+  test('Forbidden for cross project by ProjectMembership reference', () =>
+    withTestContext(async () => {
+      const adminAccount1 = await createTestProject({
+        withClient: true,
+        withAccessToken: true,
+        membership: { admin: true },
+      });
+
+      const adminAccount2 = await createTestProject({
+        withClient: true,
+        withAccessToken: true,
+        membership: { admin: true },
+      });
+
+      const { client } = adminAccount1;
+      const basicAuth = 'Basic ' + Buffer.from(client.id + ':' + client.secret).toString('base64');
+
+      // The membership exists, but belongs to another project
+      const res1 = await request(app)
+        .post(`/fhir/R4/Patient`)
+        .set('Authorization', basicAuth)
+        .set('X-Medplum', 'extended')
+        .set('X-Medplum-On-Behalf-Of', getReferenceString(adminAccount2.membership))
+        .set('Content-Type', ContentType.FHIR_JSON)
+        .send({ resourceType: 'Patient' });
+      expect(res1).toHaveStatus(400);
+      expect(res1.body).toMatchObject<OperationOutcome>({
+        resourceType: 'OperationOutcome',
+        issue: [
+          expect.objectContaining<OperationOutcomeIssue>({
+            severity: 'error',
+            code: 'invalid',
+            details: { text: 'Authentication error' },
+            diagnostics: expect.stringContaining('Forbidden'),
+          }),
+        ],
+      });
+    }));
+
+  test('Forbidden for unknown ProjectMembership reference', () =>
+    withTestContext(async () => {
+      const adminAccount = await createTestProject({
+        withClient: true,
+        withAccessToken: true,
+        membership: { admin: true },
+      });
+
+      const { client } = adminAccount;
+      const basicAuth = 'Basic ' + Buffer.from(client.id + ':' + client.secret).toString('base64');
+      const res1 = await request(app)
+        .post(`/fhir/R4/Patient`)
+        .set('Authorization', basicAuth)
+        .set('X-Medplum', 'extended')
+        .set('X-Medplum-On-Behalf-Of', `ProjectMembership/${randomUUID()}`)
+        .set('Content-Type', ContentType.FHIR_JSON)
+        .send({ resourceType: 'Patient' });
+      expect(res1).toHaveStatus(400);
+      expect(res1.body).toMatchObject<OperationOutcome>({
+        resourceType: 'OperationOutcome',
+        issue: [
+          expect.objectContaining<OperationOutcomeIssue>({
+            severity: 'error',
+            code: 'invalid',
+            details: { text: 'Authentication error' },
+            diagnostics: expect.stringContaining('Forbidden'),
+          }),
+        ],
+      });
+    }));
+
+  test('Forbidden for inactive ProjectMembership', () =>
+    withTestContext(async () => {
+      const adminAccount = await createTestProject({
+        withClient: true,
+        withAccessToken: true,
+        membership: { admin: true },
+      });
+
+      const { client, project } = adminAccount;
+      const { membership } = await addTestUser(project);
+
+      const repo = await getProjectSystemRepo(project);
+      await repo.patchResource('ProjectMembership', membership.id, [{ op: 'add', path: '/active', value: false }]);
+
+      const res1 = await request(app)
+        .post(`/fhir/R4/Patient`)
+        .set('Authorization', 'Basic ' + Buffer.from(client.id + ':' + client.secret).toString('base64'))
+        .set('X-Medplum', 'extended')
+        .set('X-Medplum-On-Behalf-Of', getReferenceString(membership))
+        .set('Content-Type', ContentType.FHIR_JSON)
+        .send({ resourceType: 'Patient' });
+      expect(res1).toHaveStatus(400);
+      expect(res1.body).toMatchObject<OperationOutcome>({
+        resourceType: 'OperationOutcome',
+        issue: [
+          expect.objectContaining<OperationOutcomeIssue>({
+            severity: 'error',
+            code: 'invalid',
+            details: { text: 'Authentication error' },
+            diagnostics: expect.stringContaining('Forbidden'),
+          }),
+        ],
+      });
+    }));
+
+  test('Forbidden for a super admin on behalf of a member of an inactive project', () =>
+    withTestContext(async () => {
+      const { accessToken } = await getSuperAdminTestProject();
+      const project = await getGlobalSystemRepo().createResource<Project>({ resourceType: 'Project', active: false });
+      const projectRepo = await getProjectSystemRepo(project);
+      const profile = await projectRepo.createResource<Practitioner>({ resourceType: 'Practitioner' });
+      const membership = await projectRepo.createResource<ProjectMembership>({
+        resourceType: 'ProjectMembership',
+        project: createReference(project),
+        user: { reference: `User/${randomUUID()}` },
+        profile: createReference(profile),
+      });
+
+      const res1 = await request(app)
+        .get(`/fhir/R4/Patient`)
+        .set('Authorization', 'Bearer ' + accessToken)
+        .set('X-Medplum-On-Behalf-Of', getReferenceString(membership))
+        .set('Content-Type', ContentType.FHIR_JSON);
+      expect(res1).toHaveStatus(400);
+      expect(res1.body.issue[0].diagnostics).toContain('Forbidden');
     }));
 
   test('Consistent meta.account behavior', () =>
@@ -343,9 +509,11 @@ describe('On Behalf Of', () => {
       // They will be the "onBehalfOf" users for all HTTP requests
       const account = 'Organization/' + randomUUID();
       const testAccount = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        compartment: { reference: account },
-        resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + account }],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          compartment: { reference: account },
+          resource: [{ resourceType: 'Patient', criteria: 'Patient?_compartment=' + account }],
+        },
       });
 
       // Create a patient on behalf of test account 1
@@ -356,7 +524,7 @@ describe('On Behalf Of', () => {
         .set('X-Medplum-On-Behalf-Of', getReferenceString(testAccount.profile))
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ resourceType: 'Patient' });
-      expect(res1.status).toBe(201);
+      expect(res1).toHaveStatus(201);
       expect(res1.body.resourceType).toStrictEqual('Patient');
 
       const patient1 = res1.body as Patient;
@@ -379,7 +547,7 @@ describe('On Behalf Of', () => {
           resourceType: 'Patient',
           meta: {},
         });
-      expect(res2.status).toBe(201);
+      expect(res2).toHaveStatus(201);
       expect(res2.body.resourceType).toStrictEqual('Patient');
 
       const patient2 = res2.body as Patient;
@@ -405,7 +573,7 @@ describe('On Behalf Of', () => {
             account: { reference: 'Organization/' + randomUUID() },
           },
         });
-      expect(res3.status).toBe(201);
+      expect(res3).toHaveStatus(201);
       expect(res3.body.resourceType).toStrictEqual('Patient');
 
       const patient3 = res3.body as Patient;

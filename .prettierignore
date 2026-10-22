@@ -7,3 +7,7 @@
 **/ccda/testdata/**/*
 **/mock/src/mocks/**/*.json
 **/packages/definitions/src/fhir/**/*
+packages/server/binary/**/*
+
+# Generated CDK cloud assemblies
+**/cdk.out/**/*

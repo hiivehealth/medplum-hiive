@@ -375,6 +375,104 @@ See this [video demo](https://www.youtube.com/watch?v=IDhsWiIxK3o) for an illust
 
 See [this Github Discussion](https://github.com/medplum/medplum/discussions/1453) for more examples of access scenarios that can be created using these policies.
 
+Parameterized policies are also the recommended pattern for temporary operational access, such as emergency patient access or temporary tenant access.
+
+### Emergency Access
+
+Emergency access, sometimes called Break Glass access, is a controlled workflow for granting temporary access to protected health information when normal access paths are not sufficient. This pattern supports ONC criterion [d6 Emergency Access](/docs/compliance/onc#criteria-certified).
+
+When implementing emergency access, keep the grant narrow, time-bound, and auditable:
+
+- Require an explicit reason before access is granted.
+- Scope access to the smallest useful resource set, such as one patient or one tenant.
+- Prefer short-lived sessions or a temporary `ProjectMembership` entry instead of standing broad access.
+- Record who requested access, who approved it, the reason, the patient or tenant scope, and the revocation time.
+- Review `AuditEvent` records after the access window closes.
+
+For patient-specific escalation, one pattern is to add the support user or clinician's `Practitioner` profile to the patient's `generalPractitioner` list, then use an access policy scoped to that relationship:
+
+```json
+{
+  "resourceType": "AccessPolicy",
+  "name": "Emergency Patient Access",
+  "resource": [
+    {
+      "resourceType": "Patient",
+      "criteria": "Patient?general-practitioner=%profile"
+    }
+  ]
+}
+```
+
+After the emergency window, remove the temporary `generalPractitioner` reference and confirm that the user can no longer read the patient record.
+
+### Temporary tenant access
+
+For support workflows, use a parameterized policy to grant access to one tenant for a limited operational window. Add a temporary `ProjectMembership.access` entry with the tenant reference as the parameter value, capture the reason and approval in your support system, and remove the entry when the work is complete.
+
+```json
+{
+  "resourceType": "ProjectMembership",
+  "access": [
+    {
+      "policy": { "reference": "AccessPolicy/tenant-support-readonly" },
+      "parameter": [
+        {
+          "name": "organization",
+          "valueReference": { "reference": "Organization/clinic-a" }
+        }
+      ]
+    }
+  ]
+}
+```
+
+### Migrating from top-level compartments
+
+Older access policies may use the top-level `compartment` element to describe a broad compartment rule. For new policies, prefer resource-level `criteria` with parameterized values. This keeps each resource rule explicit and lets the same policy template be reused with different `ProjectMembership.access.parameter` values.
+
+For example, instead of relying on a top-level compartment rule, define the tenant filter on each resource that should be visible:
+
+```json
+{
+  "resourceType": "AccessPolicy",
+  "name": "Organization Tenant Access",
+  "resource": [
+    {
+      "resourceType": "Patient",
+      "criteria": "Patient?_compartment=%organization"
+    },
+    {
+      "resourceType": "Observation",
+      "criteria": "Observation?_compartment=%organization"
+    },
+    {
+      "resourceType": "DiagnosticReport",
+      "criteria": "DiagnosticReport?_compartment=%organization"
+    }
+  ]
+}
+```
+
+Then set the concrete tenant value on each membership:
+
+```json
+{
+  "resourceType": "ProjectMembership",
+  "access": [
+    {
+      "policy": { "reference": "AccessPolicy/organization-tenant-access" },
+      "parameter": [
+        {
+          "name": "organization",
+          "valueReference": { "reference": "Organization/clinic-a" }
+        }
+      ]
+    }
+  ]
+}
+```
+
 ## Example Access Policies
 
 ### Healthcare Partnerships
@@ -452,105 +550,9 @@ Patient Access is disabled by default. See our article on [enabling open patient
 
 :::
 
-:::danger[Binary Access]
+For an example Patient Access Policy template, see [your project's Default Access Policy](#default-access-policies).
 
-Binary resources cannot use compartment-based access controls. They require explicit `securityContext` declaration. See the [Binary Security Context](/docs/access/binary-security-context) documentation for more information.
-
-:::
-
-```json
-{
-  "resourceType": "AccessPolicy",
-  "name": "Patient Access Policy Template",
-  "id": "patient-access-policy-template",
-  "resource": [
-    {
-      "resourceType": "Patient",
-      "criteria": "Patient?_compartment=%patient"
-    },
-    {
-      "resourceType": "Observation",
-      "criteria": "Observation?_compartment=%patient"
-    },
-    {
-      "resourceType": "DiagnosticReport",
-      "criteria": "DiagnosticReport?_compartment=%patient"
-    },
-    {
-      "resourceType": "MedicationRequest",
-      "criteria": "MedicationRequest?_compartment=%patient"
-    },
-    {
-      "resourceType": "Coverage",
-      "criteria": "Coverage?_compartment=%patient"
-    },
-    {
-      "resourceType": "PaymentNotice",
-      "criteria": "PaymentNotice?_compartment=%patient"
-    },
-    {
-      "resourceType": "CarePlan",
-      "criteria": "CarePlan?_compartment=%patient"
-    },
-    {
-      "resourceType": "Immunization",
-      "criteria": "Immunization?_compartment=%patient"
-    },
-    {
-      "resourceType": "Communication",
-      "criteria": "Communication?_compartment=%patient",
-      "interaction": ["create", "read", "search"]
-    },
-    {
-      "resourceType": "RequestGroup",
-      "criteria": "RequestGroup?_compartment=%patient"
-    },
-    {
-      "resourceType": "Task",
-      "criteria": "Task?focus=%patient"
-    },
-    {
-      "resourceType": "QuestionnaireResponse",
-      "criteria": "QuestionnaireResponse?_compartment=%patient"
-    },
-    {
-      "resourceType": "Subscription",
-      "criteria": "Subscription?type=websocket&author=%profile"
-    },
-    {
-      "resourceType": "Organization",
-      "readonly": true
-    },
-    {
-      "resourceType": "Practitioner",
-      "readonly": true
-    },
-    {
-      "resourceType": "Schedule",
-      "readonly": true
-    },
-    {
-      "resourceType": "DocumentReference",
-      "criteria": "DocumentReference?_compartment=%patient"
-    },
-    {
-      "resourceType": "Subscription",
-      "criteria": "Subscription?type=websocket&author=%patient"
-    },
-    {
-      "resourceType": "Appointment",
-      "interaction": ["create", "read", "search"],
-      "criteria": "Appointment?_compartment=%patient"
-    },
-    {
-      "resourceType": "Slot",
-      "interaction": ["create", "read", "search"],
-    }
-  ]
-}
-```
-
-:::caution Binary Security Context
+:::caution[Binary Security Context]
 
 `Binary` resources cannot use compartment-based access controls. Access is restricted by matching the `securityContext` field to the patient. When creating a `Binary` in a patient context, always set `securityContext` to the patient reference — otherwise the patient will not be able to access it:
 
@@ -650,6 +652,36 @@ This update allows for more granular control and visibility in RBAC implementati
 - **Client-Side**
   - The introduction of AccessPolicy.basedOn allows for client-side changes based on the user's group/policy.
   - This is especially useful for Role-Based Access Control (RBAC) implementations where different users may have varying access levels.
+
+## Default Access Policies
+
+New projects are created with a set of **default access policies**, one per profile type. These are stored on the [`Project.defaultAccessPolicies`](/docs/api/fhir/medplum/project) element, which maps a `profileType` to the `AccessPolicy` applied when a user of that type is invited without an explicit policy:
+
+| Profile type    | Default policy grants                                                                                                                            |
+| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `Practitioner`  | Read/write access to all resource types, **except** read-only access to a curated set of knowledge, terminology, and conformance resource types. |
+| `Admin`         | Full read/write access to all resource types (equivalent to having no access policy).                                                            |
+| `Patient`       | Access scoped to the patient's own compartment.                                                                                                  |
+| `RelatedPerson` | Access scoped to the associated patient's compartment, parameterized by `patient`.                                                               |
+
+When you [invite a user](/docs/app/invite) without specifying an access policy, Medplum applies the matching default for that profile type. Practitioners invited with the **admin** flag receive the `Admin` default; all other practitioners receive the `Practitioner` default.
+
+### Switching a user to (or from) admin
+
+The `admin` flag does **not** bypass a user's access policy — it only grants access to project administration resource types (such as [`ProjectMembership`](/docs/api/fhir/medplum/projectmembership) and [`User`](/docs/api/fhir/medplum/user)) on top of the existing policy. This means that promoting a Practitioner to admin without also changing their policy would leave them "half-upgraded": still restricted by the read-only rules of the `Practitioner` default.
+
+To avoid this, Medplum automatically **reconciles the default access policy when the admin flag is toggled**:
+
+- Promoting a user to admin: if their current policy is exactly the project's `Practitioner` default, it is swapped to the `Admin` default.
+- Demoting an admin: if their current policy is exactly the project's `Admin` default, it is swapped back to the `Practitioner` default.
+
+This reconciliation only happens when the user's current policy is exactly the **opposite role's recognized default** — the `Practitioner` default when promoting, or the `Admin` default when demoting. Any other policy is left as-is. In particular, **custom (non-default) access policies are never modified**: if you have assigned a user a bespoke policy, toggling the admin flag leaves that policy untouched.
+
+:::tip[Custom access policy combinations]
+
+If a user needs a more specific combination of access than the role defaults provide, we recommend **overriding the default by supplying an explicit access policy when you invite (or edit) the user**. Assigning a custom policy both gives the user exactly the access they need and opts them out of the automatic admin/practitioner reconciliation described above, so their policy will not be swapped when the admin flag changes.
+
+:::
 
 ## Related Resources
 

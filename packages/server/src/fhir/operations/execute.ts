@@ -46,6 +46,7 @@ export const executeHandler = async (req: Request, res: Response): Promise<void>
   } else {
     const result = await executeOperation(req, res);
 
+    // If a response has already started (e.g. SSE streaming), we do not control the response, clean up and return.
     if (res.headersSent) {
       if (!res.writableEnded) {
         res.end();
@@ -94,6 +95,7 @@ async function executeOperation(req: Request, res: Response): Promise<OperationO
   const result = await executeBot({
     bot,
     runAs: await getBotProjectMembership(ctx, bot),
+    runAsProject: ctx.project,
     requester: ctx.membership.profile,
     input: req.method === 'POST' ? req.body : req.query,
     contentType: req.header('content-type') as string,

@@ -1,10 +1,12 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { sleep } from '@medplum/core';
-import type { PoolClient } from 'pg';
+import type { PoolClient, PoolConfig } from 'pg';
 import { Pool } from 'pg';
 import * as semver from 'semver';
-import type { MedplumDatabaseConfig, MedplumServerConfig } from './config/types';
+import type { MedplumDatabaseConfig } from './config/types';
+import type { ServerConfig } from './config/utils';
+import { getAllShardsExceptGlobal, GLOBAL_SHARD_ID } from './fhir/sharding';
 import { globalLogger } from './logger';
 import { getPostDeployVersion, getPreDeployVersion } from './migration-sql';
 import {
@@ -14,6 +16,7 @@ import {
   getPreDeployMigration,
 } from './migrations/migration-utils';
 import { getPreDeployMigrationVersions, MigrationVersion } from './migrations/migration-versions';
+import { getConnectionShardId, setConnectionShardId } from './sharding/connection-shard-id';
 import { getServerVersion } from './util/version';
 
 export const DatabaseMode = {
@@ -22,59 +25,122 @@ export const DatabaseMode = {
 } as const;
 export type DatabaseMode = (typeof DatabaseMode)[keyof typeof DatabaseMode];
 
-let pool: Pool | undefined;
-let readonlyPool: Pool | undefined;
+type ShardPools = { pool: Pool | undefined; readonlyPool: Pool | undefined };
+const globalPools: ShardPools = { pool: undefined, readonlyPool: undefined };
+const shardPools: Record<string, ShardPools> = {};
 
-export function getDatabasePool(mode: DatabaseMode): Pool {
-  if (!pool) {
-    throw new Error('Database not setup');
+export function getDatabasePool(mode: DatabaseMode, shardId: string): Pool {
+  let pools: ShardPools | undefined;
+  if (shardId === GLOBAL_SHARD_ID) {
+    pools = globalPools;
+  } else if (Object.hasOwn(shardPools, shardId)) {
+    pools = shardPools[shardId];
   }
 
-  if (mode === DatabaseMode.READER && readonlyPool) {
-    return readonlyPool;
+  if (!pools?.pool) {
+    if (shardId === GLOBAL_SHARD_ID) {
+      throw new Error('Database not setup');
+    } else {
+      throw new Error(`Database not set up for shard ${shardId}`);
+    }
   }
 
-  return pool;
+  if (mode === DatabaseMode.READER && pools.readonlyPool) {
+    return pools.readonlyPool;
+  }
+
+  return pools.pool;
 }
 
 export const locks = {
   migration: 1,
 };
 
-export async function initDatabase(serverConfig: MedplumServerConfig): Promise<void> {
-  pool = await initPool(serverConfig.database, serverConfig.databaseProxyEndpoint);
-
-  if (serverConfig.database.runMigrations !== false) {
-    await runMigrations(pool);
+export async function initDatabase(serverConfig: ServerConfig): Promise<void> {
+  globalPools.pool = initPool(GLOBAL_SHARD_ID, serverConfig.database, serverConfig.databaseProxyEndpoint);
+  if (serverConfig.readonlyDatabase) {
+    globalPools.readonlyPool = initPool(
+      GLOBAL_SHARD_ID,
+      serverConfig.readonlyDatabase,
+      serverConfig.readonlyDatabaseProxyEndpoint
+    );
   }
 
-  if (serverConfig.readonlyDatabase) {
-    readonlyPool = await initPool(serverConfig.readonlyDatabase, serverConfig.readonlyDatabaseProxyEndpoint);
+  const migrationPools: [shardId: string, pools: Pool][] = [];
+  if (serverConfig.database.runMigrations !== false) {
+    migrationPools.push([GLOBAL_SHARD_ID, globalPools.pool]);
+  }
+
+  for (const shardConfig of getAllShardsExceptGlobal()) {
+    const shardPool = initPool(shardConfig.id, shardConfig.database, undefined);
+    const readonlyShardPool =
+      shardConfig.readonlyDatabase && initPool(shardConfig.id, shardConfig.readonlyDatabase, undefined);
+
+    shardPools[shardConfig.id] = {
+      pool: shardPool,
+      readonlyPool: readonlyShardPool,
+    };
+
+    if (shardConfig.database.runMigrations !== false) {
+      migrationPools.push([shardConfig.id, shardPool]);
+    }
+  }
+
+  // use allSettled to not interrupt the migration process for other shards if one fails
+  const migrationResults = await Promise.allSettled(
+    migrationPools.map(([shardId, pool]) => runMigrations(shardId, pool))
+  );
+  let migrationReasonToThrow: unknown;
+  for (const result of migrationResults) {
+    if (result.status === 'rejected') {
+      globalLogger.error('Database pre-deploy migration error', { reason: result.reason });
+      // arbitrarily choose the first rejection reason to throw later
+      migrationReasonToThrow ??= result.reason;
+    }
+  }
+  if (migrationReasonToThrow) {
+    throw migrationReasonToThrow;
   }
 }
 
-async function initPool(config: MedplumDatabaseConfig, proxyEndpoint: string | undefined): Promise<Pool> {
+function initPoolConfig(
+  config: MedplumDatabaseConfig,
+  proxyEndpoint: string | undefined,
+  applicationName = 'medplum-server'
+): PoolConfig {
   const poolConfig = {
     host: config.host,
     port: config.port,
     database: config.dbname,
     user: config.username,
     password: config.password,
-    application_name: 'medplum-server',
+    application_name: applicationName,
     ssl: config.ssl,
-    max: config.maxConnections ?? 100,
+    max: config.maxConnections ?? DEFAULT_MAX_CONNECTIONS,
+    min: config.minConnections,
+    idleTimeoutMillis: config.idleTimeoutMs,
+    maxUses: config.maxConnectionUses,
+    connectionTimeoutMillis: config.connectionTimeoutMs,
     options: config.disableConnectionConfiguration
       ? undefined
-      : `-c statement_timeout=${config.queryTimeout ?? DEFAULT_STATEMENT_TIMEOUT} -c default_transaction_isolation=repeatable\\ read -c idle_in_transaction_session_timeout=30000`,
+      : `-c statement_timeout=${config.queryTimeout ?? DEFAULT_STATEMENT_TIMEOUT} -c default_transaction_isolation=${DEFAULT_TRANSACTION_ISOLATION} -c idle_in_transaction_session_timeout=${DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT}`,
   };
 
   if (proxyEndpoint) {
     poolConfig.host = proxyEndpoint;
-    poolConfig.ssl = poolConfig.ssl ?? {};
+    // require SSL when using a proxy endpoint
+    poolConfig.ssl = typeof poolConfig.ssl === 'object' ? poolConfig.ssl : {};
     poolConfig.ssl.require = true;
   }
 
-  const pool = new Pool(poolConfig);
+  return poolConfig;
+}
+
+function initPool(shardId: string, config: MedplumDatabaseConfig, proxyEndpoint: string | undefined): Pool {
+  const pool = new Pool(initPoolConfig(config, proxyEndpoint));
+  setConnectionShardId(pool, shardId);
+  // 'connect' fires once per new client, before it is handed out by either connect() or query()
+  pool.on('connect', (client) => setConnectionShardId(client, shardId));
 
   pool.on('error', (err) => {
     globalLogger.error('Database connection error', err);
@@ -83,7 +149,24 @@ async function initPool(config: MedplumDatabaseConfig, proxyEndpoint: string | u
   return pool;
 }
 
+/**
+ * Escapes spaces and backslashes in a value embedded in libpq's `options` startup parameter.
+ * @see https://www.postgresql.org/docs/current/libpq-connect.html#LIBPQ-PARAMKEYWORDS-OPTIONS
+ *
+ * @param value - The value to escape.
+ * @returns The escaped value.
+ */
+export function escapePgOptionsArg(value: string): string {
+  // Correctly escape *all* backslashes and spaces using string replaceAll
+  // - replace all '\' with '\\'
+  // - then replace all ' ' with '\ '
+  return value.replaceAll('\\', '\\\\').replaceAll(' ', '\\ ');
+}
+
+const DEFAULT_MAX_CONNECTIONS = 50;
 const DEFAULT_STATEMENT_TIMEOUT = 60_000;
+const DEFAULT_TRANSACTION_ISOLATION = escapePgOptionsArg('repeatable read');
+const DEFAULT_IDLE_IN_TRANSACTION_SESSION_TIMEOUT = 30_000;
 
 export function getDefaultStatementTimeout(config: MedplumDatabaseConfig): number | 'DEFAULT' {
   if (config.disableConnectionConfiguration) {
@@ -92,30 +175,68 @@ export function getDefaultStatementTimeout(config: MedplumDatabaseConfig): numbe
   return config.queryTimeout ?? DEFAULT_STATEMENT_TIMEOUT;
 }
 
+/**
+ * Closes every database pool. A pool that fails to close is logged rather than thrown, so the
+ * remaining pools (and the rest of shutdown) still get closed.
+ */
 export async function closeDatabase(): Promise<void> {
-  if (pool) {
-    await pool.end();
-    pool = undefined;
+  async function closePool(shardId: string, pools: ShardPools, key: keyof ShardPools): Promise<void> {
+    const pool = pools[key];
+    if (!pool) {
+      return;
+    }
+    // Clear before ending: pg rejects a second end() on the same pool, so a failed pool cannot be retried
+    pools[key] = undefined;
+    const poolStats = {
+      shardId,
+      pool: key,
+      totalCount: pool.totalCount,
+      idleCount: pool.idleCount,
+      waitingCount: pool.waitingCount,
+    };
+    globalLogger.info('Closing database pool', poolStats);
+    try {
+      await pool.end();
+    } catch (err: unknown) {
+      globalLogger.error('Error closing database pool', { ...poolStats, err });
+    }
   }
 
-  if (readonlyPool) {
-    await readonlyPool.end();
-    readonlyPool = undefined;
-  }
+  const allPools: [shardId: string, pools: ShardPools][] = [
+    [GLOBAL_SHARD_ID, globalPools],
+    ...Object.entries(shardPools),
+  ];
+  await Promise.allSettled(
+    allPools.flatMap(([shardId, pools]) => [
+      closePool(shardId, pools, 'pool'),
+      closePool(shardId, pools, 'readonlyPool'),
+    ])
+  );
 }
 
-async function runMigrations(pool: Pool): Promise<void> {
+/**
+ * Runs pre-deploy migrations against a single shard's database.
+ *
+ * The migration lock ID is intentionally the same constant for every shard: Postgres scopes advisory
+ * locks to the current database, so shards in separate databases never contend, while two configs that
+ * point at the same database (or servers mid-deploy) still serialize against each other.
+ *
+ * @param shardId - The shard being migrated; used for logging.
+ * @param pool - The writer pool for the shard.
+ * @returns A promise that resolves when the migrations have completed successfully.
+ */
+async function runMigrations(shardId: string, pool: Pool): Promise<void> {
   return withPoolClient(async (client) => {
     let hasLock = false;
     try {
       hasLock = await acquireAdvisoryLock(client, locks.migration);
       if (!hasLock) {
-        throw new Error('Failed to acquire migration lock');
+        throw new Error(`Failed to acquire migration lock for shard ${shardId}`);
       }
       await client.query(`SET statement_timeout TO 0`); // Disable timeout for migrations AFTER getting lock
       await migrate(client);
-    } catch (err: any) {
-      globalLogger.error('Database schema migration error', err);
+    } catch (err: unknown) {
+      globalLogger.error('Database schema migration error', { shardId, err });
       throw err;
     } finally {
       if (hasLock) {
@@ -228,8 +349,66 @@ async function runAllPendingPreDeployMigrations(client: PoolClient, currentVersi
     if (migration) {
       const start = Date.now();
       await migration.run(client);
-      globalLogger.info('Database pre-deploy migration', { version: `v${i}`, duration: `${Date.now() - start} ms` });
+      globalLogger.info('Database pre-deploy migration', {
+        shardId: getConnectionShardId(client),
+        version: `v${i}`,
+        duration: `${Date.now() - start} ms`,
+      });
       await client.query('UPDATE "DatabaseMigration" SET "version"=$1 WHERE "id" = 1', [i]);
     }
   }
+}
+
+/**
+ * Prepares the database pools for graceful shutdown. Existing idle connections are
+ * removed immediately, regardless of the configured minimum. Checked-out and subsequently
+ * created connections remain usable, but are removed when released instead of returning
+ * to the pool. {@link closeDatabase} later ends the pools completely.
+ */
+export function prepareDatabasePoolsForShutdown(): void {
+  function preparePool(pool: Pool | undefined, mode: DatabaseMode, shardId: string): void {
+    try {
+      if (pool) {
+        preparePoolForShutdown(pool, mode);
+      }
+    } catch (err) {
+      globalLogger.error('Error purging idle pool connections', { err, shardId });
+    }
+  }
+
+  preparePool(globalPools.pool, DatabaseMode.WRITER, GLOBAL_SHARD_ID);
+  preparePool(globalPools.readonlyPool, DatabaseMode.READER, GLOBAL_SHARD_ID);
+  for (const [shardId, pools] of Object.entries(shardPools)) {
+    preparePool(pools.pool, DatabaseMode.WRITER, shardId);
+    preparePool(pools.readonlyPool, DatabaseMode.READER, shardId);
+  }
+}
+
+/**
+ * Prepares a pool for graceful shutdown by disabling its minimum connection count,
+ * removing its idle connections, and preventing released connections from returning
+ * to the pool.
+ * @param pool - The pool to prepare
+ * @param mode - The database mode, used for logging
+ * @returns The number of idle connections removed immediately
+ */
+function preparePoolForShutdown(pool: Pool, mode: DatabaseMode): number {
+  pool.options.min = 0; // do not retain a min during graceful shutdown
+  pool.options.maxUses = 1; // do not reuse connections during graceful shutdown
+
+  const poolInternal = pool as Pool & {
+    _idle: { client: PoolClient }[];
+    _remove: (client: PoolClient) => void;
+  };
+
+  const idleItems = poolInternal._idle;
+  const count = idleItems.length;
+
+  // Iterate backwards because _remove mutates _idle.
+  for (let i = count - 1; i >= 0; i--) {
+    poolInternal._remove(idleItems[i].client);
+  }
+
+  globalLogger.info(`Purged idle connections from pool`, { mode, count });
+  return count;
 }

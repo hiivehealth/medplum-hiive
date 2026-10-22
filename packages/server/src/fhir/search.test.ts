@@ -26,6 +26,7 @@ import type {
   Communication,
   Composition,
   Condition,
+  DeviceRequest,
   DiagnosticReport,
   Encounter,
   EvidenceVariable,
@@ -38,6 +39,7 @@ import type {
   Patient,
   PlanDefinition,
   Practitioner,
+  PractitionerRole,
   Project,
   Provenance,
   Questionnaire,
@@ -52,37 +54,38 @@ import type {
 } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import assert from 'node:assert';
+import type { MockInstance } from 'vitest';
 import { initAppServices, shutdownApp } from '../app';
 import { loadTestConfig } from '../config/loader';
-import type { MedplumServerConfig } from '../config/types';
-import { DatabaseMode } from '../database';
+import type { ServerConfig } from '../config/utils';
 import { bundleContains, createTestProject, withTestContext } from '../test.setup';
 import type { SystemRepository } from './repo';
-import { getGlobalSystemRepo, Repository } from './repo';
+import { Repository } from './repo';
+import { repoAccess } from './repository/access-tracker';
+import { getTestProjectSystemRepo } from './repository/test-utils';
 import type { ChainedSearchLink } from './search';
 import { clampEstimateCount, Direction, getCount, parseChainedParameter } from './search';
 import type { TokenColumnSearchParameterImplementation } from './searchparameter';
 import { getSearchParameterImplementation } from './searchparameter';
+import { PLACEHOLDER_SHARD_ID } from './sharding';
 import { SelectQuery } from './sql';
 import { loadStructureDefinitions } from './structure';
 
-jest.mock('hibp');
-
 const SUBSET_TAG: Coding = { system: 'http://hl7.org/fhir/v3/ObservationValue', code: 'SUBSETTED' };
 
-describe('project-scoped Repository', () => {
-  let config: MedplumServerConfig;
+describe.each<Project['features']>([undefined, ['range-search']])('project-scoped Repository w/ %j', (features) => {
+  let config: ServerConfig;
   let repo: Repository;
   let systemRepo: SystemRepository;
 
   beforeAll(async () => {
     config = await loadTestConfig();
     await initAppServices(config);
-    const { project } = await createTestProject();
+    const { project } = await createTestProject({ project: { features } });
     repo = new Repository({
+      routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
       strictMode: true,
       projects: [project],
-      currentProject: project,
       author: { reference: 'User/' + randomUUID() },
     });
     systemRepo = repo.getSystemRepo();
@@ -160,7 +163,7 @@ describe('project-scoped Repository', () => {
           resourceType: 'Patient',
           offset: 300,
         });
-        fail('Expected error');
+        expect.fail('Expected error');
       } catch (err) {
         expect(normalizeErrorString(err)).toStrictEqual('Search offset exceeds maximum (got 300, max 200)');
       }
@@ -193,10 +196,10 @@ describe('project-scoped Repository', () => {
   );
 
   describe('getCount', () => {
-    let getDbClientSpy: jest.SpyInstance;
+    let getDbClientSpy: MockInstance;
 
     beforeEach(() => {
-      getDbClientSpy = jest.spyOn(repo, 'getDatabaseClient');
+      getDbClientSpy = vi.spyOn(repo, 'getDatabaseClient');
     });
 
     afterEach(() => {
@@ -1108,6 +1111,66 @@ describe('project-scoped Repository', () => {
       expect(searchResult2.entry?.length).toStrictEqual(0);
     }));
 
+  test.each([
+    [Operator.MISSING, 'false', true],
+    [Operator.MISSING, 'true', false],
+    [Operator.PRESENT, 'true', true],
+    [Operator.PRESENT, 'false', false],
+  ])('Filter by _id with %s=%s', (operator, value, expectedMatch) =>
+    withTestContext(async () => {
+      const family = randomUUID();
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        name: [{ family }],
+      });
+
+      const result = await repo.search({
+        resourceType: 'Patient',
+        filters: [
+          { code: 'name', operator: Operator.EXACT, value: family },
+          { code: '_id', operator, value },
+        ],
+      });
+
+      expect(bundleContains(result, patient) !== undefined).toBe(expectedMatch);
+    })
+  );
+
+  test('Filter by _compartment presence', () =>
+    withTestContext(async () => {
+      const identifier = randomUUID();
+      const account = await systemRepo.createResource<Organization>({ resourceType: 'Organization' });
+      const organizationWithCompartment = await systemRepo.createResource<Organization>({
+        resourceType: 'Organization',
+        identifier: [{ value: identifier }],
+        meta: { accounts: [createReference(account)] },
+      });
+      const organizationWithoutCompartment = await systemRepo.createResource<Organization>({
+        resourceType: 'Organization',
+        identifier: [{ value: identifier }],
+      });
+
+      const presentResult = await systemRepo.search({
+        resourceType: 'Organization',
+        filters: [
+          { code: 'identifier', operator: Operator.EQUALS, value: identifier },
+          { code: '_compartment', operator: Operator.MISSING, value: 'false' },
+        ],
+      });
+      expect(bundleContains(presentResult, organizationWithCompartment)).toBeDefined();
+      expect(bundleContains(presentResult, organizationWithoutCompartment)).toBeUndefined();
+
+      const missingResult = await systemRepo.search({
+        resourceType: 'Organization',
+        filters: [
+          { code: 'identifier', operator: Operator.EQUALS, value: identifier },
+          { code: '_compartment', operator: Operator.MISSING, value: 'true' },
+        ],
+      });
+      expect(bundleContains(missingResult, organizationWithCompartment)).toBeUndefined();
+      expect(bundleContains(missingResult, organizationWithoutCompartment)).toBeDefined();
+    }));
+
   test('Filter by chained _id', () =>
     withTestContext(async () => {
       const organizationId = randomUUID();
@@ -1121,6 +1184,21 @@ describe('project-scoped Repository', () => {
 
       expect(searchResult1.entry?.length).toStrictEqual(1);
       expect(bundleContains(searchResult1 as Bundle, patient as Patient)).toBeDefined();
+    }));
+
+  test('Filter by chained _id presence', () =>
+    withTestContext(async () => {
+      const organization = await repo.createResource<Organization>({ resourceType: 'Organization' });
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        managingOrganization: createReference(organization),
+      });
+
+      const presentResult = await repo.search(parseSearchRequest('Patient?organization._id:missing=false'));
+      expect(bundleContains(presentResult, patient)).toBeDefined();
+
+      const missingResult = await repo.search(parseSearchRequest('Patient?organization._id:missing=true'));
+      expect(bundleContains(missingResult, patient)).toBeUndefined();
     }));
 
   test('Reverse filter by chained _id', () =>
@@ -1141,6 +1219,83 @@ describe('project-scoped Repository', () => {
         parseSearchRequest(`Location?_has:HealthcareService:location:_id=${healthcareService.id}`)
       );
       expect(searchResult.entry?.[0]?.resource?.id).toStrictEqual(location.id);
+
+      const presentResult = await repo.search(
+        parseSearchRequest('Location?_has:HealthcareService:location:_id:missing=false')
+      );
+      expect(bundleContains(presentResult, location)).toBeDefined();
+
+      const missingResult = await repo.search(
+        parseSearchRequest('Location?_has:HealthcareService:location:_id:missing=true')
+      );
+      expect(bundleContains(missingResult, location)).toBeUndefined();
+    }));
+
+  test('Reverse filter by _compartment:_id', () =>
+    withTestContext(async () => {
+      const { repo } = await createTestProject({ membership: { admin: true }, withRepo: true });
+      const organizationA = await repo.createResource<Organization>({ resourceType: 'Organization' });
+      const organizationB = await repo.createResource<Organization>({ resourceType: 'Organization' });
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { accounts: [createReference(organizationA), createReference(organizationB)] },
+      });
+      expect(patient.meta?.compartment).toContainEqual({ reference: getReferenceString(organizationA) });
+      expect(patient.meta?.compartment).toContainEqual({ reference: getReferenceString(organizationB) });
+
+      const searchResult = await repo.search(
+        parseSearchRequest(`Organization?_has:Patient:_compartment:_id=${patient.id}`)
+      );
+      // Both compartment Organizations returned
+      expect(searchResult.entry?.map((e) => e.resource?.id)).toContainExactly([organizationA.id, organizationB.id]);
+    }));
+
+  test('Forward filter by _compartment.name', () =>
+    withTestContext(async () => {
+      const { repo } = await createTestProject({ membership: { admin: true }, withRepo: true });
+
+      // Both Organizations considered, but only one matches
+      const organizationA = await repo.createResource<Organization>({
+        resourceType: 'Organization',
+        name: 'Compartment Chain Org ' + randomUUID(),
+      });
+      const organizationB = await repo.createResource<Organization>({
+        resourceType: 'Organization',
+        name: 'Other Org ' + randomUUID(),
+      });
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { accounts: [createReference(organizationB), createReference(organizationA)] },
+      });
+
+      const searchResult = await repo.search(
+        parseSearchRequest(`Patient?_compartment:Organization.name=${organizationA.name}`)
+      );
+      expect(searchResult.entry?.map((e) => e.resource?.id)).toStrictEqual([patient.id]);
+    }));
+
+  test('Chained filter with _compartment as middle link', () =>
+    withTestContext(async () => {
+      const { repo } = await createTestProject({ membership: { admin: true }, withRepo: true });
+      const organization = await repo.createResource<Organization>({
+        resourceType: 'Organization',
+        name: randomUUID(),
+      });
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { accounts: [createReference(organization)] },
+      });
+      const encounter = await repo.createResource<Encounter>({
+        resourceType: 'Encounter',
+        status: 'finished',
+        class: { code: 'test' },
+        subject: createReference(patient),
+      });
+
+      const searchResult = await repo.search(
+        parseSearchRequest(`Encounter?patient._compartment:Organization.name=${organization.name?.substring(0, 8)}`)
+      );
+      expect(searchResult.entry?.map((e) => e.resource?.id)).toStrictEqual([encounter.id]);
     }));
 
   test('Empty _id', async () =>
@@ -1263,7 +1418,7 @@ describe('project-scoped Repository', () => {
             },
           ],
         });
-        fail('Expected error');
+        expect.fail('Expected error');
       } catch (err) {
         expect(normalizeErrorString(err)).toStrictEqual('Search filter value must be a string');
       }
@@ -1282,7 +1437,7 @@ describe('project-scoped Repository', () => {
             },
           ],
         });
-        fail('Expected error');
+        expect.fail('Expected error');
       } catch (err) {
         expect(normalizeErrorString(err)).toStrictEqual('Search filter value cannot contain null bytes');
       }
@@ -2301,8 +2456,62 @@ describe('project-scoped Repository', () => {
             `Patient?_has:Observation:subject:encounter:Encounter._has:DiagnosticReport:encounter:result.specimen.parent.collected=2023`
           )
         )
-      ).rejects.toThrow(new Error('Search chains longer than three links are not currently supported'));
+      ).rejects.toThrow('Search chains longer than three links are not currently supported');
     }));
+
+  describe('disableChainedSearch', () => {
+    afterEach(() => {
+      config.disableChainedSearch = undefined;
+    });
+
+    test.each([
+      'Observation?subject:Patient.name=Alice',
+      'Patient?_has:Observation:subject:code=123',
+      'DiagnosticReport?result:Observation.subject:Patient.name=Alice',
+      `Patient?_has:Observation:subject:_id=${randomUUID()}`,
+    ])('Rejects chained search through disabled type: %s', (searchString) =>
+      withTestContext(async () => {
+        config.disableChainedSearch = ['Observation'];
+        await expect(repo.search(parseSearchRequest(searchString))).rejects.toThrow(
+          'Chained search is disabled for Observation'
+        );
+      })
+    );
+
+    test.each([
+      `Observation?subject:Patient._id=${randomUUID()}`,
+      'Encounter?patient.name=Alice',
+      'DiagnosticReport?result.code=123',
+    ])('Allows chained search not using disabled reference table: %s', (searchString) =>
+      withTestContext(async () => {
+        config.disableChainedSearch = ['Observation'];
+        await expect(repo.search(parseSearchRequest(searchString))).resolves.toBeDefined();
+      })
+    );
+
+    test('Chained search works again after reindex', () =>
+      withTestContext(async () => {
+        config.disableChainedSearch = ['Observation'];
+        const code = randomUUID();
+        const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
+        const obs = await repo.createResource<Observation>({
+          resourceType: 'Observation',
+          status: 'final',
+          code: { coding: [{ code }] },
+          subject: createReference(patient),
+        });
+        const searchRequest = parseSearchRequest<Patient>(`Patient?_has:Observation:subject:code=${code}`);
+        await expect(repo.search(searchRequest)).rejects.toThrow('Chained search is disabled for Observation');
+
+        config.disableChainedSearch = undefined;
+        const beforeReindex = await repo.search(searchRequest);
+        expect(beforeReindex.entry).toHaveLength(0);
+
+        await systemRepo.reindexResources([obs]);
+        const afterReindex = await repo.search(searchRequest);
+        expect(afterReindex.entry?.map((e) => e.resource?.id)).toStrictEqual([patient.id]);
+      }));
+  });
 
   test.each([
     ['Patient?organization.invalid.name=Kaiser', 'Invalid search parameter in chain: Organization?invalid'],
@@ -2318,9 +2527,7 @@ describe('project-scoped Repository', () => {
     ],
     ['Patient?_has:Observation:status=active', 'Invalid search chain: _has:Observation:status'],
   ])('Invalid chained search parameters: %s', (searchString: string, errorMsg: string) => {
-    return withTestContext(async () =>
-      expect(repo.search(parseSearchRequest(searchString))).rejects.toStrictEqual(new Error(errorMsg))
-    );
+    return withTestContext(async () => expect(repo.search(parseSearchRequest(searchString))).rejects.toThrow(errorMsg));
   });
 
   test('Chained search with modifier', () =>
@@ -2591,6 +2798,59 @@ describe('project-scoped Repository', () => {
       expect(bundleContains(bundle, response)).toMatchObject<BundleEntry>({ search: { mode: 'include' } });
     }));
 
+  test('Reverse include on denied type', () =>
+    withTestContext(async () => {
+      const { repo, client } = await createTestProject({
+        withRepo: true,
+        withClient: true,
+        accessPolicy: { resource: [{ resourceType: 'ClientApplication' }] },
+      });
+
+      await expect(
+        repo.search({
+          resourceType: 'ClientApplication',
+          revInclude: [
+            {
+              resourceType: 'ProjectMembership',
+              searchParam: 'profile',
+            },
+          ],
+          total: 'accurate',
+          filters: [{ code: '_id', operator: Operator.EQUALS, value: client.id }],
+        })
+      ).rejects.toThrow('Forbidden');
+    }));
+
+  test('Chained search through denied type', () =>
+    withTestContext(async () => {
+      const { repo, project } = await createTestProject({
+        withRepo: true,
+        accessPolicy: { resource: [{ resourceType: 'Observation' }, { resourceType: 'Organization' }] },
+      });
+
+      const organization = await repo.createResource({
+        resourceType: 'Organization',
+        name: randomUUID(),
+      });
+
+      const patient = await repo.getSystemRepo().createResource({
+        resourceType: 'Patient',
+        meta: { project: project.id },
+        managingOrganization: createReference(organization),
+      });
+
+      await repo.createResource({
+        resourceType: 'Observation',
+        status: 'final',
+        subject: createReference(patient),
+        code: { text: 'Seen by doctor' },
+      });
+
+      await expect(
+        repo.search(parseSearchRequest(`Observation?patient.organization.name=${organization.name}`))
+      ).rejects.toThrow('Forbidden');
+    }));
+
   test('_include:iterate', () =>
     withTestContext(async () => {
       /*
@@ -2702,7 +2962,9 @@ describe('project-scoped Repository', () => {
         ],
       });
 
-      const expected = [
+      expect(
+        bundle.entry?.map((e) => `${e.search?.mode}:${e.resource?.resourceType}/${e.resource?.id}`)
+      ).toContainExactly([
         `match:Patient/${patient.id}`,
         `include:Patient/${linked1.id}`,
         `include:Patient/${linked2.id}`,
@@ -2710,11 +2972,87 @@ describe('project-scoped Repository', () => {
         `include:Organization/${organization1.id}`,
         `include:Practitioner/${practitioner1.id}`,
         `include:Practitioner/${practitioner2.id}`,
-      ].sort();
+      ]);
+    }));
 
+  test('_include with target type', () =>
+    withTestContext(async () => {
+      // gh-9765: AuditEvent.entity.what can reference many types, so
+      // _include=AuditEvent:entity:Task must include only the Task, not every
+      // referenced resource type.
+      const task = await repo.createResource<Task>({
+        resourceType: 'Task',
+        status: 'completed',
+        intent: 'order',
+      });
+      const referencedAuditEvent = await repo.createResource<AuditEvent>({
+        resourceType: 'AuditEvent',
+        recorded: '2026-01-01T00:00:00.000Z',
+        type: { system: 'http://terminology.hl7.org/CodeSystem/audit-event-type', code: 'rest' },
+        agent: [{ requestor: true }],
+        source: { observer: { display: 'test' } },
+      });
+      const auditEvent = await repo.createResource<AuditEvent>({
+        resourceType: 'AuditEvent',
+        recorded: '2026-01-01T00:00:00.000Z',
+        type: { system: 'http://terminology.hl7.org/CodeSystem/audit-event-type', code: 'rest' },
+        agent: [{ requestor: true }],
+        source: { observer: { display: 'test' } },
+        entity: [
+          { what: { reference: getReferenceString(task) } },
+          { what: { reference: getReferenceString(referencedAuditEvent) } },
+        ],
+      });
+
+      const bundle = await repo.search({
+        resourceType: 'AuditEvent',
+        filters: [{ code: 'entity', operator: Operator.EQUALS, value: getReferenceString(task) }],
+        include: [{ resourceType: 'AuditEvent', searchParam: 'entity', targetType: 'Task' }],
+      });
+
+      // The Task is included; the referenced AuditEvent is not, because its type
+      // does not match the include target type.
       expect(
-        bundle.entry?.map((e) => `${e.search?.mode}:${e.resource?.resourceType}/${e.resource?.id}`).sort()
-      ).toStrictEqual(expected);
+        bundle.entry?.map((e) => `${e.search?.mode}:${e.resource?.resourceType}/${e.resource?.id}`)
+      ).toContainExactly([`include:Task/${task.id}`, `match:AuditEvent/${auditEvent.id}`]);
+    }));
+
+  test('_revinclude with target type', () =>
+    withTestContext(async () => {
+      // gh-9765: _revinclude target type restricts which base resources are followed.
+      const identifier = randomUUID();
+      const task = await repo.createResource<Task>({
+        resourceType: 'Task',
+        status: 'completed',
+        intent: 'order',
+        identifier: [{ value: identifier }],
+      });
+      const auditEvent = await repo.createResource<AuditEvent>({
+        resourceType: 'AuditEvent',
+        recorded: '2026-01-01T00:00:00.000Z',
+        type: { system: 'http://terminology.hl7.org/CodeSystem/audit-event-type', code: 'rest' },
+        agent: [{ requestor: true }],
+        source: { observer: { display: 'test' } },
+        entity: [{ what: { reference: getReferenceString(task) } }],
+      });
+
+      // Target type matches the Task base result: the AuditEvent is reverse included.
+      const matched = await repo.search({
+        resourceType: 'Task',
+        filters: [{ code: 'identifier', operator: Operator.EQUALS, value: identifier }],
+        revInclude: [{ resourceType: 'AuditEvent', searchParam: 'entity', targetType: 'Task' }],
+      });
+      expect(
+        matched.entry?.map((e) => `${e.search?.mode}:${e.resource?.resourceType}/${e.resource?.id}`)
+      ).toContainExactly([`include:AuditEvent/${auditEvent.id}`, `match:Task/${task.id}`]);
+
+      // Target type Patient does not match the Task base result: nothing is reverse included.
+      const notMatched = await repo.search({
+        resourceType: 'Task',
+        filters: [{ code: 'identifier', operator: Operator.EQUALS, value: identifier }],
+        revInclude: [{ resourceType: 'AuditEvent', searchParam: 'entity', targetType: 'Patient' }],
+      });
+      expect(notMatched.entry?.filter((e) => e.search?.mode === 'include')).toHaveLength(0);
     }));
 
   test('_revinclude:iterate', () =>
@@ -2846,7 +3184,9 @@ describe('project-scoped Repository', () => {
         ],
       });
 
-      const expected = [
+      expect(
+        bundle.entry?.map((e) => `${e.search?.mode}:${e.resource?.resourceType}/${e.resource?.id}`)
+      ).toContainExactly([
         `match:Patient/${patient.id}`,
         `include:Patient/${linked1.id}`,
         `include:Patient/${linked2.id}`,
@@ -2854,11 +3194,7 @@ describe('project-scoped Repository', () => {
         `include:Observation/${observation2.id}`,
         `include:Observation/${observation3.id}`,
         `include:Observation/${observation4.id}`,
-      ].sort();
-
-      expect(
-        bundle.entry?.map((e) => `${e.search?.mode}:${e.resource?.resourceType}/${e.resource?.id}`).sort()
-      ).toStrictEqual(expected);
+      ]);
     }));
 
   test('_include depth limit', () =>
@@ -2956,7 +3292,7 @@ describe('project-scoped Repository', () => {
           ],
           include: [{ resourceType: 'Patient', searchParam: 'link', modifier: Operator.ITERATE }],
         })
-      ).resolves.toMatchObject<Bundle>({
+      ).resolves.toMatchObject({
         resourceType: 'Bundle',
         type: 'searchset',
         entry: [],
@@ -2997,7 +3333,7 @@ describe('project-scoped Repository', () => {
         include: [{ resourceType: 'Patient', searchParam: 'general-practitioner' }],
         count: 1,
       };
-      await expect(repo.search(searchRequest)).resolves.toMatchObject<Bundle>({
+      await expect(repo.search(searchRequest)).resolves.toMatchObject({
         resourceType: 'Bundle',
         type: 'searchset',
         entry: [
@@ -3013,7 +3349,7 @@ describe('project-scoped Repository', () => {
       });
 
       searchRequest.count = 2;
-      await expect(repo.search(searchRequest)).resolves.toMatchObject<Bundle>({
+      await expect(repo.search(searchRequest)).resolves.toMatchObject({
         resourceType: 'Bundle',
         type: 'searchset',
         entry: [
@@ -3449,6 +3785,75 @@ describe('project-scoped Repository', () => {
       expect(result2.entry?.[0]?.resource?.id).toStrictEqual(obs2.id);
     }));
 
+  test.each<[number, string]>([
+    [0, 'Z'],
+    [1, 'Z'],
+    [6, 'Z'],
+    [12, 'Z'],
+    [23, 'Z'],
+    [0, '-08:00'],
+    [23, '-08:00'],
+    [0, '+03:00'],
+    [23, '+03:00'],
+  ])('birthdate covers all hours: %d (%s)', (hour, tz) =>
+    withTestContext(async () => {
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        name: [{ given: ['Evelyn'] }],
+        birthDate: '2000-01-01',
+        managingOrganization: { reference: 'Organization/' + randomUUID() },
+      });
+
+      const result1 = await repo.search({
+        resourceType: 'Patient',
+        filters: [
+          {
+            code: 'organization',
+            operator: Operator.EQUALS,
+            value: patient.managingOrganization?.reference as string,
+          },
+          {
+            code: 'birthdate',
+            operator: Operator.EQUALS,
+            value: `2000-01-01T${hour.toString().padStart(2, '0')}:00:00${tz}`,
+          },
+        ],
+      });
+      expect(result1.entry).toHaveLength(1);
+    })
+  );
+
+  test('birthdate with multiple values', () =>
+    withTestContext(async () => {
+      if (!features) {
+        return; // Skip test without feature flag
+      }
+
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        name: [{ given: ['Evelyn'] }],
+        birthDate: '2000-01-01',
+        managingOrganization: { reference: 'Organization/' + randomUUID() },
+      });
+
+      const result1 = await repo.search({
+        resourceType: 'Patient',
+        filters: [
+          {
+            code: 'organization',
+            operator: Operator.EQUALS,
+            value: patient.managingOrganization?.reference as string,
+          },
+          {
+            code: 'birthdate',
+            operator: Operator.EQUALS,
+            value: `2000-01-01,2001-01-01`,
+          },
+        ],
+      });
+      expect(result1.entry).toHaveLength(1);
+    }));
+
   test('_filter search', () =>
     withTestContext(async () => {
       const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
@@ -3530,6 +3935,31 @@ describe('project-scoped Repository', () => {
       });
 
       expect(result2.entry).toHaveLength(1);
+    }));
+
+  test('_filter with UUID value', () =>
+    withTestContext(async () => {
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        name: [{ given: ['Evelyn'] }],
+      });
+
+      // The first UUID has all digits before its first hyphen, which used to be tokenized as a date
+      // literal and truncated. That silently dropped the rest of the expression -- including the
+      // "or" branch that matches the real resource. In the parenthesized form, the UUID also used to
+      // swallow the closing parenthesis.
+      for (const value of [
+        `_id eq 12345678-1234-4123-8123-123456789abc or _id eq ${patient.id}`,
+        `(_id eq 12345678-1234-4123-8123-123456789abc or _id eq ${patient.id})`,
+      ]) {
+        const result = await repo.search({
+          resourceType: 'Patient',
+          filters: [{ code: '_filter', operator: Operator.EQUALS, value }],
+        });
+
+        expect(result.entry).toHaveLength(1);
+        expect(result.entry?.[0]?.resource?.id).toStrictEqual(patient.id);
+      }
     }));
 
   test('_filter birthdate eq', () =>
@@ -3727,8 +4157,7 @@ describe('project-scoped Repository', () => {
         ],
       });
 
-      expect(result.entry).toHaveLength(2);
-      expect(getEntryIds(result)).toStrictEqual(expect.arrayContaining([observation1.id, observation2.id]));
+      expect(getEntryIds(result)).toContainExactly([observation1.id, observation2.id]);
 
       // Patients with observations performed by themselves with an ID equal to observation1.id
       const result2 = await repo.search(
@@ -3864,12 +4293,12 @@ describe('project-scoped Repository', () => {
       [Operator.LESS_THAN, start, false],
       [Operator.LESS_THAN_OR_EQUALS, start, true],
       [Operator.GREATER_THAN_OR_EQUALS, start, true],
-      [Operator.GREATER_THAN, start, false],
+      [Operator.GREATER_THAN, start, features?.includes('range-search')],
 
       [Operator.LESS_THAN, startPlusOneSecond, true],
       [Operator.LESS_THAN_OR_EQUALS, startPlusOneSecond, true],
-      [Operator.GREATER_THAN_OR_EQUALS, startPlusOneSecond, false],
-      [Operator.GREATER_THAN, startPlusOneSecond, false],
+      [Operator.GREATER_THAN_OR_EQUALS, startPlusOneSecond, features?.includes('range-search')],
+      [Operator.GREATER_THAN, startPlusOneSecond, features?.includes('range-search')],
 
       [Operator.GREATER_THAN, '2025-05-01', true],
       [Operator.GREATER_THAN, '2025-06-01', false],
@@ -4322,6 +4751,44 @@ describe('project-scoped Repository', () => {
       expect(bundle.entry?.length).toBe(2);
       expect(bundleContains(bundle, patient)).toBeTruthy();
       expect(bundleContains(bundle, obs)).toBeTruthy();
+    }));
+
+  test('Multiple resource types with _type uses offset pagination across combined results', async () =>
+    withTestContext(async () => {
+      const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
+      const expectedIds = [patient.id];
+
+      for (let i = 0; i < 4; i++) {
+        const obs = await repo.createResource<Observation>({
+          resourceType: 'Observation',
+          status: 'final',
+          code: { text: 'test' },
+          subject: createReference(patient),
+        });
+        expectedIds.push(obs.id);
+      }
+
+      let url = `Patient?_type=Patient,Observation&_compartment=${getReferenceString(patient)}&_sort=_id&_count=2`;
+      const seenIds: string[] = [];
+      const pageSizes: number[] = [];
+
+      while (url) {
+        const bundle = await repo.search(parseSearchRequest(url));
+        pageSizes.push(bundle.entry?.length ?? 0);
+        for (const entry of bundle.entry ?? []) {
+          seenIds.push(entry.resource?.id as string);
+        }
+
+        const nextLink = bundle.link?.find((l) => l.relation === 'next')?.url;
+        if (nextLink) {
+          expect(nextLink).toContain('_type=Patient,Observation');
+          expect(nextLink).toContain('_offset=');
+        }
+        url = nextLink ?? '';
+      }
+
+      expect(pageSizes).toStrictEqual([2, 2, 1]);
+      expect(seenIds).toContainExactly(expectedIds);
     }));
 
   test('Binary search not allowed', async () =>
@@ -4903,9 +5370,10 @@ describe('project-scoped Repository', () => {
         ]);
 
         // Second patient has one ServiceRequest and one Observation
-        expect(
-          result[getReferenceString(patients[1])].map((r) => r.resourceType).sort((a, b) => a.localeCompare(b))
-        ).toStrictEqual(['Observation', 'ServiceRequest']);
+        expect(result[getReferenceString(patients[1])].map((r) => r.resourceType)).toContainExactly([
+          'Observation',
+          'ServiceRequest',
+        ]);
 
         // Third patient has only Observations
         expect(result[getReferenceString(patients[2])].map((r) => r.resourceType)).toStrictEqual([
@@ -4918,7 +5386,7 @@ describe('project-scoped Repository', () => {
       withTestContext(async () => {
         try {
           await repo.search({ resourceType: 'Patient', offset: 10, cursor: 'foo' });
-          fail('Expected error');
+          expect.fail('Expected error');
         } catch (err) {
           expect(normalizeErrorString(err)).toBe('Cannot use both offset and cursor');
         }
@@ -4995,6 +5463,41 @@ describe('project-scoped Repository', () => {
         expect(seenResources.length).toBe(50);
       }));
 
+    test('Cursor pagination with multiple resource types from _type', () =>
+      withTestContext(async () => {
+        const patient = await systemRepo.createResource<Patient>({ resourceType: 'Patient' });
+        const expectedIds = [patient.id];
+
+        for (let i = 0; i < 49; i++) {
+          const obs = await systemRepo.createResource<Observation>({
+            resourceType: 'Observation',
+            status: 'final',
+            code: { text: 'cursor_type_test' },
+            subject: createReference(patient),
+          });
+          expectedIds.push(obs.id);
+        }
+
+        let url = `Patient?_type=Patient,Observation&_compartment=${getReferenceString(patient)}&_sort=_lastUpdated&_count=20`;
+        const seenIds: string[] = [];
+        while (url) {
+          const bundle = await systemRepo.search(parseSearchRequest(url));
+          for (const entry of bundle.entry ?? []) {
+            seenIds.push(entry.resource?.id as string);
+          }
+
+          const link = bundle.link?.find((l) => l.relation === 'next')?.url;
+          if (link) {
+            expect(link).toContain('_type=Patient,Observation');
+            expect(link).toContain('_cursor=');
+          }
+          url = link ?? '';
+        }
+
+        expect(seenIds.length).toBe(50);
+        expect(seenIds).toContainExactly(expectedIds);
+      }));
+
     test('V1 cursor is not parsed as V2', () =>
       withTestContext(async () => {
         const identifier = randomUUID();
@@ -5021,6 +5524,96 @@ describe('project-scoped Repository', () => {
       }));
   });
 
+  describe('Reference search bare-id prefix derivation', () => {
+    // Verifies that single-target reference search parameters accept bare ids
+    // (per FHIR R4 §3.1.1.4.12 — the spec defines bare `[id]` as the standard
+    // form and reserves `[type]/[id]` for multi-target params). Prior to the
+    // fix, only the `subject`/`patient` columns were prefixed, so spec-compliant
+    // queries like `DeviceRequest?encounter=<uuid>` silently returned zero.
+    test('Single-target reference param: bare uuid matches (DeviceRequest.encounter)', () =>
+      withTestContext(async () => {
+        const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
+        const encounter = await repo.createResource<Encounter>({
+          resourceType: 'Encounter',
+          status: 'in-progress',
+          class: { code: 'AMB' },
+          subject: createReference(patient),
+        });
+        const deviceRequest = await repo.createResource<DeviceRequest>({
+          resourceType: 'DeviceRequest',
+          status: 'active',
+          intent: 'order',
+          subject: createReference(patient),
+          encounter: createReference(encounter),
+          codeCodeableConcept: { text: 'Test device' },
+        });
+
+        // Bare uuid form (the spec-compliant form for single-target refs).
+        const bareResult = await repo.search(parseSearchRequest(`DeviceRequest?encounter=${encounter.id}`));
+        expect(bareResult.entry).toHaveLength(1);
+        expect(bareResult.entry?.[0]?.resource?.id).toBe(deviceRequest.id);
+
+        // Control: typed-prefix form still works.
+        const typedResult = await repo.search(parseSearchRequest(`DeviceRequest?encounter=Encounter/${encounter.id}`));
+        expect(typedResult.entry).toHaveLength(1);
+        expect(typedResult.entry?.[0]?.resource?.id).toBe(deviceRequest.id);
+      }));
+
+    test('Single-target reference param: bare uuid matches (PractitionerRole.practitioner)', () =>
+      withTestContext(async () => {
+        const practitioner = await repo.createResource<Practitioner>({ resourceType: 'Practitioner' });
+        const role = await repo.createResource<PractitionerRole>({
+          resourceType: 'PractitionerRole',
+          practitioner: createReference(practitioner),
+        });
+
+        const result = await repo.search(parseSearchRequest(`PractitionerRole?practitioner=${practitioner.id}`));
+        expect(result.entry).toHaveLength(1);
+        expect(result.entry?.[0]?.resource?.id).toBe(role.id);
+      }));
+
+    test('Single-target reference param on array column: bare uuid matches (Encounter.location)', () =>
+      withTestContext(async () => {
+        const location = await repo.createResource<Location>({ resourceType: 'Location', name: randomUUID() });
+        const encounter = await repo.createResource<Encounter>({
+          resourceType: 'Encounter',
+          status: 'in-progress',
+          class: { code: 'AMB' },
+          location: [{ location: createReference(location) }],
+        });
+
+        const result = await repo.search(parseSearchRequest(`Encounter?location=${location.id}`));
+        expect(result.entry).toHaveLength(1);
+        expect(result.entry?.[0]?.resource?.id).toBe(encounter.id);
+      }));
+
+    test('Back-compat: bare uuid on multi-target subject column still defaults to Patient', () =>
+      withTestContext(async () => {
+        // Observation.subject targets [Patient, Group, Device, Location] — multi-target.
+        // The legacy heuristic prepends `Patient/` for bare values; preserved.
+        const patient = await repo.createResource<Patient>({ resourceType: 'Patient' });
+        const observation = await repo.createResource<Observation>({
+          resourceType: 'Observation',
+          status: 'final',
+          code: { text: 'back-compat probe' },
+          subject: createReference(patient),
+        });
+
+        const result = await repo.search(parseSearchRequest(`Observation?subject=${patient.id}`));
+        expect(result.entry?.some((e) => e.resource?.id === observation.id)).toBe(true);
+      }));
+
+    test('Non-uuid bare value is not rewritten (avoids corrupting unrelated values)', () =>
+      withTestContext(async () => {
+        // Sanity: a value that is neither a uuid nor a typed reference should be
+        // left untouched on a single-target reference column. The search simply
+        // matches nothing — but importantly, it does not throw or get rewritten
+        // into an unintended `Type/not-a-uuid` filter.
+        const result = await repo.search(parseSearchRequest('DeviceRequest?encounter=not-a-uuid'));
+        expect(result.entry ?? []).toHaveLength(0);
+      }));
+  });
+
   describe('Quantity search', () => {
     beforeAll(async () => {
       for (const weight of [70, 75, 80, 85, 90]) {
@@ -5043,9 +5636,7 @@ describe('project-scoped Repository', () => {
         const result = await repo.search(
           parseSearchRequest<Observation>('Observation?code=29463-7&value-quantity=gt80')
         );
-        expect(result.entry).toHaveLength(2);
-        expect(result.entry?.find((e) => e.resource?.valueQuantity?.value === 85)).toBeDefined();
-        expect(result.entry?.find((e) => e.resource?.valueQuantity?.value === 90)).toBeDefined();
+        expect(result.entry?.map((e) => e.resource?.valueQuantity?.value)).toContainExactly([85, 90]);
       }));
 
     test('With units', async () =>
@@ -5053,9 +5644,7 @@ describe('project-scoped Repository', () => {
         const result = await repo.search(
           parseSearchRequest<Observation>('Observation?code=29463-7&value-quantity=gt80|http://unitsofmeasure.org|kg')
         );
-        expect(result.entry).toHaveLength(2);
-        expect(result.entry?.find((e) => e.resource?.valueQuantity?.value === 85)).toBeDefined();
-        expect(result.entry?.find((e) => e.resource?.valueQuantity?.value === 90)).toBeDefined();
+        expect(result.entry?.map((e: any) => e.resource?.valueQuantity?.value)).toContainExactly([85, 90]);
       }));
 
     test('Approximately', async () =>
@@ -5063,10 +5652,7 @@ describe('project-scoped Repository', () => {
         const result = await repo.search(
           parseSearchRequest<Observation>('Observation?code=29463-7&value-quantity=ap80|http://unitsofmeasure.org|kg')
         );
-        expect(result.entry).toHaveLength(3);
-        expect(result.entry?.find((e) => e.resource?.valueQuantity?.value === 75)).toBeDefined();
-        expect(result.entry?.find((e) => e.resource?.valueQuantity?.value === 80)).toBeDefined();
-        expect(result.entry?.find((e) => e.resource?.valueQuantity?.value === 85)).toBeDefined();
+        expect(result.entry?.map((e: any) => e.resource?.valueQuantity?.value)).toContainExactly([75, 80, 85]);
       }));
   });
 
@@ -5081,25 +5667,34 @@ describe('project-scoped Repository', () => {
       ).rejects.toThrow('ResearchStudy cannot be chained via canonical reference (EvidenceVariable:derived-from)');
     }));
 
-  test('Date array columns', async () =>
-    withTestContext(async () => {
-      const result = await repo.search({
-        resourceType: 'MedicationRequest',
-        filters: [
-          {
-            code: 'date',
-            operator: Operator.EQUALS,
-            value: new Date().toISOString(),
-          },
-        ],
-      });
-      expect(result.entry).toHaveLength(0);
-    }));
+  test.each(['2028-06-01T23:45:56.890-11:00', '2028-06', 'lt2028-06-06'])(
+    'Date array columns match search value %s',
+    async (value) =>
+      withTestContext(async () => {
+        if (!features) {
+          return; // Skip test without feature flag
+        }
+        const identifier = randomUUID();
+        const resource = await repo.createResource<Goal>({
+          resourceType: 'Goal',
+          identifier: [{ value: identifier }],
+          lifecycleStatus: 'active',
+          description: { text: 'Test' },
+          subject: { reference: 'Patient/example' },
+          target: [{ dueDate: '2028-06-01' }],
+        });
+
+        const searchReq = parseSearchRequest(`Goal?identifier=${identifier}&target-date=${value}`);
+        const res = await repo.search(searchReq);
+        expect(res.entry).toHaveLength(1);
+        expect(res.entry?.[0].resource?.id).toStrictEqual(resource.id);
+      })
+  );
 
   describe('discourage sequential scans', () => {
-    let querySpy: jest.SpyInstance;
+    let querySpy: MockInstance;
     beforeEach(() => {
-      querySpy = jest.spyOn(repo.getDatabaseClient(DatabaseMode.READER), 'query');
+      querySpy = vi.spyOn(repo.getDatabaseClient(repoAccess.sqlReadConfig('Patient')), 'query');
     });
 
     afterEach(() => {
@@ -5121,8 +5716,6 @@ describe('project-scoped Repository', () => {
       expect(querySpy).toHaveBeenNthCalledWith(1, expect.stringContaining('SET enable_seqscan = off'));
       expect(querySpy).toHaveBeenNthCalledWith(2, expect.stringContaining('SELECT'), expect.anything());
       expect(querySpy).toHaveBeenNthCalledWith(3, expect.stringContaining('RESET enable_seqscan'));
-
-      querySpy.mockRestore();
     });
 
     test('config.fhirSearchMinLimit', async () => {
@@ -5137,16 +5730,16 @@ describe('project-scoped Repository', () => {
       await repo.search(parseSearchRequest('Patient?identifier=123&_count=1'));
       expect(querySpy).toHaveBeenCalledTimes(1);
       expect(querySpy).toHaveBeenNthCalledWith(1, expect.stringMatching(/LIMIT 39$/), expect.anything());
-      querySpy.mockClear();
     });
   });
 });
 
-describe('systemRepo', () => {
-  const systemRepo = getGlobalSystemRepo();
+describe.each([true, false])('systemRepo', (rangeSearch) => {
+  const systemRepo = getTestProjectSystemRepo();
 
   beforeAll(async () => {
     const config = await loadTestConfig();
+    config.rangeSearch = rangeSearch;
     await initAppServices(config);
   });
 
@@ -5163,17 +5756,13 @@ describe('systemRepo', () => {
       const patient1 = await systemRepo.createResource<Patient>({
         resourceType: 'Patient',
         identifier: [{ system: 'id', value: idValue }],
-        meta: {
-          project: project1,
-        },
+        meta: { project: project1 },
       });
 
       const patient2 = await systemRepo.createResource<Patient>({
         resourceType: 'Patient',
         identifier: [{ system: 'id', value: idValue }],
-        meta: {
-          project: project2,
-        },
+        meta: { project: project2 },
       });
 
       const patient3 = await systemRepo.createResource<Patient>({
@@ -5423,7 +6012,7 @@ describe('systemRepo', () => {
     withTestContext(async () => {
       const type = randomUUID();
       const searchRequest = parseSearchRequest(`PractitionerRole?_total=accurate&organization.type=${type}`);
-      await expect(systemRepo.search(searchRequest)).resolves.toMatchObject<Partial<Bundle>>({
+      await expect(systemRepo.search(searchRequest)).resolves.toMatchObject({
         type: 'searchset',
         total: 0,
       });
@@ -5447,7 +6036,7 @@ describe('systemRepo', () => {
         new SelectQuery('Patient').column('__version').where('id', '=', id);
 
       // patient1 at OLDER_VERSION, patient2 at Repository.VERSION
-      const client = systemRepo.getDatabaseClient(DatabaseMode.WRITER);
+      const client = systemRepo.getDatabaseClient(repoAccess.sqlWrite('Patient'));
       const OLDER_VERSION = Repository.VERSION - 1;
       await client.query('UPDATE "Patient" SET __version = $1 WHERE id = $2', [OLDER_VERSION, patient1.id]);
       expect((await getVersionQuery(patient1.id).execute(client))[0].__version).toStrictEqual(OLDER_VERSION);
@@ -5553,6 +6142,16 @@ describe('systemRepo', () => {
       // special search params
       ['Patient?_id:in=123', 'Invalid modifier'],
       ['Patient?_id:not-in=123', 'Invalid modifier'],
+      ['Patient?_id:text=123', 'Invalid modifier'],
+      ['Patient?_id:above=123', 'Invalid modifier'],
+      ['Patient?_id:below=123', 'Invalid modifier'],
+      ['Patient?_id:of-type=123', 'Invalid modifier'],
+      ['Patient?_id:contains=123', 'Invalid modifier'],
+      ['Patient?_id:identifier=123', 'Invalid modifier'],
+      ['Patient?_id:iterate=123', 'Invalid modifier'],
+      ['Patient?_id:missing=maybe', "must have a value of 'true' or 'false'"],
+      ['Patient?_project:missing=maybe', "must have a value of 'true' or 'false'"],
+      ['Patient?_compartment:missing=maybe', "must have a value of 'true' or 'false'"],
       ['Patient?_lastUpdated:in=2025-10-15', 'Invalid modifier'],
       ['Patient?_lastUpdated:not-in=2025-10-15', 'Invalid modifier'],
       ['Patient?_deleted:in=true', 'Invalid modifier'],
@@ -5573,7 +6172,7 @@ describe('systemRepo', () => {
       // lookup table
       ['Patient?name:in=123', 'Invalid modifier'],
       ['Patient?name:not-in=123', 'Invalid modifier'],
-    ])(':in and :not-in for %s', (searchString, expectedError) =>
+    ])('Reject invalid operator or modifier for %s', (searchString, expectedError) =>
       withTestContext(async () => {
         await expect(async () => {
           const searchRequest = parseSearchRequest(searchString);

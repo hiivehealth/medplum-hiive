@@ -6,7 +6,6 @@ import { Operator, globalSchema } from '@medplum/core';
 import type { ResourceType, SearchParameter } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
-import { MemoryRouter } from 'react-router';
 import { getFieldDefinitions } from '../SearchControl/SearchControlField';
 import { act, fireEvent, render, screen, userEvent } from '../test-utils/render';
 import type { SearchPopupMenuProps } from './SearchPopupMenu';
@@ -20,23 +19,21 @@ describe('SearchPopupMenu', () => {
       visible: true,
       x: 0,
       y: 0,
-      onPrompt: jest.fn(),
-      onChange: jest.fn(),
-      onClose: jest.fn(),
+      onPrompt: vi.fn(),
+      onChange: vi.fn(),
+      onClose: vi.fn(),
       ...partialProps,
     } as SearchPopupMenuProps;
 
     render(
-      <MemoryRouter>
-        <MedplumProvider medplum={medplum}>
-          <Menu closeOnItemClick={false}>
-            <Menu.Target>
-              <Button>Toggle menu</Button>
-            </Menu.Target>
-            <SearchPopupMenu {...props} />
-          </Menu>
-        </MedplumProvider>
-      </MemoryRouter>
+      <MedplumProvider medplum={medplum}>
+        <Menu closeOnItemClick={false}>
+          <Menu.Target>
+            <Button>Toggle menu</Button>
+          </Menu.Target>
+          <SearchPopupMenu {...props} />
+        </Menu>
+      </MedplumProvider>
     );
 
     await toggleMenu();
@@ -88,7 +85,7 @@ describe('SearchPopupMenu', () => {
 
   test('Date submenu prompt', async () => {
     const searchParam = globalSchema.types['Patient'].searchParams?.['birthdate'] as SearchParameter;
-    const onPrompt = jest.fn();
+    const onPrompt = vi.fn();
 
     await setup({
       search: {
@@ -252,7 +249,7 @@ describe('SearchPopupMenu', () => {
 
   test('Quantity submenu prompt', async () => {
     const searchParam = globalSchema.types['Observation'].searchParams?.['value-quantity'] as SearchParameter;
-    const onPrompt = jest.fn();
+    const onPrompt = vi.fn();
 
     await setup({
       search: {
@@ -353,7 +350,7 @@ describe('SearchPopupMenu', () => {
         {
           code: 'organization',
           operator: Operator.EQUALS,
-          value: 'Organization/123',
+          value: 'Organization/125',
         },
       ],
     };
@@ -374,7 +371,7 @@ describe('SearchPopupMenu', () => {
 
   test('Reference submenu prompt', async () => {
     const searchParam = globalSchema.types['Patient'].searchParams?.['organization'] as SearchParameter;
-    const onPrompt = jest.fn();
+    const onPrompt = vi.fn();
 
     await setup({
       search: {
@@ -496,7 +493,7 @@ describe('SearchPopupMenu', () => {
 
   test('Text submenu prompt', async () => {
     const searchParam = globalSchema.types['Patient'].searchParams?.['name'] as SearchParameter;
-    const onPrompt = jest.fn();
+    const onPrompt = vi.fn();
 
     await setup({
       search: {
@@ -562,7 +559,7 @@ describe('SearchPopupMenu', () => {
 
   test('Token submenu prompt', async () => {
     const searchParam = globalSchema.types['MedicationRequest'].searchParams?.['code'] as SearchParameter;
-    const onPrompt = jest.fn();
+    const onPrompt = vi.fn();
 
     await setup({
       search: {
@@ -596,7 +593,7 @@ describe('SearchPopupMenu', () => {
 
   test('URI submenu prompt', async () => {
     const searchParam = globalSchema.types['Device'].searchParams?.['url'] as SearchParameter;
-    const onPrompt = jest.fn();
+    const onPrompt = vi.fn();
 
     await setup({
       search: {

@@ -63,6 +63,7 @@ export class BackEnd extends Construct {
   redisSecretsParameter: ssm.StringParameter;
   botLambdaRoleParameter: ssm.StringParameter;
   workersParameter?: ssm.StringParameter;
+  blockedEmailDomainsParameter?: ssm.StringParameter;
   rdsClusterParameterGroup?: rds.ParameterGroup;
   rdsWriterParameterGroup?: rds.ParameterGroup;
   rdsReaderParameterGroup?: rds.ParameterGroup;
@@ -360,7 +361,13 @@ export class BackEnd extends Construct {
         // https://docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3.html
         new iam.PolicyStatement({
           effect: iam.Effect.ALLOW,
-          actions: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+          actions: [
+            's3:GetObject',
+            's3:PutObject',
+            's3:DeleteObject',
+            // Binary $scan reads GuardDuty scan result tags and marks pending scans
+            ...(config.guardDutyMalwareProtectionEnabled ? ['s3:GetObjectTagging', 's3:PutObjectTagging'] : []),
+          ],
           resources: [`arn:aws:s3:::${config.storageBucketName}/*`],
         }),
 
@@ -383,8 +390,18 @@ export class BackEnd extends Construct {
             'lambda:UpdateFunctionCode',
             'lambda:UpdateFunctionConfiguration',
             'lambda:InvokeFunction',
+            'lambda:ListVersionsByFunction',
+            'lambda:DeleteFunction',
           ],
           resources: [`arn:aws:lambda:${region}:${accountNumber}:function:medplum-bot-lambda-*`],
+        }),
+
+        // Lambda: List functions
+        // https://docs.aws.amazon.com/lambda/latest/dg/permissions-user-function.html
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ['lambda:ListFunctions'],
+          resources: ['*'],
         }),
 
         // Lambda layers: List layer versions
@@ -436,6 +453,18 @@ export class BackEnd extends Construct {
         }),
       ],
     });
+
+    if (config.guardDutyMalwareProtectionEnabled) {
+      // Binary $scan: request on-demand scans
+      // https://docs.aws.amazon.com/guardduty/latest/ug/malware-protection-s3-on-demand.html
+      this.taskRolePolicies.addStatements(
+        new iam.PolicyStatement({
+          effect: iam.Effect.ALLOW,
+          actions: ['guardduty:SendObjectMalwareScan'],
+          resources: ['*'],
+        })
+      );
+    }
 
     // Task Role
     this.taskRole = new iam.Role(this, 'TaskExecutionRole', {
@@ -547,7 +576,7 @@ export class BackEnd extends Construct {
       config.apiPort,
       config.apiInternetFacing !== false,
       config.apiSslCertArn,
-      config.loadBalancerLoggingBucket,
+      config.loadBalancerLoggingPrefix,
       config.apiWafIpSetArn,
       config.wafLogGroupName,
       config.wafLogGroupCreate,
@@ -563,7 +592,7 @@ export class BackEnd extends Construct {
         config.apiPort,
         config.mtlsInternetFacing !== false,
         config.mtlsSslCertArn,
-        config.loadBalancerLoggingBucket,
+        config.loadBalancerLoggingPrefix,
         config.mtlsWafIpSetArn,
         config.wafLogGroupName,
         config.wafLogGroupCreate,
@@ -673,6 +702,15 @@ export class BackEnd extends Construct {
       stringValue: this.botLambdaRole.roleArn,
     });
 
+    if (config.blockedEmailDomains) {
+      this.blockedEmailDomainsParameter = new ssm.StringParameter(this, 'BlockedEmailDomains', {
+        tier: ssm.ParameterTier.STANDARD,
+        parameterName: `/medplum/${name}/blockedEmailDomains`,
+        description: 'Blocked email domains',
+        stringValue: config.blockedEmailDomains,
+      });
+    }
+
     // Workers configuration
     if (config.workers) {
       this.workersParameter = new ssm.StringParameter(this, 'WorkersParameter', {
@@ -702,7 +740,7 @@ export class BackEnd extends Construct {
   ): ecs.ContainerImage {
     // Pull out the image name and tag from the image URI if it's an ECR image
     const ecrImageUriRegex = new RegExp(
-      `^${config.accountNumber}\\.dkr\\.ecr\\.${config.region}\\.amazonaws\\.com/(.*)[:@](.*)$`
+      `^${config.accountNumber}\\.dkr\\.ecr\\.${config.region}\\.amazonaws\\.com/([^:@]+)[:@](.+)$`
     );
     const nameTagMatches = ecrImageUriRegex.exec(imageName);
     const serverImageName = nameTagMatches?.[1];
@@ -916,7 +954,7 @@ export class BackEnd extends Construct {
     const cluster = new elasticache.CfnReplicationGroup(this, `${id}Cluster`, {
       engine: options.engine ?? 'Redis',
       engineVersion: options.engineVersion ?? '6.x',
-      cacheNodeType: options.nodeType ?? 'cache.t2.medium',
+      cacheNodeType: options.nodeType ?? 'cache.t4g.medium',
       replicationGroupDescription: `${id}ReplicationGroup`,
       authToken: password.secretValueFromJson('password').toString(),
       transitEncryptionEnabled: true,

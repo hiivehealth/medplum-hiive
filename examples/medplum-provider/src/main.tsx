@@ -7,6 +7,7 @@ import '@mantine/notifications/styles.css';
 import '@mantine/spotlight/styles.css';
 import { MedplumClient } from '@medplum/core';
 import { MedplumProvider } from '@medplum/react';
+import '@medplum/react-scheduling/styles.css';
 import '@medplum/react/styles.css';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
@@ -15,12 +16,13 @@ import { App } from './App';
 
 const medplum = new MedplumClient({
   onUnauthenticated: () => (window.location.href = '/'),
-  baseUrl: sessionStorage.getItem('medplum_base_url') || import.meta.env.VITE_MEDPLUM_BASE_URL || undefined,
+  baseUrl: sessionStorage.getItem('medplum_base_url') || import.meta.env.MEDPLUM_BASE_URL || undefined,
   cacheTime: 60000,
   autoBatchTime: 100,
 });
 
 const theme = createTheme({
+  activeClassName: '',
   headings: {
     sizes: {
       h1: {

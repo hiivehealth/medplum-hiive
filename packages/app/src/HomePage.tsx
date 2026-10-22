@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { Paper } from '@mantine/core';
+import { Divider, Paper, Title } from '@mantine/core';
 import { showNotification } from '@mantine/notifications';
 import type { SearchRequest } from '@medplum/core';
 import { formatSearchQuery, normalizeErrorString, parseSearchRequest } from '@medplum/core';
@@ -33,7 +33,9 @@ export function HomePage(): JSX.Element {
       setSearch(populatedSearch);
     } else {
       // Otherwise, navigate to the desired URL
-      navigate(`/${populatedSearch.resourceType}${formatSearchQuery(populatedSearch)}`)?.catch(console.error);
+      navigate(`/${populatedSearch.resourceType}${formatSearchQuery(populatedSearch)}`, { replace: true })?.catch(
+        console.error
+      );
     }
   }, [medplum, navigate, location]);
 
@@ -42,7 +44,11 @@ export function HomePage(): JSX.Element {
   }
 
   return (
-    <Paper shadow="xs" m="md" p="xs" className={classes.paper}>
+    <Paper shadow="xs" m="md" p="md" className={classes.paper}>
+      <Title order={4} mb="md">
+        {search.resourceType}
+      </Title>
+      <Divider mb="md" />
       <SearchControl
         checkboxesEnabled={true}
         search={search}
@@ -71,22 +77,23 @@ export function HomePage(): JSX.Element {
             .catch((err) => showNotification({ color: 'red', message: normalizeErrorString(err), autoClose: false }));
         }}
         onDelete={(ids: string[]) => {
-          if (window.confirm('Are you sure you want to delete these resources?')) {
-            medplum.invalidateSearches(search.resourceType);
-            medplum
-              .executeBatch({
-                resourceType: 'Bundle',
-                type: 'batch',
-                entry: ids.map((id) => ({
-                  request: {
-                    method: 'DELETE',
-                    url: `${search.resourceType}/${id}`,
-                  },
-                })),
-              })
-              .then(() => setSearch({ ...search }))
-              .catch((err) => showNotification({ color: 'red', message: normalizeErrorString(err), autoClose: false }));
-          }
+          medplum.invalidateSearches(search.resourceType);
+          return medplum
+            .executeBatch({
+              resourceType: 'Bundle',
+              type: 'batch',
+              entry: ids.map((id) => ({
+                request: {
+                  method: 'DELETE',
+                  url: `${search.resourceType}/${id}`,
+                },
+              })),
+            })
+            .then(() => undefined)
+            .catch((err) => {
+              showNotification({ color: 'red', message: normalizeErrorString(err), autoClose: false });
+              throw err;
+            });
         }}
         onBulk={(ids: string[]) => {
           navigate(`/bulk/${search.resourceType}?ids=${ids.join(',')}`)?.catch(console.error);

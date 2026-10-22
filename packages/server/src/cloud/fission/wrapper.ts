@@ -13,7 +13,6 @@ export const FISSION_PACKAGE_JSON = `{
 
 export const FISSION_INDEX_CODE = `
 const { ContentType, Hl7Message, MedplumClient, normalizeOperationOutcome } = require('@medplum/core');
-const fetch = require('node-fetch');
 const PdfPrinter = require('pdfmake');
 const userCode = require('./user.js');
 
@@ -30,13 +29,15 @@ module.exports = async function (context) {
   logOutput.length = 0;
   try {
     const event = context.request.body;
-    const { bot, baseUrl, accessToken, requester, contentType, secrets, traceId, headers } = event;
+    const { bot, baseUrl, accessToken, requester, contentType, secrets, traceId, traceparent, headers } = event;
     const medplum = new MedplumClient({
       baseUrl,
       fetch: function (url, options = {}) {
         options.headers ||= {};
         options.headers['x-trace-id'] = traceId;
-        options.headers['traceparent'] = traceId;
+        if (traceparent) {
+          options.headers['traceparent'] = traceparent;
+        }
         return fetch(url, options);
       },
       createPdf,
@@ -61,6 +62,7 @@ module.exports = async function (context) {
     return {
       status: 200,
       body: JSON.stringify({
+        success: true,
         returnValue,
         logResult: logOutput.join('\\n'),
       }),
@@ -76,6 +78,7 @@ module.exports = async function (context) {
     return {
       status: 400,
       body: JSON.stringify({
+        success: false,
         returnValue: normalizeOperationOutcome(err),
         logResult: logOutput.join('\\n'),
       }),

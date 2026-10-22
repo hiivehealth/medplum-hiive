@@ -6,10 +6,11 @@ import { execSync } from 'child_process';
 import { copyFileSync, existsSync } from 'fs';
 import path from 'path';
 import { defineConfig } from 'vite';
+import { medplumAliases } from '../../aliases.mjs';
 import packageJson from './package.json' with { type: 'json' };
 
-if (!existsSync(path.join(__dirname, '.env'))) {
-  copyFileSync(path.join(__dirname, '.env.defaults'), path.join(__dirname, '.env'));
+if (!existsSync(path.join(import.meta.dirname, '.env'))) {
+  copyFileSync(path.join(import.meta.dirname, '.env.defaults'), path.join(import.meta.dirname, '.env'));
 }
 
 let gitHash;
@@ -26,19 +27,23 @@ export default defineConfig({
   plugins: [react()],
   server: {
     port: 3000,
+    allowedHosts: true,
   },
   preview: {
     port: 3000,
+    allowedHosts: true,
   },
   publicDir: 'static',
   build: {
     sourcemap: true,
+    cssTarget: ['chrome123', 'edge123', 'firefox120', 'safari17.5', 'ios17.5'], // Native `light-dark()` support
   },
   resolve: {
     alias: {
-      '@medplum/core': path.resolve(__dirname, '../core/src'),
-      '@medplum/react': path.resolve(__dirname, '../react/src'),
-      '@medplum/react-hooks': path.resolve(__dirname, '../react-hooks/src'),
+      ...medplumAliases,
+      '@medplum/core': path.resolve(import.meta.dirname, '../core/src'),
+      '@medplum/react': path.resolve(import.meta.dirname, '../react/src'),
+      '@medplum/react-hooks': path.resolve(import.meta.dirname, '../react-hooks/src'),
     },
   },
 });

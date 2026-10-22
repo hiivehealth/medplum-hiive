@@ -2,9 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 import { SubscriptionEmitter, generateId } from '@medplum/core';
 import type { Bundle } from '@medplum/fhirtypes';
-import { MockClient } from '@medplum/mock';
+import { MockClient, TestProject } from '@medplum/mock';
 import { act, render, screen } from '@testing-library/react';
-import 'jest-websocket-mock';
 import type { JSX, ReactNode } from 'react';
 import { StrictMode, useCallback, useState } from 'react';
 import { MemoryRouter } from 'react-router';
@@ -43,31 +42,65 @@ function RenderToggleComponent({ render }: { render: boolean }): JSX.Element {
   return <>{render ? <TestComponent criteria="Communication" /> : null}</>;
 }
 
+/**
+ * Advance past `useSubscription`'s debounced unsubscribe timer in a single step.
+ *
+ * `useSubscription` waits 3 seconds before calling `unsubscribeFromCriteria` on unmount so
+ * that brief remounts (e.g. StrictMode or toggling conditional render) can reuse the same
+ * subscription. Tests that assert on cleanup must advance time past that debounce.
+ *
+ * How to use:
+ * - Pass a duration >= 3000 ms (the hook's debounce interval).
+ * - Optionally pass an action (unmount, rerender, etc.) to run before advancing time.
+ *
+ * ```ts
+ * await advanceDebounce(5000, unmount);
+ * expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(0);
+ * ```
+ *
+ * Why fake timers are scoped here instead of enabled for the whole file:
+ * - Most tests in this file rely on real timers (`screen.findByTestId`, WebSocket mocks, etc.).
+ * - Enabling fake timers globally causes those async helpers to hang.
+ *
+ * When this helper is not enough:
+ * - If a test performs several mount/unmount cycles against the same debounce window, toggling
+ *   fake timers on and off between steps can leave orphaned timer state and make the final
+ *   cleanup assertion fail.
+ * - For that case, call `vi.useFakeTimers({ shouldAdvanceTime: true })` once, keep it enabled
+ *   for the whole sequence, split each step into two `act` blocks (action, then advance), and
+ *   restore real timers in a `finally` block. See "Mount and remount before debounce timeout".
+ *
+ * @param ms - Milliseconds to advance fake time. Use >= 3000 to exceed the hook debounce.
+ * @param action - Optional callback (e.g. unmount or rerender) run before time is advanced.
+ */
+async function advanceDebounce(ms: number, action?: () => void): Promise<void> {
+  await act(async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    action?.();
+    await vi.advanceTimersByTimeAsync(ms);
+    vi.useRealTimers();
+  });
+}
+
 describe('useSubscription()', () => {
   let medplum: MockClient;
-
-  beforeAll(() => {
-    jest.useFakeTimers();
-  });
 
   beforeEach(() => {
     medplum = new MockClient();
   });
 
-  afterAll(() => {
-    jest.useRealTimers();
-  });
-
   function setup(
     children: ReactNode,
-    strict = false
+    options?: { strict?: boolean; client?: MockClient }
   ): {
     unmount: ReturnType<typeof render>['unmount'];
     rerender: (element: JSX.Element) => void;
   } {
+    const strict = options?.strict ?? false;
+    const client = options?.client ?? medplum;
     const defaultWrapper = (children: ReactNode): JSX.Element => (
       <MemoryRouter>
-        <MedplumProvider medplum={medplum}>{children}</MedplumProvider>
+        <MedplumProvider medplum={client}>{children}</MedplumProvider>
       </MemoryRouter>
     );
 
@@ -98,9 +131,25 @@ describe('useSubscription()', () => {
     expect(bundle.type).toBe('history');
 
     // Make sure subscription is cleaned up
-    unmount();
-    jest.advanceTimersByTime(5000);
+    await advanceDebounce(5000, unmount);
     expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(0);
+  });
+
+  test('Does not update React state after unmount', () => {
+    vi.useFakeTimers();
+    try {
+      const { unmount } = setup(<TestComponent criteria="Communication" />);
+      unmount();
+
+      // Reproduce the test environment teardown that exposed the delayed state update in #9654.
+      vi.stubGlobal('window', undefined);
+
+      expect(() => vi.advanceTimersByTime(3000)).not.toThrow();
+      expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(0);
+    } finally {
+      vi.unstubAllGlobals();
+      vi.useRealTimers();
+    }
   });
 
   test('Mount and remount before debounce timeout', async () => {
@@ -108,22 +157,39 @@ describe('useSubscription()', () => {
     const { rerender } = setup(<RenderToggleComponent render={true} />);
     expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
 
-    const emitter = medplum.getSubscriptionManager().getEmitter('Communication') as SubscriptionEmitter;
+    const emitter = medplum.getSubscriptionManager().getEmitter('Communication') as unknown as SubscriptionEmitter;
     expect(emitter).toBeInstanceOf(SubscriptionEmitter);
     expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
 
-    rerender(<RenderToggleComponent render={false} />);
-    jest.advanceTimersByTime(1000);
-    expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      await act(async () => {
+        rerender(<RenderToggleComponent render={false} />);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1000);
+      });
+      expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
 
-    rerender(<RenderToggleComponent render={true} />);
-    jest.advanceTimersByTime(5000);
-    expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
-    expect(medplum.getSubscriptionManager().getEmitter('Communication')).toBe(emitter);
+      await act(async () => {
+        rerender(<RenderToggleComponent render={true} />);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(5000);
+      });
+      expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
+      expect(medplum.getSubscriptionManager().getEmitter('Communication')).toBe(emitter);
 
-    // Make sure we fully unmount later when actually unmounting
-    rerender(<RenderToggleComponent render={false} />);
-    jest.advanceTimersByTime(5000);
+      // Make sure we fully unmount later when actually unmounting
+      await act(async () => {
+        rerender(<RenderToggleComponent render={false} />);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(3000);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
     expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(0);
   });
 
@@ -132,8 +198,8 @@ describe('useSubscription()', () => {
     const emitter = medplum.getSubscriptionManager().addCriteria('Communication');
     expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
 
-    setup(<TestComponent criteria="Communication" />, true);
-    jest.advanceTimersByTime(5000);
+    setup(<TestComponent criteria="Communication" />, { strict: true });
+    await advanceDebounce(5000);
     expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
     expect(medplum.getSubscriptionManager().getEmitter('Communication')).toBe(emitter);
   });
@@ -482,6 +548,41 @@ describe('useSubscription()', () => {
     expect(lastFromCb4?.id).toEqual(id4);
   });
 
+  test('Is a no-op when unauthenticated', async () => {
+    const profile = medplum.getProfile();
+    const getProfileSpy = vi.spyOn(medplum, 'getProfile').mockReturnValue(undefined);
+    const subscribeSpy = vi.spyOn(medplum, 'subscribeToCriteria');
+
+    setup(<TestComponent criteria="Communication" />);
+
+    // No subscription should be created while unauthenticated
+    expect(subscribeSpy).not.toHaveBeenCalled();
+    expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(0);
+
+    // Once authenticated, the hook should subscribe
+    getProfileSpy.mockReturnValue(profile);
+    act(() => {
+      medplum.dispatchEvent({ type: 'change' });
+    });
+
+    expect(subscribeSpy).toHaveBeenCalledWith('Communication', undefined);
+    expect(medplum.getSubscriptionManager().getCriteriaCount()).toEqual(1);
+
+    getProfileSpy.mockRestore();
+    subscribeSpy.mockRestore();
+  });
+
+  test('Is a no-op when the active project is missing the `websocket-subscriptions` feature', async () => {
+    const client = new MockClient({ project: { ...TestProject, features: [] } });
+    const subscribeSpy = vi.spyOn(client, 'subscribeToCriteria');
+
+    setup(<TestComponent criteria="Communication" />, { client });
+
+    // No subscription should be created while the feature is disabled
+    expect(subscribeSpy).not.toHaveBeenCalled();
+    expect(client.getSubscriptionManager().getCriteriaCount()).toEqual(0);
+  });
+
   test('WebSocket disconnects and reconnects', async () => {
     let lastFromCb: Bundle | undefined;
     const id = generateId();
@@ -612,7 +713,7 @@ describe('useSubscription()', () => {
   });
 
   test('Changing callback should not recreate Subscription', async () => {
-    const subscribeSpy = jest.spyOn(medplum, 'subscribeToCriteria');
+    const subscribeSpy = vi.spyOn(medplum, 'subscribeToCriteria');
     let callsToOpen = 0;
 
     function TestWrapper(): JSX.Element {

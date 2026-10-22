@@ -5,7 +5,7 @@ import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { initTestAuth } from '../../test.setup';
+import { getSuperAdminAccessToken } from '../../test.setup';
 
 describe('dbcolumnstatisticsupdate', () => {
   const app = express();
@@ -15,7 +15,7 @@ describe('dbcolumnstatisticsupdate', () => {
   beforeAll(async () => {
     const config = await loadTestConfig();
     await initApp(app, config);
-    accessToken = await initTestAuth({ project: { superAdmin: true } });
+    accessToken = await getSuperAdminAccessToken();
   });
 
   afterAll(async () => {
@@ -35,7 +35,7 @@ describe('dbcolumnstatisticsupdate', () => {
         resetToDefault: false,
         newStatisticsTarget: 100,
       });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body).toMatchObject(allOk);
 
     const res2 = await request(app)
@@ -48,7 +48,7 @@ describe('dbcolumnstatisticsupdate', () => {
         resetToDefault: true,
         newStatisticsTarget: undefined,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res1.body).toMatchObject(allOk);
   });
 
@@ -59,7 +59,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({});
-      expect(res1.status).toBe(400);
+      expect(res1).toHaveStatus(400);
       expect(res1.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [
@@ -78,7 +78,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ tableName: 'AccessPolicy', columnNames: [] });
-      expect(res2.status).toBe(400);
+      expect(res2).toHaveStatus(400);
       expect(res2.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [
@@ -97,7 +97,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ tableName: 'AccessPolicy', columnNames: ['id'] });
-      expect(res3.status).toBe(400);
+      expect(res3).toHaveStatus(400);
       expect(res3.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [
@@ -116,7 +116,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ tableName: 'Robert"; DROP TABLE Students;', columnNames: ['id'], resetToDefault: true });
-      expect(res1.status).toBe(400);
+      expect(res1).toHaveStatus(400);
       expect(res1.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [
@@ -135,7 +135,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ tableName: 'AccessPolicy', columnNames: ['id', 'invalid-column-name'], resetToDefault: true });
-      expect(res.status).toBe(400);
+      expect(res).toHaveStatus(400);
       expect(res.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [
@@ -154,7 +154,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ tableName: 'AccessPolicy', columnNames: ['id'], resetToDefault: true, newStatisticsTarget: 100 });
-      expect(res.status).toBe(400);
+      expect(res).toHaveStatus(400);
       expect(res.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [
@@ -173,7 +173,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ tableName: 'AccessPolicy', columnNames: ['id'], resetToDefault: false });
-      expect(res.status).toBe(400);
+      expect(res).toHaveStatus(400);
       expect(res.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [
@@ -192,7 +192,7 @@ describe('dbcolumnstatisticsupdate', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('Content-Type', ContentType.FHIR_JSON)
         .send({ tableName: 'AccessPolicy', columnNames: ['id'], resetToDefault: false, newStatisticsTarget: -1 });
-      expect(res.status).toBe(400);
+      expect(res).toHaveStatus(400);
       expect(res.body).toMatchObject({
         resourceType: 'OperationOutcome',
         issue: [

@@ -1,29 +1,64 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { Button, Group, Stack, Text } from '@mantine/core';
-import { showNotification } from '@mantine/notifications';
-import { createReference, formatHumanName, formatPeriod, isReference } from '@medplum/core';
-import type { Appointment, Coding, Patient, PlanDefinition, Practitioner } from '@medplum/fhirtypes';
-import { CodingInput, Form, MedplumLink, ResourceAvatar, ResourceInput, useMedplum } from '@medplum/react';
-import { useResource } from '@medplum/react-hooks';
-import { IconAlertSquareRounded } from '@tabler/icons-react';
+import { Button, Divider, Group, Loader, Stack, Text, Tooltip } from '@mantine/core';
+import type { WithId } from '@medplum/core';
+import {
+  createReference,
+  EMPTY,
+  formatDateTime,
+  getExtension,
+  getReferenceString,
+  isDefined,
+  isOk,
+  isReference,
+  isResource,
+  parseReference,
+  resolveId,
+  ServiceTypeReferenceURI,
+} from '@medplum/core';
+import type { Appointment, Bundle, CodeableConcept, Patient, Slot } from '@medplum/fhirtypes';
+import {
+  CodeableConceptDisplay,
+  Form,
+  MedplumLink,
+  OperationOutcomeAlert,
+  ResourceAvatar,
+  ResourceInput,
+  ResourceName,
+  useMedplum,
+} from '@medplum/react';
+import { useSearchOne } from '@medplum/react-hooks';
+import { IconFileCheck, IconNotes, IconTrash } from '@tabler/icons-react';
 import type { JSX } from 'react';
 import { useCallback, useState } from 'react';
-import { useNavigate } from 'react-router';
-import { createEncounter } from '../../utils/encounter';
+import { Link } from 'react-router';
+import { encounterUrl } from '../../utils/encounter';
 import { showErrorNotification } from '../../utils/notifications';
-import { PlanDefinitionSummary } from '../plandefinition/PlanDefinitionSummary';
+import classes from './AppointmentDetails.module.css';
+import { CreateEncounterForm } from './CreateEncounterForm';
+
+// Medplum `serviceType` values may include an extension linking to a
+// HealthcareService; if present, use that as our display name first.
+// Fall back to normal CodeableConcept display otherwise.
+function ServiceTypeDisplay(props: { value: CodeableConcept }): JSX.Element {
+  const { value } = props;
+
+  const ext = getExtension(value, ServiceTypeReferenceURI);
+  if (ext?.valueReference?.display) {
+    return <>{ext.valueReference.display}</>;
+  }
+  return <CodeableConceptDisplay value={value} />;
+}
 
 type UpdateAppointmentFormProps = {
-  appointment: Appointment;
-  onUpdate: (appointment: Appointment) => void;
+  appointment: WithId<Appointment>;
 };
 
 function UpdateAppointmentForm(props: UpdateAppointmentFormProps): JSX.Element {
   const medplum = useMedplum();
   const [patient, setPatient] = useState<Patient | undefined>(undefined);
 
-  const { appointment, onUpdate } = props;
+  const { appointment } = props;
   const handleSubmit = useCallback(async () => {
     if (!patient) {
       return;
@@ -39,15 +74,12 @@ function UpdateAppointmentForm(props: UpdateAppointmentFormProps): JSX.Element {
       ],
     } satisfies Appointment;
 
-    let result: Appointment;
     try {
-      result = await medplum.updateResource(updated);
+      await medplum.updateResource(updated);
     } catch (error) {
       showErrorNotification(error);
-      return;
     }
-    onUpdate?.(result);
-  }, [medplum, patient, appointment, onUpdate]);
+  }, [medplum, patient, appointment]);
 
   return (
     <Form onSubmit={handleSubmit}>
@@ -68,132 +100,199 @@ function UpdateAppointmentForm(props: UpdateAppointmentFormProps): JSX.Element {
   );
 }
 
-// This component is used when an appointment does not have a related Encounter
-// that we can direct the viewer to. It allows us to show some details for
-// appointments that are not fully configured and offer UI to complete set up.
-//
-// As one example, this can be used after a patient has scheduled an appointment
-// via $find/$hold to set up an Encounter and apply a plan definition to it.
-export function AppointmentDetails(props: {
-  appointment: Appointment;
-  onUpdate: (appointment: Appointment) => void;
-}): JSX.Element {
+export function AppointmentDetails(props: { appointment: WithId<Appointment> }): JSX.Element {
+  const { appointment } = props;
   const medplum = useMedplum();
-  const [planDefinition, setPlanDefinition] = useState<PlanDefinition | undefined>();
-  const [encounterClass, setEncounterClass] = useState<Coding | undefined>();
 
-  // Extract references to a Patient and a Practitioner from `Appointment.participants`; we expect
-  // one of each.
-  const participants = props.appointment.participant.map((p) => p.actor);
-  const patientRef = participants.find((r) => isReference<Patient>(r, 'Patient'));
-  const practitionerRef = participants.find((r) => isReference<Practitioner>(r, 'Practitioner'));
-
-  const patient = useResource(patientRef);
-  const navigate = useNavigate();
-
-  const handleSubmit = useCallback(async () => {
-    if (!patient) {
-      showNotification({
-        color: 'yellow',
-        icon: <IconAlertSquareRounded />,
-        title: 'Error',
-        message: 'Patient not loaded',
-      });
-      return;
+  const [encounter, encounterLoading, encounterOutcome] = useSearchOne(
+    'Encounter',
+    {
+      appointment: getReferenceString(appointment),
+    },
+    {
+      // Disable debouncer for faster encounter loading. This search is not driven by
+      // keyboard input and so won't benefit from debouncing.
+      debounceMs: 0,
     }
+  );
 
-    if (!practitionerRef) {
-      showNotification({
-        color: 'yellow',
-        icon: <IconAlertSquareRounded />,
-        title: 'Error',
-        message: 'Appointment has no Practitioner participant',
-      });
-      return;
-    }
+  const cancellable =
+    appointment.status === 'booked' || appointment.status === 'pending' || appointment.status === 'proposed';
+  const cancelTooltip = cancellable ? null : `Can't cancel appointment with status "${appointment.status}"`;
+  const [cancelLoading, setCancelLoading] = useState(false);
 
-    if (!encounterClass || !planDefinition) {
-      showNotification({
-        color: 'yellow',
-        icon: <IconAlertSquareRounded />,
-        title: 'Error',
-        message: 'Please fill out required fields.',
-      });
-      return;
-    }
-
+  const handleCancel = useCallback(async () => {
+    setCancelLoading(true);
     try {
-      const encounter = await createEncounter(
-        medplum,
-        encounterClass,
-        patient,
-        planDefinition,
-        props.appointment,
-        practitionerRef
+      const updated = await medplum.post<WithId<Appointment>>(
+        medplum.fhirUrl('Appointment', appointment.id, '$cancel')
       );
+      // $cancel is a custom operation, so the client cannot classify its modifications
+      // itself; announce them to invalidate caches and notify interested components.
+      medplum.notifyResourceModified({
+        resourceType: 'Appointment',
+        operation: 'update',
+        id: updated.id,
+        resource: updated,
+      });
 
-      navigate(`/Patient/${patient.id}/Encounter/${encounter.id}`)?.catch(console.error);
+      // The $cancel operation soft-deletes the appointment's slots, but does
+      // not return any kind of tombstone for them, so we read the remaining
+      // pointers from the appointment resource and mark them as deleted.
+      updated.slot?.forEach((slot) => {
+        medplum.notifyResourceModified({ resourceType: 'Slot', operation: 'delete', id: resolveId(slot) });
+      });
     } catch (err) {
       showErrorNotification(err);
+    } finally {
+      setCancelLoading(false);
     }
-  }, [medplum, patient, encounterClass, planDefinition, props.appointment, navigate, practitionerRef]);
+  }, [medplum, appointment]);
+
+  const confirmable = appointment.status === 'pending';
+  const [confirmLoading, setConfirmLoading] = useState(false);
+  const handleConfirm = useCallback(async () => {
+    if (!confirmable) {
+      console.error(new Error(`handleConfirm called from non confirmable status '${appointment.status}'`));
+      return;
+    }
+    setConfirmLoading(true);
+    try {
+      const updated = await medplum.post<Bundle<WithId<Appointment> | WithId<Slot>>>(
+        medplum.fhirUrl('Appointment', appointment.id, '$confirm')
+      );
+      const updatedResources = updated.entry?.map((entry) => entry.resource) ?? EMPTY;
+      const updatedAppointment = updatedResources.find((res) => isResource<Appointment>(res, 'Appointment'));
+      const updatedSlots = updatedResources.filter((res) => isResource<Slot>(res, 'Slot'));
+      // $confirm is a custom operation, so the client cannot classify its modifications
+      // itself; announce them to invalidate caches and notify interested components.
+      medplum.notifyResourceModified({
+        resourceType: 'Appointment',
+        operation: 'update',
+        id: updatedAppointment?.id,
+        resource: updatedAppointment,
+      });
+      updatedSlots.forEach((slot) => {
+        medplum.notifyResourceModified({
+          resourceType: 'Slot',
+          operation: 'update',
+          id: slot.id,
+          resource: slot,
+        });
+      });
+    } catch (err) {
+      showErrorNotification(err);
+    } finally {
+      setConfirmLoading(false);
+    }
+  }, [medplum, appointment, confirmable]);
+
+  const sortedParticipants = appointment.participant
+    .map((participant) => {
+      const actor = participant.actor;
+      if (!isReference(actor)) {
+        return undefined;
+      }
+      const [resourceType] = parseReference(actor);
+      return { actor, resourceType };
+    })
+    .filter(isDefined)
+    .sort((a, b) => (a.resourceType === 'Patient' ? 0 : 1) - (b.resourceType === 'Patient' ? 0 : 1));
+
+  // If there is a "Patient" participant, we sorted it to the front of the list, so we can
+  // check just the first entry.
+  const hasPatient = sortedParticipants[0]?.resourceType === 'Patient';
 
   return (
-    <Stack gap="md">
-      <Text size="lg">{formatPeriod({ start: props.appointment.start, end: props.appointment.end })}</Text>
+    <Stack gap="md" className={classes.AppointmentDetails}>
+      <Divider />
 
-      {!patientRef && <UpdateAppointmentForm appointment={props.appointment} onUpdate={props.onUpdate} />}
+      {!hasPatient && <UpdateAppointmentForm appointment={props.appointment} />}
 
-      {!!patient && (
-        <>
-          <Group align="center" gap="sm">
-            <MedplumLink to={patient}>
-              <ResourceAvatar value={patient} size={48} radius={48} />
+      {sortedParticipants.map(({ actor, resourceType }, index) => {
+        return (
+          <Group align="center" gap="sm" key={`${actor.reference ?? ''}_${index}`}>
+            <MedplumLink to={actor} tabIndex={-1}>
+              <ResourceAvatar value={actor} size={48} radius={48} />
             </MedplumLink>
-            <MedplumLink to={patient} fw={800} size="lg">
-              {formatHumanName(patient.name?.[0])}
-            </MedplumLink>
+            <div>
+              <ResourceName value={actor} size="lg" fw={800} link />
+              <Text size="xs" c="dimmed">
+                {resourceType}
+              </Text>
+            </div>
           </Group>
-          <div>
-            <h3>Set Up Encounter</h3>
-            <Form onSubmit={handleSubmit}>
-              <Stack gap="md">
-                <ResourceInput<Practitioner>
-                  name="practitioner"
-                  resourceType="Practitioner"
-                  label="Practitioner"
-                  defaultValue={practitionerRef}
-                  disabled={true}
-                  required={true}
-                />
+        );
+      })}
 
-                <CodingInput
-                  name="class"
-                  label="Encounter Class"
-                  binding="http://terminology.hl7.org/ValueSet/v3-ActEncounterCode"
-                  required={true}
-                  onChange={setEncounterClass}
-                  path="Encounter.type"
-                />
+      <Divider />
 
-                <ResourceInput<PlanDefinition>
-                  name="plandefinition"
-                  resourceType="PlanDefinition"
-                  label="Care template"
-                  onChange={setPlanDefinition}
-                  required={true}
-                />
+      <dl className={classes.metadata}>
+        <dt>Appointment Start</dt>
+        <dd>{formatDateTime(props.appointment.start)}</dd>
 
-                <PlanDefinitionSummary planDefinition={planDefinition} />
+        <dt>Appointment End</dt>
+        <dd>{formatDateTime(props.appointment.end)}</dd>
 
-                <Button fullWidth type="submit" disabled={!planDefinition || !encounterClass}>
-                  Apply
-                </Button>
-              </Stack>
-            </Form>
-          </div>
-        </>
+        {(props.appointment.serviceType ?? EMPTY).length > 0 && (
+          <>
+            <dt>Service Type</dt>
+            {(props.appointment.serviceType ?? EMPTY).map((serviceType, index) => (
+              <dd key={index}>
+                <ServiceTypeDisplay value={serviceType} />
+              </dd>
+            ))}
+          </>
+        )}
+      </dl>
+
+      <Divider />
+
+      {encounterLoading && (
+        <Group justify="center">
+          <Loader size="sm" />
+        </Group>
       )}
+      <OperationOutcomeAlert outcome={encounterOutcome} title="Loading Encounter failed" />
+      {hasPatient && !encounter && !encounterLoading && encounterOutcome && isOk(encounterOutcome) && (
+        <CreateEncounterForm appointment={appointment} />
+      )}
+
+      <Divider />
+
+      {encounter && (
+        <Button
+          component={Link}
+          to={encounterUrl(encounter)}
+          leftSection={<IconNotes size={16} />}
+          variant="outline"
+          color="dark"
+        >
+          View Encounter
+        </Button>
+      )}
+      {confirmable && (
+        <Button
+          loading={confirmLoading}
+          onClick={handleConfirm}
+          variant="outline"
+          leftSection={<IconFileCheck size={16} />}
+        >
+          Confirm Appointment
+        </Button>
+      )}
+      <Tooltip label={cancelTooltip} disabled={!cancelTooltip}>
+        <Button
+          loading={cancelLoading}
+          onClick={handleCancel}
+          variant="outline"
+          color="red"
+          leftSection={<IconTrash size={16} />}
+          data-disabled={!cancellable}
+        >
+          Cancel Visit
+        </Button>
+      </Tooltip>
     </Stack>
   );
 }

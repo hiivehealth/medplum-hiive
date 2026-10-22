@@ -9,7 +9,7 @@ import { loadTestConfig } from '../../config/loader';
 import type { ActiveSubscriptionEntry } from '../../pubsub';
 import { getActiveSubsKey } from '../../pubsub';
 import { getPubSubRedis } from '../../redis';
-import { initTestAuth } from '../../test.setup';
+import { getSuperAdminAccessToken, initTestAuth } from '../../test.setup';
 import type { WsSubProjectDetailStats } from './getwssubprojectstats';
 
 describe('$get-ws-sub-project-stats', () => {
@@ -31,26 +31,26 @@ describe('$get-ws-sub-project-stats', () => {
       .get('/fhir/R4/$get-ws-sub-project-stats')
       .query({ projectId: randomUUID() })
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res.status).toBe(403);
+    expect(res).toHaveStatus(403);
   });
 
   test('Returns 400 when projectId is missing', async () => {
-    const accessToken = await initTestAuth({ project: { superAdmin: true } });
+    const accessToken = await getSuperAdminAccessToken();
 
     const res = await request(app)
       .get('/fhir/R4/$get-ws-sub-project-stats')
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
   });
 
   test('Returns empty resource types for unknown project', async () => {
-    const accessToken = await initTestAuth({ project: { superAdmin: true } });
+    const accessToken = await getSuperAdminAccessToken();
 
     const res = await request(app)
       .get('/fhir/R4/$get-ws-sub-project-stats')
       .query({ projectId: randomUUID() })
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     const params = res.body as Parameters;
     const statsStr = params.parameter?.find((p) => p.name === 'stats')?.valueString;
@@ -105,13 +105,13 @@ describe('$get-ws-sub-project-stats', () => {
     await redis.hset(getActiveSubsKey(projectId, 'Patient'), 'Subscription/sub4', JSON.stringify(entry4));
 
     try {
-      const accessToken = await initTestAuth({ project: { superAdmin: true } });
+      const accessToken = await getSuperAdminAccessToken();
 
       const res = await request(app)
         .get('/fhir/R4/$get-ws-sub-project-stats')
         .query({ projectId })
         .set('Authorization', 'Bearer ' + accessToken);
-      expect(res.status).toBe(200);
+      expect(res).toHaveStatus(200);
 
       const params = res.body as Parameters;
       const statsStr = params.parameter?.find((p) => p.name === 'stats')?.valueString;
@@ -129,13 +129,10 @@ describe('$get-ws-sub-project-stats', () => {
       // Criteria sorted descending by count
       expect(obType?.criteria[0].criteria).toBe('Observation?code=85354-9');
       expect(obType?.criteria[0].count).toBe(2);
-      expect(obType?.criteria[0].entries).toHaveLength(2);
-      expect(obType?.criteria[0].entries).toEqual(
-        expect.arrayContaining([
-          { subscriptionId: 'sub1', criteria: entry1.criteria, expiration: entry1.expiration, author: entry1.author },
-          { subscriptionId: 'sub2', criteria: entry2.criteria, expiration: entry2.expiration, author: entry2.author },
-        ])
-      );
+      expect(obType?.criteria[0].entries).toContainExactly([
+        { subscriptionId: 'sub1', criteria: entry1.criteria, expiration: entry1.expiration, author: entry1.author },
+        { subscriptionId: 'sub2', criteria: entry2.criteria, expiration: entry2.expiration, author: entry2.author },
+      ]);
 
       expect(obType?.criteria[1].criteria).toBe('Observation?status=final');
       expect(obType?.criteria[1].count).toBe(1);
@@ -177,13 +174,13 @@ describe('$get-ws-sub-project-stats', () => {
     await redis.hset(`medplum:subscriptions:r4:project:${projectId}:active:v2`, 'Subscription/sub3', 'Observation');
 
     try {
-      const accessToken = await initTestAuth({ project: { superAdmin: true } });
+      const accessToken = await getSuperAdminAccessToken();
 
       const res = await request(app)
         .get('/fhir/R4/$get-ws-sub-project-stats')
         .query({ projectId })
         .set('Authorization', 'Bearer ' + accessToken);
-      expect(res.status).toBe(200);
+      expect(res).toHaveStatus(200);
 
       const params = res.body as Parameters;
       const statsStr = params.parameter?.find((p) => p.name === 'stats')?.valueString;

@@ -1,271 +1,20 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { deepClone, sleep } from '@medplum/core';
-import { EventEmitter } from 'node:events';
-import { Duplex } from 'node:stream';
-import type {
-  ClientBase,
-  Pool,
-  PoolClient,
-  PoolConfig,
-  QueryArrayResult,
-  QueryConfig,
-  QueryResult,
-  QueryResultRow,
-} from 'pg';
-import pg from 'pg';
-import { Readable, Writable } from 'stream';
-import { loadConfig, loadTestConfig } from './config/loader';
-import type { MedplumDatabaseSslConfig } from './config/types';
+import { sleep } from '@medplum/core';
+import type { Pool, PoolClient } from 'pg';
+import { loadTestConfig } from './config/loader';
 import {
   acquireAdvisoryLock,
   closeDatabase,
   DatabaseMode,
   getDatabasePool,
-  getDefaultStatementTimeout,
   initDatabase,
+  prepareDatabasePoolsForShutdown,
   releaseAdvisoryLock,
 } from './database';
+import { GLOBAL_SHARD_ID, PLACEHOLDER_SHARD_ID, TODO_SHARD_ID } from './fhir/sharding';
 import { globalLogger } from './logger';
-import { GetDataVersionSql, GetVersionSql } from './migration-sql';
-import { getLatestPostDeployMigrationVersion, getPreDeployMigrationVersions } from './migrations/migration-versions';
-
-const preDeployVersion = getPreDeployMigrationVersions().length;
-const latestVersion = getLatestPostDeployMigrationVersion();
-
-describe('Database config', () => {
-  let poolSpy: jest.SpyInstance<pg.Pool, [config?: pg.PoolConfig | undefined]>;
-  let advisoryLockResponse = true;
-
-  beforeAll(() => {
-    // to appease jest, the name must start with "mock"
-    const mockQueries = {
-      GetVersionSql,
-      GetDataVersionSql,
-    };
-    jest.useFakeTimers();
-    jest.mock('pg');
-    poolSpy = jest.spyOn(pg, 'Pool').mockImplementation((_config?: PoolConfig) => {
-      class MockPoolClient extends Duplex implements PoolClient {
-        release(): void {}
-        async connect(): Promise<ClientBase> {
-          return this;
-        }
-        async query<R extends QueryResultRow = any, I = any[]>(sql: string | QueryConfig<I>): Promise<QueryResult<R>> {
-          const result: QueryResult<R> = {
-            command: '',
-            rowCount: null,
-            oid: -1,
-            fields: [],
-            rows: [],
-          };
-          if (sql === 'SELECT pg_try_advisory_lock($1)') {
-            result.rows = [{ pg_try_advisory_lock: advisoryLockResponse } as unknown as R];
-          }
-          if (sql === mockQueries.GetVersionSql) {
-            result.rows = [{ version: preDeployVersion } as unknown as R];
-          }
-          if (sql === mockQueries.GetDataVersionSql) {
-            result.rows = [{ dataVersion: latestVersion } as unknown as R];
-          }
-
-          return result;
-        }
-        copyFrom(_queryText: string): Writable {
-          return new Writable();
-        }
-        copyTo(_queryText: string): Readable {
-          return new Readable();
-        }
-        pauseDrain(): void {}
-        resumeDrain(): void {}
-        escapeIdentifier(_str: string): string {
-          return '';
-        }
-        escapeLiteral(_str: string): string {
-          return '';
-        }
-        getTypeParser(): any {
-          return undefined;
-        }
-        setTypeParser(): void {}
-      }
-
-      class MockPool extends EventEmitter implements Pool {
-        expiredCount: number;
-        ending: boolean;
-        ended: boolean;
-        options: pg.PoolOptions;
-
-        constructor(_config?: PoolConfig) {
-          super();
-          this.expiredCount = 0;
-          this.ending = false;
-          this.ended = false;
-          this.options = {
-            max: -1,
-            maxUses: -1,
-            allowExitOnIdle: false,
-            maxLifetimeSeconds: -1,
-            idleTimeoutMillis: -1,
-          };
-        }
-
-        totalCount = -1;
-        idleCount = -1;
-        waitingCount = -1;
-        async connect(): Promise<pg.PoolClient> {
-          return new MockPoolClient();
-        }
-        on(): this {
-          return this;
-        }
-        async end(): Promise<void> {}
-        async query(): Promise<QueryArrayResult<any>> {
-          return {
-            command: '',
-            rowCount: null,
-            oid: -1,
-            fields: [],
-            rows: [],
-          };
-        }
-      }
-
-      return new MockPool();
-    });
-    jest.spyOn(globalLogger, 'error').mockImplementation(() => {});
-  });
-
-  afterAll(() => {
-    jest.restoreAllMocks();
-    jest.useRealTimers();
-  });
-
-  beforeEach(() => {
-    advisoryLockResponse = true;
-    poolSpy.mockClear();
-  });
-
-  afterEach(async () => {
-    await closeDatabase();
-  });
-
-  test('SSL config', async () => {
-    const config = await loadConfig('file:test.config.json');
-    expect(config).toBeDefined();
-    expect(config.baseUrl).toBeDefined();
-    expect(config.database).toBeDefined();
-
-    const configCopy = deepClone(config);
-    const databaseConfig = configCopy.database;
-    const sslConfig = {
-      rejectUnauthorized: true,
-      require: true,
-      ca: '__THIS_SHOULD_BE_A_PEM_FILE__',
-    } satisfies MedplumDatabaseSslConfig;
-    databaseConfig.ssl = sslConfig;
-
-    await initDatabase(configCopy);
-    expect(poolSpy).toHaveBeenCalledTimes(1);
-    expect(poolSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        host: databaseConfig.host,
-        port: databaseConfig.port,
-        password: databaseConfig.password,
-        database: databaseConfig.dbname,
-        user: databaseConfig.username,
-        ssl: sslConfig,
-      })
-    );
-  });
-
-  test('RDS proxy', async () => {
-    const config = await loadConfig('file:test.config.json');
-    expect(config).toBeDefined();
-    expect(config.baseUrl).toBeDefined();
-    expect(config.database).toBeDefined();
-
-    const configCopy = deepClone(config);
-    configCopy.databaseProxyEndpoint = 'test';
-
-    const databaseConfig = configCopy.database;
-
-    await initDatabase(configCopy);
-    expect(poolSpy).toHaveBeenCalledTimes(1);
-    expect(poolSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        host: configCopy.databaseProxyEndpoint,
-        port: databaseConfig.port,
-        password: databaseConfig.password,
-        database: databaseConfig.dbname,
-        user: databaseConfig.username,
-        ssl: { require: true },
-      })
-    );
-  });
-
-  test('Cannot acquire migration lock', async () => {
-    advisoryLockResponse = false;
-    const config = await loadTestConfig();
-    config.database.runMigrations = true;
-    const initDBPromise = initDatabase(config);
-
-    // Use `jest.runAllTimersAsync().catch(...)` instead of `await jest.runAllTimersAsync()` since
-    // we expect initDBPromise to reject. Based on https://github.com/jestjs/jest/issues/14120
-    jest.runAllTimersAsync().catch((reason) => console.error('Unexpected error in jest.runAllTimersAsync', reason));
-
-    await expect(initDBPromise).rejects.toThrow('Failed to acquire migration lock');
-  });
-
-  test('Default connection settings', async () => {
-    const config = await loadTestConfig();
-    config.database.disableConnectionConfiguration = false;
-    await initDatabase(config);
-    expect(poolSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        options: `-c statement_timeout=60000 -c default_transaction_isolation=repeatable\\ read -c idle_in_transaction_session_timeout=30000`,
-      })
-    );
-  });
-
-  test('Custom query timeout', async () => {
-    const config = await loadTestConfig();
-    config.database.disableConnectionConfiguration = false;
-    config.database.queryTimeout = 5000;
-    await initDatabase(config);
-    expect(poolSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        options: `-c statement_timeout=5000 -c default_transaction_isolation=repeatable\\ read -c idle_in_transaction_session_timeout=30000`,
-      })
-    );
-  });
-
-  test('Disabled connection configuration', async () => {
-    const config = await loadTestConfig();
-    config.database.queryTimeout = 12345;
-    config.database.disableConnectionConfiguration = true;
-    await initDatabase(config);
-    expect(poolSpy).toHaveBeenCalledWith(
-      expect.objectContaining({
-        options: undefined,
-      })
-    );
-  });
-
-  test('getDefaultStatementTimeout', async () => {
-    const config = await loadTestConfig();
-    config.database.disableConnectionConfiguration = true;
-    expect(getDefaultStatementTimeout(config.database)).toBe('DEFAULT');
-
-    config.database.disableConnectionConfiguration = false;
-    config.database.queryTimeout = 5000;
-    expect(getDefaultStatementTimeout(config.database)).toBe(5000);
-
-    config.database.queryTimeout = undefined;
-    expect(getDefaultStatementTimeout(config.database)).toBe(60000);
-  });
-});
+import { getConnectionShardId } from './sharding/connection-shard-id';
 
 describe('Advisory locks', () => {
   let clientA: PoolClient;
@@ -274,7 +23,7 @@ describe('Advisory locks', () => {
   beforeEach(async () => {
     const config = await loadTestConfig();
     await initDatabase(config);
-    const pool = getDatabasePool(DatabaseMode.READER);
+    const pool = getDatabasePool(DatabaseMode.READER, GLOBAL_SHARD_ID);
     clientA = await pool.connect();
     clientB = await pool.connect();
     await clientA.query(`SET statement_timeout TO 100`);
@@ -311,5 +60,118 @@ describe('Advisory locks', () => {
     await Promise.all([aPromise(), bPromise()]);
 
     expect(bLock).toBe(true);
+  });
+});
+
+describe('getDatabasePool', () => {
+  beforeAll(async () => {
+    const config = await loadTestConfig();
+    await initDatabase(config);
+  });
+
+  afterAll(async () => {
+    await closeDatabase();
+  });
+
+  // getDatabasePool takes normalized shard IDs, so the placeholder and TODO IDs are not aliases for the global shard
+  test.each(['unknown-shard', '', PLACEHOLDER_SHARD_ID, TODO_SHARD_ID, 'toString'])(
+    'Throws for a shard with no database: "%s"',
+    (shardId) => {
+      expect(() => getDatabasePool(DatabaseMode.WRITER, shardId)).toThrow(`Database not set up for shard ${shardId}`);
+    }
+  );
+});
+
+describe('prepareDatabasePoolsForShutdown', () => {
+  beforeEach(async () => {
+    const config = await loadTestConfig();
+    config.database.minConnections = 2;
+    await initDatabase(config);
+  });
+
+  afterEach(async () => {
+    await closeDatabase();
+  });
+
+  test('Closes all idle connections regardless of the configured minimum', async () => {
+    const pool = getDatabasePool(DatabaseMode.WRITER, GLOBAL_SHARD_ID);
+    const clients = await Promise.all([pool.connect(), pool.connect()]);
+    expect(getConnectionShardId(pool)).toStrictEqual(GLOBAL_SHARD_ID);
+    expect(clients.map(getConnectionShardId)).toStrictEqual([GLOBAL_SHARD_ID, GLOBAL_SHARD_ID]);
+    clients.forEach((client) => client.release());
+    expect(pool.options.min).toBe(2);
+    expect(pool.idleCount).toBe(2);
+
+    prepareDatabasePoolsForShutdown();
+
+    expect(pool.options.min).toBe(0);
+    expect(pool.idleCount).toBe(0);
+    expect(pool.totalCount).toBe(0);
+
+    await closeDatabase();
+
+    // idempotent
+    prepareDatabasePoolsForShutdown();
+  });
+
+  test('Handles errors thrown while preparing pools', async () => {
+    type PoolWithRemove = Pool & { _remove: (client: PoolClient) => void };
+
+    const writerPool = getDatabasePool(DatabaseMode.WRITER, GLOBAL_SHARD_ID);
+    const readerPool = getDatabasePool(DatabaseMode.READER, GLOBAL_SHARD_ID);
+    const clients = await Promise.all([writerPool.connect(), readerPool.connect()]);
+    clients.forEach((client) => client.release());
+
+    const writerError = new Error('Writer test error');
+    const readerError = new Error('Reader test error');
+    const writerRemoveSpy = vi.spyOn(writerPool as PoolWithRemove, '_remove').mockImplementation(() => {
+      throw writerError;
+    });
+    const readerRemoveSpy = vi.spyOn(readerPool as PoolWithRemove, '_remove').mockImplementation(() => {
+      throw readerError;
+    });
+    const errorSpy = vi.spyOn(globalLogger, 'error').mockImplementation(() => undefined);
+
+    try {
+      prepareDatabasePoolsForShutdown();
+
+      expect(writerRemoveSpy).toHaveBeenCalledTimes(1);
+      expect(readerRemoveSpy).toHaveBeenCalledTimes(1);
+      expect(errorSpy).toHaveBeenCalledTimes(2);
+      expect(errorSpy).toHaveBeenCalledWith('Error purging idle pool connections', {
+        err: writerError,
+        shardId: GLOBAL_SHARD_ID,
+      });
+      expect(errorSpy).toHaveBeenCalledWith('Error purging idle pool connections', {
+        err: readerError,
+        shardId: GLOBAL_SHARD_ID,
+      });
+    } finally {
+      writerRemoveSpy.mockRestore();
+      readerRemoveSpy.mockRestore();
+      errorSpy.mockRestore();
+    }
+  });
+
+  test('Closes connections released during graceful shutdown', async () => {
+    const pool = getDatabasePool(DatabaseMode.WRITER, GLOBAL_SHARD_ID);
+    const idleClient = await pool.connect();
+    const activeClient = await pool.connect();
+    idleClient.release();
+    expect(pool.idleCount).toBe(1);
+    expect(pool.totalCount).toBe(2);
+
+    prepareDatabasePoolsForShutdown();
+
+    expect(pool.idleCount).toBe(0);
+    expect(pool.totalCount).toBe(1);
+
+    await pool.query('SELECT 1');
+    expect(pool.idleCount).toBe(0);
+    expect(pool.totalCount).toBe(1);
+
+    expect(() => activeClient.release()).not.toThrow();
+    expect(pool.idleCount).toBe(0);
+    expect(pool.totalCount).toBe(0);
   });
 });

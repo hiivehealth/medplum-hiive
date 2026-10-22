@@ -1,26 +1,35 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { Project } from '@medplum/fhirtypes';
+import type { Mock } from 'vitest';
 import { initAppServices, shutdownApp } from './app';
 import { loadTestConfig } from './config/loader';
+import type { ServerConfig } from './config/utils';
 import { DatabaseMode, getDatabasePool } from './database';
-import type { SystemRepository } from './fhir/repo';
-import { getGlobalSystemRepo } from './fhir/repo';
-import { SelectQuery } from './fhir/sql';
+import type { OutputAction } from './fhir/operations/db-configure-indexes';
+import { configureGinIndexes } from './fhir/operations/db-configure-indexes';
+import { getGlobalSystemRepo, getShardSystemRepo } from './fhir/repo';
+import { getAllShards } from './fhir/sharding';
+import { globalLogger } from './logger';
 import { getPostDeployVersion, getPreDeployVersion } from './migration-sql';
 import {
   getPendingPostDeployMigration,
   getPostDeployMigration,
   preparePostDeployMigrationAsyncJob,
 } from './migrations/migration-utils';
-import { getLatestPostDeployMigrationVersion, MigrationVersion } from './migrations/migration-versions';
-import { seedDatabase } from './seed';
-import { withTestContext } from './test.setup';
+import {
+  getLatestPostDeployMigrationVersion,
+  getPreDeployMigrationVersions,
+  MigrationVersion,
+} from './migrations/migration-versions';
+import { closeRedis, getCacheRedis, initRedis } from './redis';
+import * as seedModule from './seed';
+import { deleteRedisKeys, withTestContext } from './test.setup';
 
-async function synchronouslyRunAllPendingPostDeployMigrations(systemRepo: SystemRepository): Promise<void> {
+async function synchronouslyRunAllPendingPostDeployMigrations(shardId: string): Promise<void> {
   const lastVersion = getLatestPostDeployMigrationVersion();
 
-  const pendingMigration = await getPendingPostDeployMigration(getDatabasePool(DatabaseMode.WRITER));
+  const pendingMigration = await getPendingPostDeployMigration(getDatabasePool(DatabaseMode.WRITER, shardId));
   if (pendingMigration === MigrationVersion.UNKNOWN) {
     throw new Error('Post-deploy migration version is unknown');
   }
@@ -29,80 +38,116 @@ async function synchronouslyRunAllPendingPostDeployMigrations(systemRepo: System
     return;
   }
 
-  console.log(
-    `${new Date().toISOString()} - Running pending post-deploy migrations ${pendingMigration} through ${lastVersion}`
+  globalLogger.write(
+    `${new Date().toISOString()} - [${shardId}] Running pending post-deploy migrations ${pendingMigration} through ${lastVersion}`
   );
 
   for (let i = pendingMigration; i <= lastVersion; i++) {
-    await synchronouslyRunPostDeployMigration(systemRepo, i);
+    await synchronouslyRunPostDeployMigration(shardId, i);
   }
 }
 
-async function synchronouslyRunPostDeployMigration(systemRepo: SystemRepository, version: number): Promise<void> {
+async function synchronouslyRunPostDeployMigration(shardId: string, version: number): Promise<void> {
   const migration = getPostDeployMigration(version);
-  const asyncJob = await preparePostDeployMigrationAsyncJob(systemRepo, version);
-  const jobData = migration.prepareJobData(asyncJob);
-  console.log(`${new Date().toISOString()} - Starting post-deploy migration v${version}`);
-  const result = await migration.run(systemRepo, undefined, jobData);
-  console.log(`${new Date().toISOString()} - Post-deploy migration v${version} result: ${result}`);
+  const asyncJob = await preparePostDeployMigrationAsyncJob(shardId, version);
+  const jobData = migration.prepareJobData({ shardId, asyncJob });
+  globalLogger.write(`${new Date().toISOString()} - [${shardId}] Starting post-deploy migration v${version}`);
+  const result = await migration.run(getShardSystemRepo(shardId), undefined, jobData);
+  globalLogger.write(`${new Date().toISOString()} - [${shardId}] Post-deploy migration v${version} result: ${result}`);
 }
 
 describe('Seed', () => {
-  const originalConsoleLog = console.log;
-  let consoleLogSpy: jest.SpyInstance;
+  let config: ServerConfig;
+  let loggerWriteSpy: Mock<typeof globalLogger.write>;
+  let seedDatabaseSpy: Mock<(typeof seedModule)['seedDatabase']>;
 
   beforeAll(async () => {
-    consoleLogSpy = jest.spyOn(console, 'log').mockImplementation(jest.fn());
+    loggerWriteSpy = vi.spyOn(globalLogger, 'write').mockImplementation(() => undefined);
+    seedDatabaseSpy = vi.spyOn(seedModule, 'seedDatabase');
 
-    const config = await loadTestConfig();
+    config = await loadTestConfig({ sharded: true });
     config.database.runMigrations = true;
     // Since BullMQ is not available in tests, disable automatically running post-deploy migrations
     // asynchronously. Instead, run them synchronously below.
     config.database.disableRunPostDeployMigrations = true;
+    for (const shardConfig of getAllShards()) {
+      shardConfig.database.runMigrations = true;
+      shardConfig.database.disableRunPostDeployMigrations = true;
+    }
 
-    console.log(`${new Date().toISOString()} - Initializing app services`);
+    // Delete all cache Redis keys to ensure a clean slate since the cache may be out of
+    // sync with the database, e.g. if postgres/init_test.sql or something similar was run beforehand.
+    // On CI/CD this is effectively a noop since a fresh Redis server is used for each test run
+    await initRedis(config);
+    await deleteRedisKeys(getCacheRedis(), '');
+    await closeRedis();
+
+    globalLogger.write(`${new Date().toISOString()} - Initializing app services`);
     await initAppServices(config);
-    await withTestContext(async () => {
-      // Run post-deploy migrations synchronously
-      await synchronouslyRunAllPendingPostDeployMigrations(getGlobalSystemRepo());
-    });
+
+    for (const shardConfig of getAllShards()) {
+      await synchronouslyRunAllPendingPostDeployMigrations(shardConfig.id);
+
+      // Scheduling and user creation use serializable transactions that touch these
+      // tables. The `fastUpdate` feature can cause seemingly unrelated transactions
+      // to append to the same "pending list", which can cause transaction
+      // failures.
+      //
+      // Here we update the indexes on Appointment, Slot, and User tables to disable `fastUpdate`,
+      // and then vacuum the tables to clear any existing pending list entries.
+      const pool = getDatabasePool(DatabaseMode.WRITER, shardConfig.id);
+      const actions: OutputAction[] = [];
+      const tables = ['Appointment', 'Appointment_References', 'Slot', 'Slot_References', 'User', 'User_References'];
+      await configureGinIndexes(pool, actions, tables, { fastUpdate: false });
+    }
   });
 
   afterAll(async () => {
     await shutdownApp();
-    consoleLogSpy.mockRestore();
+    loggerWriteSpy.mockRestore();
+    seedDatabaseSpy.mockRestore();
   });
 
   test('Seeder completes successfully', () =>
     withTestContext(async () => {
-      const config = await loadTestConfig();
+      // // seedDatabase executed in beforeAll via initAppServices
+      expect(seedDatabaseSpy).toHaveBeenCalledTimes(1);
 
-      // Seeder was already run as part of `initAppServices`, but run it again
-      // incase it is ever removed from `initAppServices`
-      await seedDatabase(config);
+      for (const shardConfig of getAllShards()) {
+        const pool = getDatabasePool(DatabaseMode.WRITER, shardConfig.id);
 
-      // Make sure all database migrations have run
-      const pool = getDatabasePool(DatabaseMode.WRITER);
+        // Every shard gets the base definitions
+        expect(
+          await getShardSystemRepo(shardConfig.id).searchOne({ resourceType: 'StructureDefinition' })
+        ).toBeDefined();
 
-      const preDeployVersion = await getPreDeployVersion(pool);
-      expect(preDeployVersion).toBeGreaterThanOrEqual(67);
+        const preDeployVersion = await getPreDeployVersion(pool);
+        expect(preDeployVersion).toBeGreaterThanOrEqual(67);
+        expect(preDeployVersion).toBe(getPreDeployMigrationVersions().at(-1) as number);
 
-      const postDeployVersion = await getPostDeployVersion(pool);
-      // only show log messages if post-deploy migrations did not run successfully
-      if (getLatestPostDeployMigrationVersion() !== postDeployVersion) {
-        consoleLogSpy.mock.calls.forEach((call) => originalConsoleLog(...call));
+        const postDeployVersion = await getPostDeployVersion(pool);
+
+        // only show log messages if post-deploy migrations did not run successfully
+        if (getLatestPostDeployMigrationVersion() !== postDeployVersion) {
+          loggerWriteSpy.mock.calls.forEach((call: unknown[]) => console.log(...call));
+          expect(postDeployVersion).toEqual(getLatestPostDeployMigrationVersion());
+        }
       }
-      expect(postDeployVersion).toEqual(getLatestPostDeployMigrationVersion());
 
-      // Make sure the first project is a super admin
-      const rows = await new SelectQuery('Project').column('content').where('name', '=', 'Super Admin').execute(pool);
-      expect(rows.length).toBe(1);
+      // confirm seedDatabase is idempotent
+      await seedDatabaseSpy(config);
 
-      const project = JSON.parse(rows[0].content) as Project;
-      expect(project.superAdmin).toBe(true);
-      expect(project.strictMode).toBe(true);
-
-      // Second time, seeder should silently ignore
-      await seedDatabase(config);
+      const projects = await getGlobalSystemRepo().searchResources<Project>({
+        resourceType: 'Project',
+        filters: [{ code: 'name', operator: 'eq', value: 'Super Admin' }],
+      });
+      expect(projects.length).toBe(1);
+      for (const project of projects) {
+        expect(project).toMatchObject({
+          name: 'Super Admin',
+          superAdmin: true,
+          strictMode: true,
+        });
+      }
     }));
 });

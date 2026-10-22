@@ -1,14 +1,25 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { Subscription } from '@medplum/fhirtypes';
-import type { Job, Worker } from 'bullmq';
-import { Queue } from 'bullmq';
+import type { Job, QueueOptions, Worker } from 'bullmq';
+import { DelayedError, Queue } from 'bullmq';
 import EventEmitter from 'node:events';
+import type { MockInstance } from 'vitest';
+import { vi } from 'vitest';
 import { loadTestConfig } from '../config/loader';
-import type { MedplumServerConfig } from '../config/types';
+import type { WorkerName } from '../config/types';
+import type { ServerConfig } from '../config/utils';
 import { globalLogger } from '../logger';
+import * as otelModule from '../otel/otel';
 import { withTestContext } from '../test.setup';
-import { addVerboseQueueLogging, DefaultQueueRegistry, getWorkerBullmqConfig, isJobSuccessful } from './utils';
+import {
+  addVerboseQueueLogging,
+  applyGlobalConcurrency,
+  DefaultQueueRegistry,
+  getWorkerBullmqConfig,
+  isJobSuccessful,
+  trackJobMetrics,
+} from './utils';
 
 describe('worker utils', () => {
   beforeAll(async () => {
@@ -30,7 +41,7 @@ describe('worker utils', () => {
       expect(isJobSuccessful(subscription, 200)).toBe(true);
     });
 
-    test('Successful job with invalid custom codes', () => {
+    test('Successful job with invalid custom codes', async () => {
       const subscription: Subscription = {
         resourceType: 'Subscription',
         status: 'active',
@@ -47,10 +58,10 @@ describe('worker utils', () => {
           },
         ],
       };
-      withTestContext(() => expect(isJobSuccessful(subscription, 200)).toBe(true));
+      await withTestContext(() => expect(isJobSuccessful(subscription, 200)).toBe(true));
     });
 
-    test('Unsuccessful job with invalid custom codes', () => {
+    test('Unsuccessful job with invalid custom codes', async () => {
       const subscription: Subscription = {
         resourceType: 'Subscription',
         status: 'active',
@@ -67,10 +78,10 @@ describe('worker utils', () => {
           },
         ],
       };
-      withTestContext(() => expect(isJobSuccessful(subscription, 500)).toBe(false));
+      await withTestContext(() => expect(isJobSuccessful(subscription, 500)).toBe(false));
     });
 
-    test('Successful job with valid custom codes', () => {
+    test('Successful job with valid custom codes', async () => {
       const subscription: Subscription = {
         resourceType: 'Subscription',
         status: 'active',
@@ -87,10 +98,10 @@ describe('worker utils', () => {
           },
         ],
       };
-      withTestContext(() => expect(isJobSuccessful(subscription, 500)).toBe(true));
+      await withTestContext(() => expect(isJobSuccessful(subscription, 500)).toBe(true));
     });
 
-    test('Unsuccessful job with valid custom codes', () => {
+    test('Unsuccessful job with valid custom codes', async () => {
       const subscription: Subscription = {
         resourceType: 'Subscription',
         status: 'active',
@@ -107,10 +118,10 @@ describe('worker utils', () => {
           },
         ],
       };
-      withTestContext(() => expect(isJobSuccessful(subscription, 200)).toBe(false));
+      await withTestContext(() => expect(isJobSuccessful(subscription, 200)).toBe(false));
     });
 
-    test('Successful job with valid custom codes comma separated', () => {
+    test('Successful job with valid custom codes comma separated', async () => {
       const subscription: Subscription = {
         resourceType: 'Subscription',
         status: 'active',
@@ -127,7 +138,7 @@ describe('worker utils', () => {
           },
         ],
       };
-      withTestContext(() => expect(isJobSuccessful(subscription, 200)).toBe(true));
+      await withTestContext(() => expect(isJobSuccessful(subscription, 200)).toBe(true));
     });
   });
 
@@ -145,7 +156,7 @@ describe('worker utils', () => {
         this.name = name;
       }
 
-      close = jest.fn();
+      close = vi.fn();
     }
 
     beforeEach(() => {
@@ -192,9 +203,7 @@ describe('worker utils', () => {
       expect(worker2.close).not.toHaveBeenCalled();
 
       // closeAll should close all queues
-      let promises = queueRegistry.closeAll();
-      expect(promises.length).toBe(2);
-      await Promise.all(promises);
+      await queueRegistry.closeAll();
       expect(queue.close).toHaveBeenCalledTimes(1);
       expect(worker.close).toHaveBeenCalledTimes(1);
       expect(queue2.close).toHaveBeenCalledTimes(1);
@@ -207,8 +216,12 @@ describe('worker utils', () => {
       expect(queueRegistry.isClosing(queueName + '2')).toBeUndefined();
 
       // nothing to close
-      promises = queueRegistry.closeAll();
-      expect(promises.length).toBe(0);
+      vi.clearAllMocks();
+      await queueRegistry.closeAll();
+      expect(queue.close).not.toHaveBeenCalled();
+      expect(worker.close).not.toHaveBeenCalled();
+      expect(queue2.close).not.toHaveBeenCalled();
+      expect(worker2.close).not.toHaveBeenCalled();
 
       // attempting to emit the closing event after closing shouldn't fail or throw
       worker.emit('closing', 'artificially emitting');
@@ -228,9 +241,7 @@ describe('worker utils', () => {
       expect(queueRegistry.isClosing(queueName)).toBe(false);
 
       // closeAll should close only the queue (no worker to close)
-      const promises = queueRegistry.closeAll();
-      expect(promises.length).toBe(1);
-      await Promise.all(promises);
+      await queueRegistry.closeAll();
       expect(queue.close).toHaveBeenCalledTimes(1);
 
       // queue should be removed from registry after closeAll
@@ -245,7 +256,7 @@ describe('worker utils', () => {
       const queue = { name: queueName } as Queue;
       const worker = new EventEmitter() as unknown as Worker;
 
-      const loggerInfoSpy = jest.spyOn(globalLogger, 'info').mockImplementation();
+      const loggerInfoSpy = vi.spyOn(globalLogger, 'info').mockImplementation(() => undefined);
 
       addVerboseQueueLogging<any>(queue, worker, (job) => ({ asyncJob: 'AsyncJob/' + job.data.asyncJobId }));
 
@@ -341,24 +352,143 @@ describe('worker utils', () => {
     });
   });
 
-  describe('getWorkerBullmqConfig', () => {
-    test('returns global bullmq config when no per-worker overrides', () => {
-      const config = {
-        bullmq: { concurrency: 20, removeOnComplete: { count: 1 }, removeOnFail: { count: 1 } },
-      } as MedplumServerConfig;
+  describe('trackJobMetrics', () => {
+    const job = { id: 'job-1' } as Job;
+    let inFlightSpy: MockInstance<typeof otelModule.addToUpDownCounter>;
+    let completedSpy: MockInstance<typeof otelModule.incrementCounter>;
 
-      const result = getWorkerBullmqConfig(config, 'subscription');
-      expect(result).toStrictEqual(config.bullmq);
+    beforeEach(() => {
+      inFlightSpy = vi.spyOn(otelModule, 'addToUpDownCounter');
+      completedSpy = vi.spyOn(otelModule, 'incrementCounter');
     });
 
-    test('returns global bullmq config when workers config exists but no bullmq overrides for this worker', () => {
+    afterEach(() => {
+      inFlightSpy.mockRestore();
+      completedSpy.mockRestore();
+    });
+
+    function reportedDeltas(workerName: WorkerName): number[] {
+      const metricName = otelModule.getQueueMetricName(workerName, 'inFlightJobs');
+      return inFlightSpy.mock.calls.filter((call) => call[0] === metricName).map((call) => call[1]);
+    }
+
+    function completions(workerName: WorkerName): number {
+      const metricName = otelModule.getQueueMetricName(workerName, 'jobsCompleted');
+      return completedSpy.mock.calls.filter((call) => call[0] === metricName).length;
+    }
+
+    test('increments while the job runs and decrements once it resolves', async () => {
+      const processor = vi.fn(async () => {
+        // Mid-flight: the increment has landed, and neither the decrement nor the completion has.
+        expect(reportedDeltas('batch')).toStrictEqual([1]);
+        expect(completions('batch')).toBe(0);
+        return 'result';
+      });
+
+      await expect(trackJobMetrics('batch', processor)(job)).resolves.toBe('result');
+      expect(reportedDeltas('batch')).toStrictEqual([1, -1]);
+      expect(completions('batch')).toBe(1);
+    });
+
+    test('decrements and rethrows when the job fails, without counting a completion', async () => {
+      const processor = vi.fn().mockRejectedValue(new Error('job blew up'));
+
+      await expect(trackJobMetrics('cron', processor)(job)).rejects.toThrow('job blew up');
+      expect(reportedDeltas('cron')).toStrictEqual([1, -1]);
+      expect(completions('cron')).toBe(0);
+    });
+
+    test('does not count a completion for a job re-queued as delayed', async () => {
+      // moveToDelayedAndThrow throws DelayedError; the attempt that finally runs to the end counts.
+      const processor = vi.fn().mockRejectedValue(new DelayedError('queue is closing'));
+
+      await expect(trackJobMetrics('batch', processor)(job)).rejects.toThrow(DelayedError);
+      expect(reportedDeltas('batch')).toStrictEqual([1, -1]);
+      expect(completions('batch')).toBe(0);
+    });
+
+    test('names both metrics after the worker, matching the other per-queue metrics', async () => {
+      await trackJobMetrics('subscription', async () => undefined)(job);
+
+      const expectedOptions = { attributes: otelModule.BASE_METRIC_OPTIONS.attributes };
+      expect(inFlightSpy).toHaveBeenCalledWith('medplum.subscription.inFlightJobs', 1, expectedOptions);
+      expect(completedSpy).toHaveBeenCalledWith('medplum.subscription.jobsCompleted', expectedOptions);
+    });
+
+    test('forwards all processor arguments and preserves arity', async () => {
+      const processor = vi.fn().mockResolvedValue(undefined);
+      const wrapped = trackJobMetrics('download', processor);
+      const signal = new AbortController().signal;
+
+      // BullMQ reads `processor.length >= 3` to decide whether to supply an abort signal, so the
+      // wrapper must keep all three parameters.
+      expect(wrapped.length).toBe(3);
+
+      await wrapped(job, 'token-1', signal);
+      expect(processor).toHaveBeenCalledWith(job, 'token-1', signal);
+    });
+  });
+
+  describe('applyGlobalConcurrency', () => {
+    test('sets global concurrency when configured', async () => {
+      const setGlobalConcurrency = vi.fn().mockResolvedValue(5);
+      const removeGlobalConcurrency = vi.fn().mockResolvedValue(0);
+      const queue = { name: 'TestQueue', setGlobalConcurrency, removeGlobalConcurrency } as unknown as Queue;
+
+      await applyGlobalConcurrency(queue, { globalConcurrency: 5 });
+      expect(setGlobalConcurrency).toHaveBeenCalledWith(5);
+      expect(removeGlobalConcurrency).not.toHaveBeenCalled();
+    });
+
+    test('removes global concurrency when not configured', async () => {
+      const setGlobalConcurrency = vi.fn().mockResolvedValue(5);
+      const removeGlobalConcurrency = vi.fn().mockResolvedValue(0);
+      const queue = { name: 'TestQueue', setGlobalConcurrency, removeGlobalConcurrency } as unknown as Queue;
+
+      await applyGlobalConcurrency(queue, { concurrency: 10 });
+      expect(removeGlobalConcurrency).toHaveBeenCalledTimes(1);
+      expect(setGlobalConcurrency).not.toHaveBeenCalled();
+    });
+
+    test('removes global concurrency when config is undefined', async () => {
+      const setGlobalConcurrency = vi.fn().mockResolvedValue(5);
+      const removeGlobalConcurrency = vi.fn().mockResolvedValue(0);
+      const queue = { name: 'TestQueue', setGlobalConcurrency, removeGlobalConcurrency } as unknown as Queue;
+
+      await applyGlobalConcurrency(queue, undefined);
+      expect(removeGlobalConcurrency).toHaveBeenCalledTimes(1);
+      expect(setGlobalConcurrency).not.toHaveBeenCalled();
+    });
+
+    test('rejects when the underlying call fails', async () => {
+      const err = new Error('redis down');
+      const setGlobalConcurrency = vi.fn().mockRejectedValue(err);
+      const queue = { name: 'TestQueue', setGlobalConcurrency } as unknown as Queue;
+
+      await expect(applyGlobalConcurrency(queue, { globalConcurrency: 3 })).rejects.toThrow('redis down');
+    });
+  });
+
+  describe('getWorkerBullmqConfig', () => {
+    const defaultOptions: QueueOptions = { connection: { host: 'test-redis' } };
+
+    test('returns default options plus global bullmq config when no per-worker overrides', () => {
+      const config = {
+        bullmq: { concurrency: 20, removeOnComplete: { count: 1 }, removeOnFail: { count: 1 } },
+      } as ServerConfig;
+
+      const result = getWorkerBullmqConfig(config, 'subscription', defaultOptions);
+      expect(result).toStrictEqual({ ...defaultOptions, ...config.bullmq });
+    });
+
+    test('returns default options plus global bullmq config when workers config exists but no bullmq overrides for this worker', () => {
       const config = {
         bullmq: { concurrency: 20, removeOnComplete: { count: 1 }, removeOnFail: { count: 1 } },
         workers: { enabled: ['subscription'] },
-      } as MedplumServerConfig;
+      } as ServerConfig;
 
-      const result = getWorkerBullmqConfig(config, 'subscription');
-      expect(result).toStrictEqual(config.bullmq);
+      const result = getWorkerBullmqConfig(config, 'subscription', defaultOptions);
+      expect(result).toStrictEqual({ ...defaultOptions, ...config.bullmq });
     });
 
     test('merges per-worker bullmq overrides on top of global config', () => {
@@ -369,11 +499,45 @@ describe('worker utils', () => {
             subscription: { concurrency: 50 },
           },
         },
-      } as MedplumServerConfig;
+      } as ServerConfig;
 
-      const result = getWorkerBullmqConfig(config, 'subscription');
+      const result = getWorkerBullmqConfig(config, 'subscription', defaultOptions);
       expect(result).toStrictEqual({
+        ...defaultOptions,
         concurrency: 50,
+        removeOnComplete: { count: 1 },
+        removeOnFail: { count: 1 },
+      });
+    });
+
+    test('worker defaults supersede global bullmq config', () => {
+      const config = {
+        bullmq: { concurrency: 20, removeOnComplete: { count: 1 }, removeOnFail: { count: 1 } },
+      } as ServerConfig;
+
+      const result = getWorkerBullmqConfig(config, 'batch', defaultOptions, { concurrency: 1 });
+      expect(result).toStrictEqual({
+        ...defaultOptions,
+        concurrency: 1,
+        removeOnComplete: { count: 1 },
+        removeOnFail: { count: 1 },
+      });
+    });
+
+    test('per-worker overrides supersede worker defaults', () => {
+      const config = {
+        bullmq: { concurrency: 20, removeOnComplete: { count: 1 }, removeOnFail: { count: 1 } },
+        workers: {
+          bullmq: {
+            batch: { concurrency: 5 },
+          },
+        },
+      } as ServerConfig;
+
+      const result = getWorkerBullmqConfig(config, 'batch', defaultOptions, { concurrency: 1 });
+      expect(result).toStrictEqual({
+        ...defaultOptions,
+        concurrency: 5,
         removeOnComplete: { count: 1 },
         removeOnFail: { count: 1 },
       });
@@ -387,10 +551,10 @@ describe('worker utils', () => {
             subscription: { concurrency: 50 },
           },
         },
-      } as MedplumServerConfig;
+      } as ServerConfig;
 
-      const result = getWorkerBullmqConfig(config, 'download');
-      expect(result).toStrictEqual(config.bullmq);
+      const result = getWorkerBullmqConfig(config, 'download', defaultOptions);
+      expect(result).toStrictEqual({ ...defaultOptions, ...config.bullmq });
     });
   });
 });

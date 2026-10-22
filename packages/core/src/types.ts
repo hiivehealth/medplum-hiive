@@ -17,6 +17,20 @@ import type { InternalSchemaElement, InternalTypeSchema } from './typeschema/typ
 import { getAllDataTypes, tryGetDataType } from './typeschema/types';
 import { capitalize, EMPTY, getReferenceString, isResourceWithId } from './utils';
 
+/**
+ * Given a type `Reference<X>`, extracts `X`
+ *
+ * The input is constrained to references, so passing anything else is a compile error
+ * rather than a silently unhelpful type. `null` and `undefined` are allowed and pass
+ * through, so an optional reference field dereferences to an optional resource.
+ *
+ * The check is structural, though: this accepts anything assignable to `Reference`, an
+ * interface whose fields are all optional. Object types that are not true references are
+ * therefore accepted, and with no `resource` property to infer from, resolve to
+ * `Resource`, the default type argument of `Reference`.
+ */
+export type Dereference<T extends Reference | null | undefined> = T extends Reference<infer R> ? R : T;
+
 export type TypeName<T> = T extends string
   ? 'string'
   : T extends number
@@ -178,6 +192,8 @@ function getOrInitTypeSchema(resourceType: string): TypeInfo {
     globalSchema.types[resourceType] = typeSchema;
   }
 
+  let compartmentTargets: string[] | undefined; // Lazy-loaded
+
   // Binary has no search parameters; not even those inherited from Resource
   if (!typeSchema.searchParams && resourceType !== 'Binary') {
     typeSchema.searchParams = {
@@ -198,6 +214,13 @@ function getOrInitTypeSchema(resourceType: string): TypeInfo {
         code: '_compartment',
         type: 'reference',
         expression: resourceType + '.meta.compartment',
+        // Must be lazy-loaded: `getOrInitTypeSchema` runs to pre-populate
+        // each resource type's search parameters, before the entire list
+        // of resource types is available
+        get target(): string[] {
+          compartmentTargets ??= getResourceTypes();
+          return compartmentTargets;
+        },
       } as SearchParameter,
       _profile: {
         base: [resourceType],
@@ -366,7 +389,7 @@ export function getPropertyDisplayName(propertyName: string): string {
   return words.map(capitalizeDisplayWord).join(' ').replace('_', ' ').replaceAll(/\s+/g, ' ');
 }
 
-const capitalizedWords = new Set(['CDS', 'ID', 'IP', 'PKCE', 'JWKS', 'URI', 'URL', 'OMB', 'UDI']);
+const capitalizedWords = new Set(['CDS', 'ID', 'IP', 'JWKS', 'PKCE', 'OMB', 'OID', 'SOP', 'UDI', 'UID', 'URI', 'URL']);
 
 function capitalizeDisplayWord(word: string): string {
   const upper = word.toUpperCase();
@@ -430,6 +453,42 @@ export function getElementDefinitionFromElements(
 
   // Otherwise, no matches.
   return undefined;
+}
+
+export function getElementDefinitionForPath(
+  typeName: string,
+  path: string,
+  profileUrl?: string
+): InternalSchemaElement | undefined {
+  const pathParts = path.split(/[.[\]]/g);
+  const baseSchema = tryGetDataType(typeName, profileUrl);
+  if (!baseSchema) {
+    return undefined;
+  }
+
+  let currentType = baseSchema;
+  let currentElement: InternalSchemaElement | undefined;
+  for (const segment of pathParts) {
+    let next: InternalTypeSchema | undefined;
+    if (segment.match(/^[a-z]/)) {
+      const element = getElementDefinitionFromElements(currentType.elements, segment);
+      if (!element) {
+        return undefined;
+      }
+      if (element.type.length > 1) {
+        throw new Error('Multiple matching types in path ' + path);
+      }
+
+      next = tryGetDataType(element.type[0].code);
+      currentElement = element;
+    }
+
+    if (next) {
+      currentType = next;
+    }
+  }
+
+  return currentElement;
 }
 
 /**

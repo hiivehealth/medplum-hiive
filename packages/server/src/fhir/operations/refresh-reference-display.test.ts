@@ -8,7 +8,7 @@ import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
 import { createTestProject, withTestContext } from '../../test.setup';
-import type { Repository } from '../repo';
+import type { Repository, SystemRepository } from '../repo';
 
 describe('$refresh-reference-display', () => {
   const app = express();
@@ -16,7 +16,7 @@ describe('$refresh-reference-display', () => {
   let accessToken: string;
   let client: WithId<ClientApplication>;
   let accessPolicy: WithId<AccessPolicy>;
-  let systemRepo: Repository;
+  let systemRepo: SystemRepository;
 
   beforeAll(async () => {
     const config = await loadTestConfig();
@@ -82,7 +82,7 @@ describe('$refresh-reference-display', () => {
         .auth(accessToken, { type: 'bearer' })
         .set('X-Medplum', 'extended')
         .send();
-      expect(res.status).toBe(200);
+      expect(res).toHaveStatus(200);
       const updated = res.body as Observation;
 
       expect(updated.meta?.author?.display).toBe('Client!');
@@ -123,7 +123,7 @@ describe('$refresh-reference-display', () => {
         .auth(accessToken, { type: 'bearer' })
         .set('X-Medplum', 'extended')
         .send();
-      expect(res.status).toBe(200);
+      expect(res).toHaveStatus(200);
       const updated = res.body as Observation;
 
       expect(updated.subject?.display).toBe('Test Patient Jones-Smith');

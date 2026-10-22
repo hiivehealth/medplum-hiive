@@ -21,7 +21,6 @@ import type {
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { ReactNode } from 'react';
-import { MemoryRouter } from 'react-router';
 import { act, render, screen, userEvent } from '../test-utils/render';
 import { ResourcePropertyDisplay } from './ResourcePropertyDisplay';
 
@@ -116,11 +115,7 @@ describe('ResourcePropertyDisplay', () => {
   });
 
   test('Renders canonical', async () => {
-    await setup(
-      <MemoryRouter>
-        <ResourcePropertyDisplay propertyType={PropertyType.canonical} value="Patient/123" />
-      </MemoryRouter>
-    );
+    await setup(<ResourcePropertyDisplay propertyType={PropertyType.canonical} value="Patient/123" />);
 
     const el = screen.getByText('Patient/123');
     expect(el).toBeInTheDocument();
@@ -425,13 +420,11 @@ describe('ResourcePropertyDisplay', () => {
     };
 
     await setup(
-      <MemoryRouter>
-        <ResourcePropertyDisplay
-          property={{ ...baseProperty, type: [{ code: 'Reference' }] }}
-          propertyType={PropertyType.Reference}
-          value={value}
-        />
-      </MemoryRouter>
+      <ResourcePropertyDisplay
+        property={{ ...baseProperty, type: [{ code: 'Reference' }] }}
+        propertyType={PropertyType.Reference}
+        value={value}
+      />
     );
 
     expect(screen.getByText(value.display as string)).toBeInTheDocument();
@@ -481,6 +474,23 @@ describe('ResourcePropertyDisplay', () => {
     await expect(
       setup(<ResourcePropertyDisplay propertyType={PropertyType.BackboneElement} value={{}} />)
     ).rejects.toThrow('Displaying property of type BackboneElement requires element schema');
+  });
+
+  test('Primitive with extension but no value should render empty string', async () => {
+    console.warn = vi.fn();
+    await setup(
+      <ResourcePropertyDisplay
+        property={{ ...baseProperty, path: 'Patient.birthDate', type: [{ code: 'date' }] }}
+        propertyType={PropertyType.date}
+        value={{
+          extension: [{ url: 'http://hl7.org/fhir/StructureDefinition/data-absent-reason', valueCode: 'unknown' }],
+        }}
+      />
+    );
+    expect(console.warn).toHaveBeenCalledWith(
+      'Non-standard FHIR data or missing primitive value with extension',
+      expect.anything()
+    );
   });
 
   describe('Secret field functionality', () => {
@@ -557,7 +567,7 @@ describe('ResourcePropertyDisplay', () => {
 
       // Mock clipboard API
       const mockClipboard = {
-        writeText: jest.fn().mockResolvedValue(undefined),
+        writeText: vi.fn().mockResolvedValue(undefined),
       };
       Object.defineProperty(navigator, 'clipboard', {
         value: mockClipboard,
@@ -583,7 +593,7 @@ describe('ResourcePropertyDisplay', () => {
 
       // Mock clipboard API
       const mockClipboard = {
-        writeText: jest.fn().mockResolvedValue(undefined),
+        writeText: vi.fn().mockResolvedValue(undefined),
       };
       Object.defineProperty(navigator, 'clipboard', {
         value: mockClipboard,

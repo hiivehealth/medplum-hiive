@@ -3,7 +3,9 @@
 import type { Practitioner, User } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import express from 'express';
+import type * as Jose from 'jose';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { initApp, shutdownApp } from '../app';
 import { getConfig, loadTestConfig } from '../config/loader';
 import type { SystemRepository } from '../fhir/repo';
@@ -13,11 +15,11 @@ import { getUserByEmail } from '../oauth/utils';
 import { withTestContext } from '../test.setup';
 import { registerNew } from './register';
 
-jest.mock('jose', () => {
-  const original = jest.requireActual('jose');
+vi.mock('jose', async () => {
+  const original = await vi.importActual<typeof Jose>('jose');
   return {
     ...original,
-    jwtVerify: jest.fn((credential: string) => {
+    jwtVerify: vi.fn((credential: string) => {
       if (credential === 'invalid') {
         throw new Error('Verification failed');
       }
@@ -44,6 +46,7 @@ describe('Google Auth', () => {
 
   beforeEach(() => {
     getConfig().registerEnabled = undefined;
+    getConfig().requireVerifiedEmailForProjectCreation = undefined;
   });
 
   afterAll(async () => {
@@ -58,7 +61,7 @@ describe('Google Auth', () => {
         googleClientId: '',
         googleCredential: createCredential('Admin', 'Admin', 'admin@example.com'),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Missing googleClientId');
   });
@@ -71,7 +74,7 @@ describe('Google Auth', () => {
         googleClientId: '123',
         googleCredential: createCredential('Admin', 'Admin', 'admin@example.com'),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Invalid googleClientId');
   });
@@ -81,7 +84,7 @@ describe('Google Auth', () => {
       googleClientId: getConfig().googleClientId,
       googleCredential: '',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Missing googleCredential');
   });
@@ -91,7 +94,7 @@ describe('Google Auth', () => {
       googleClientId: getConfig().googleClientId,
       googleCredential: 'invalid',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Verification failed');
   });
@@ -104,7 +107,7 @@ describe('Google Auth', () => {
         googleClientId: getConfig().googleClientId,
         googleCredential: createCredential('Admin', 'Admin', 'admin@example.com'),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.code).toBeDefined();
   });
 
@@ -117,7 +120,7 @@ describe('Google Auth', () => {
         googleClientId: getConfig().googleClientId,
         googleCredential: createCredential('Test', 'Test', email),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
 
     const user = await getUserByEmail(email, undefined);
     expect(user).toBeUndefined();
@@ -135,7 +138,7 @@ describe('Google Auth', () => {
         createUser: true,
         projectId: 'new',
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Registration is disabled');
 
     const user = await getUserByEmail(email, undefined);
@@ -152,7 +155,7 @@ describe('Google Auth', () => {
         googleCredential: createCredential('Test', 'Test', email),
         createUser: true,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.login).toBeDefined();
     expect(res.body.code).toBeUndefined();
 
@@ -171,9 +174,10 @@ describe('Google Auth', () => {
         googleCredential: createCredential('Test', 'Test', email),
         createUser: true,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.login).toBeDefined();
     expect(res.body.code).toBeUndefined();
+    expect(res.body.emailVerificationRequired).toBeUndefined();
 
     const user = await getUserByEmail(email, undefined);
     expect(user).toBeDefined();
@@ -196,12 +200,190 @@ describe('Google Auth', () => {
         googleClientId: getConfig().googleClientId,
         googleCredential: createCredential('Test', 'Test', email),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.login).toBeDefined();
     expect(res.body.code).toBeUndefined();
 
     const user = await getUserByEmail(email, undefined);
     expect(user).toBeDefined();
+  });
+
+  test('Require email verification when Google has not verified email', async () => {
+    getConfig().requireVerifiedEmailForProjectCreation = true;
+    const email = 'new-google-' + randomUUID() + '@example.com';
+    const res = await request(app)
+      .post('/auth/google')
+      .type('json')
+      .send({
+        projectId: 'new',
+        googleClientId: getConfig().googleClientId,
+        googleCredential: createCredential('Test', 'Test', email, undefined, false),
+        createUser: true,
+      });
+    expect(res).toHaveStatus(200);
+    expect(res.body.login).toBeDefined();
+    expect(res.body.code).toBeUndefined();
+    expect(res.body.emailVerificationRequired).toBe(true);
+
+    const user = await getUserByEmail(email, undefined);
+    expect(user?.emailVerified).toBe(false);
+  });
+
+  test('Skip email verification when Google verified email', async () => {
+    getConfig().requireVerifiedEmailForProjectCreation = true;
+    const email = 'new-google-' + randomUUID() + '@example.com';
+    const res = await request(app)
+      .post('/auth/google')
+      .type('json')
+      .send({
+        projectId: 'new',
+        googleClientId: getConfig().googleClientId,
+        googleCredential: createCredential('Test', 'Test', email, undefined, true),
+        createUser: true,
+      });
+    expect(res).toHaveStatus(200);
+    expect(res.body.login).toBeDefined();
+    expect(res.body.emailVerificationRequired).toBeUndefined();
+
+    // Google's assertion is accepted, so the user can create a project immediately
+    const user = await getUserByEmail(email, undefined);
+    expect(user?.emailVerified).toBe(true);
+  });
+
+  test('Skip email verification for verified user', async () => {
+    getConfig().requireVerifiedEmailForProjectCreation = true;
+    const email = 'new-google-' + randomUUID() + '@example.com';
+    await systemRepo.createResource<User>({
+      resourceType: 'User',
+      firstName: 'Google',
+      lastName: 'Google',
+      email,
+      emailVerified: true,
+    });
+
+    const res = await request(app)
+      .post('/auth/google')
+      .type('json')
+      .send({
+        projectId: 'new',
+        googleClientId: getConfig().googleClientId,
+        googleCredential: createCredential('Test', 'Test', email),
+        createUser: true,
+      });
+    expect(res).toHaveStatus(200);
+    expect(res.body.login).toBeDefined();
+    expect(res.body.emailVerificationRequired).toBeUndefined();
+  });
+
+  test('Verify existing user when Google verified email', async () => {
+    getConfig().requireVerifiedEmailForProjectCreation = true;
+    const email = 'new-google-' + randomUUID() + '@example.com';
+    await systemRepo.createResource<User>({
+      resourceType: 'User',
+      firstName: 'Google',
+      lastName: 'Google',
+      email,
+    });
+
+    const res = await request(app)
+      .post('/auth/google')
+      .type('json')
+      .send({
+        projectId: 'new',
+        googleClientId: getConfig().googleClientId,
+        googleCredential: createCredential('Test', 'Test', email, undefined, true),
+        createUser: true,
+      });
+    expect(res).toHaveStatus(200);
+    expect(res.body.login).toBeDefined();
+    expect(res.body.emailVerificationRequired).toBeUndefined();
+
+    // An account that predates the claim is upgraded rather than left unverified
+    const user = await getUserByEmail(email, undefined);
+    expect(user?.emailVerified).toBe(true);
+  });
+
+  test('Do not un-verify a user when Google reports unverified', async () => {
+    getConfig().requireVerifiedEmailForProjectCreation = true;
+    const email = 'new-google-' + randomUUID() + '@example.com';
+    await systemRepo.createResource<User>({
+      resourceType: 'User',
+      firstName: 'Google',
+      lastName: 'Google',
+      email,
+      emailVerified: true,
+    });
+
+    const res = await request(app)
+      .post('/auth/google')
+      .type('json')
+      .send({
+        projectId: 'new',
+        googleClientId: getConfig().googleClientId,
+        googleCredential: createCredential('Test', 'Test', email, undefined, false),
+        createUser: true,
+      });
+    expect(res).toHaveStatus(200);
+    expect(res.body.emailVerificationRequired).toBeUndefined();
+
+    // A Medplum verification outranks a false claim and is never downgraded
+    const user = await getUserByEmail(email, undefined);
+    expect(user?.emailVerified).toBe(true);
+  });
+
+  test('Skip email verification on sign in', async () => {
+    getConfig().requireVerifiedEmailForProjectCreation = true;
+    const email = 'new-google-' + randomUUID() + '@example.com';
+    await systemRepo.createResource<User>({
+      resourceType: 'User',
+      firstName: 'Google',
+      lastName: 'Google',
+      email,
+    });
+
+    // Signing in is not registering, so an unverified user is not re-sent the link
+    const res = await request(app)
+      .post('/auth/google')
+      .type('json')
+      .send({
+        projectId: 'new',
+        googleClientId: getConfig().googleClientId,
+        googleCredential: createCredential('Test', 'Test', email),
+      });
+    expect(res).toHaveStatus(200);
+    expect(res.body.login).toBeDefined();
+    expect(res.body.emailVerificationRequired).toBeUndefined();
+  });
+
+  test('Skip email verification for existing project', async () => {
+    getConfig().requireVerifiedEmailForProjectCreation = true;
+    const project = await withTestContext(
+      async () =>
+        (
+          await registerNew({
+            firstName: 'Google',
+            lastName: 'Google',
+            projectName: 'Google Email Verification',
+            email: `google-owner${randomUUID()}@example.com`,
+            password: 'password!@#',
+          })
+        ).project
+    );
+
+    // Verification only gates new project creation, so joining an existing project
+    // does not send a link
+    const email = 'new-google-' + randomUUID() + '@example.com';
+    const res = await request(app)
+      .post('/auth/google')
+      .type('json')
+      .send({
+        projectId: project.id,
+        googleClientId: getConfig().googleClientId,
+        googleCredential: createCredential('Test', 'Test', email),
+        createUser: true,
+      });
+    expect(res).toHaveStatus(200);
+    expect(res.body.emailVerificationRequired).toBeUndefined();
   });
 
   test('Require Google auth', async () => {
@@ -234,7 +416,7 @@ describe('Google Auth', () => {
         googleClientId: getConfig().googleClientId,
         googleCredential: createCredential('Test', 'Test', email),
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
   });
 
@@ -272,7 +454,7 @@ describe('Google Auth', () => {
         googleClientId: getConfig().googleClientId,
         googleCredential: createCredential('Test', 'Test', email, 'https://example.com/picture.jpg'),
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
 
     // Now re-fetch the profile
@@ -318,7 +500,7 @@ describe('Google Auth', () => {
         googleClientId: googleClientId,
         googleCredential: createCredential('Test', 'Test', email),
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
   });
 
@@ -361,7 +543,7 @@ describe('Google Auth', () => {
         googleClientId: googleClientId,
         googleCredential: createCredential('Test', 'Test', email),
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeUndefined();
     expect(res2.body.login).toBeDefined();
     expect(res2.body.memberships).toBeDefined();
@@ -407,7 +589,7 @@ describe('Google Auth', () => {
         googleClientId: googleClientId,
         googleCredential: createCredential('Test', 'Test', email),
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
   });
 
   test('Custom Google client wrong projectId', async () => {
@@ -448,7 +630,7 @@ describe('Google Auth', () => {
         googleClientId: googleClientId,
         googleCredential: createCredential('Test', 'Test', email),
       });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue[0].details.text).toStrictEqual('Invalid googleClientId');
   });
 
@@ -475,7 +657,7 @@ describe('Google Auth', () => {
         googleClientId: getConfig().googleClientId,
         googleCredential: createCredential('Text', 'User', email),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.code).toBeDefined();
   });
 
@@ -502,11 +684,23 @@ describe('Google Auth', () => {
         googleClientId: getConfig().googleClientId,
         googleCredential: createCredential('Text', 'User', email),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Invalid projectId');
   });
 });
 
-function createCredential(firstName: string, lastName: string, email: string, picture?: string): string {
-  return JSON.stringify({ given_name: firstName, family_name: lastName, email, picture });
+function createCredential(
+  firstName: string,
+  lastName: string,
+  email: string,
+  picture?: string,
+  emailVerified?: boolean
+): string {
+  return JSON.stringify({
+    given_name: firstName,
+    family_name: lastName,
+    email,
+    picture,
+    email_verified: emailVerified,
+  });
 }

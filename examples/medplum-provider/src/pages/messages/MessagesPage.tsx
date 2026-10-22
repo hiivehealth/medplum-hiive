@@ -2,14 +2,16 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { SearchRequest } from '@medplum/core';
 import { formatSearchQuery, getReferenceString, Operator } from '@medplum/core';
-import type { Communication, DocumentReference, Reference } from '@medplum/fhirtypes';
+import type { Communication, DocumentReference, Patient, Reference } from '@medplum/fhirtypes';
 import { createPharmaciesSection, getDefaultSections, ThreadInbox } from '@medplum/react';
 import { useMedplum } from '@medplum/react-hooks';
 import type { JSX } from 'react';
-import { useEffect, useMemo } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useLocation, useNavigate, useParams } from 'react-router';
 import { usePharmacyDialog } from '../../components/pharmacy/usePharmacyDialog';
+import { useNewInUrl } from '../../hooks/useNewInUrl';
 import { normalizeCommunicationSearch } from '../../utils/communication-search';
+import { usePatientActionsMenu } from '../patient/usePatientActionsMenu';
 import classes from './MessagesPage.module.css';
 /**
  * Fetches
@@ -21,6 +23,8 @@ export function MessagesPage(): JSX.Element {
   const location = useLocation();
   const medplum = useMedplum();
   const PharmacyDialogComponent = usePharmacyDialog();
+  const [threadPatient, setThreadPatient] = useState<Reference<Patient>>();
+  const { headerMenuItems, actionsModals, openEditModal } = usePatientActionsMenu(threadPatient);
 
   const currentSearch = useMemo(() => (location.search ? location.search.substring(1) : ''), [location.search]);
 
@@ -32,16 +36,24 @@ export function MessagesPage(): JSX.Element {
     [currentSearch]
   );
 
+  const basePath = messageId ? `/Communication/${messageId}` : '/Communication';
+  const {
+    isNew: isNewMessage,
+    openNew: onNewTopicOpen,
+    closeNew: onNewTopicClose,
+  } = useNewInUrl(basePath, formatSearchQuery(parsedSearch));
+
   useEffect(() => {
     const isDetailView = Boolean(messageId);
     if (!isDetailView && normalizedSearch !== currentSearch) {
       const prefix = normalizedSearch ? `?${normalizedSearch}` : '';
-      navigate(`/Communication${prefix}`, { replace: true })?.catch(console.error);
+      navigate(`${isNewMessage ? `${basePath}/new` : basePath}${prefix}`, { replace: true })?.catch(console.error);
     }
-  }, [currentSearch, navigate, normalizedSearch, messageId]);
+  }, [currentSearch, navigate, normalizedSearch, messageId, isNewMessage, basePath]);
 
   const onChange = (search: SearchRequest): void => {
-    navigate(`/Communication${formatSearchQuery(search)}`)?.catch(console.error);
+    // Keep the selected thread open when the list search changes (pagination, filters)
+    navigate(`${basePath}${formatSearchQuery(search)}`)?.catch(console.error);
   };
 
   const getThreadUri = (topic: Communication): string => {
@@ -71,6 +83,10 @@ export function MessagesPage(): JSX.Element {
     navigate(getThreadUri(message))?.catch(console.error);
   };
 
+  const onSelectFirst = (thread: Communication): void => {
+    navigate(getThreadUri(thread), { replace: true })?.catch(console.error);
+  };
+
   const onViewInDocuments = (reference: Reference<DocumentReference>): void => {
     medplum
       .readReference(reference)
@@ -84,14 +100,23 @@ export function MessagesPage(): JSX.Element {
 
   return (
     <div className={classes.container}>
+      {actionsModals}
       <ThreadInbox
         threadId={messageId}
         query={formatSearchQuery(parsedSearch).substring(1)}
         showPatientSummary={true}
         sections={sections}
+        patientHeaderMenuItems={headerMenuItems}
+        patientHeaderLink={threadPatient}
+        onEditPatient={openEditModal}
+        onPatientChange={setThreadPatient}
         allowPatientSelection={true}
         onNew={onNew}
+        onSelectFirst={onSelectFirst}
         getThreadUri={getThreadUri}
+        newTopicOpened={isNewMessage}
+        onNewTopicOpen={onNewTopicOpen}
+        onNewTopicClose={onNewTopicClose}
         onViewInDocuments={onViewInDocuments}
         onChange={onChange}
         inProgressUri={inProgressUri}

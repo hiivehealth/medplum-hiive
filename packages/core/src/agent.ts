@@ -83,12 +83,76 @@ export interface AgentUpgradeResponse extends BaseAgentMessage {
 export interface AgentLogsRequest extends BaseAgentRequestMessage {
   type: 'agent:logs:request';
   limit?: number;
+  /**
+   * Opaque pagination cursor. Pass the `nextBefore` value from a previous
+   * response to fetch the next (older) page; treat it as an opaque token rather
+   * than parsing it. Logs are read across all rotated log files, not just the
+   * most recent one.
+   */
+  before?: string;
 }
 
 export interface AgentLogsResponse extends BaseAgentMessage {
   type: 'agent:logs:response';
   statusCode: number;
   logs: LogMessage[];
+  /** Whether more (older) log entries exist beyond the ones returned in this page. */
+  hasMore: boolean;
+  /**
+   * Opaque cursor to pass as `before` in a subsequent request to fetch the next
+   * older page. Only present when `hasMore` is true.
+   */
+  nextBefore?: string;
+}
+
+export type AgentRttStats = {
+  count: number;
+  min: number;
+  max: number;
+  average: number;
+  p50: number;
+  p95: number;
+  p99: number;
+  pendingCount: number;
+};
+
+export type AgentChannelStats = {
+  rtt: AgentRttStats;
+};
+
+export type AgentStatPrimitiveValue = string | boolean | number;
+export type AgentStatValue =
+  | AgentStatPrimitiveValue
+  | Record<
+      string,
+      AgentStatPrimitiveValue | Record<string, AgentStatPrimitiveValue | Record<string, AgentStatPrimitiveValue>>
+    >;
+
+/**
+ * Statistics about the running agent. Known fields are typed; additional
+ * fields may be present and are preserved as unknown values.
+ */
+export interface AgentStats {
+  hl7ConnectionsOpen: number;
+  ping: number;
+  webSocketQueueDepth: number;
+  hl7QueueDepth: number;
+  hl7ClientCount: number;
+  live: boolean;
+  outstandingHeartbeats: number;
+  channelStats: Record<string, AgentChannelStats>;
+  clientStats: Record<string, AgentChannelStats>;
+  [key: string]: AgentStatValue;
+}
+
+export interface AgentStatsRequest extends BaseAgentRequestMessage {
+  type: 'agent:stats:request';
+}
+
+export interface AgentStatsResponse extends BaseAgentMessage {
+  type: 'agent:stats:response';
+  statusCode: number;
+  stats: AgentStats;
 }
 
 export type AgentRequestMessage =
@@ -97,7 +161,8 @@ export type AgentRequestMessage =
   | AgentTransmitRequest
   | AgentReloadConfigRequest
   | AgentUpgradeRequest
-  | AgentLogsRequest;
+  | AgentLogsRequest
+  | AgentStatsRequest;
 
 export type AgentResponseMessage =
   | AgentConnectResponse
@@ -106,6 +171,7 @@ export type AgentResponseMessage =
   | AgentReloadConfigResponse
   | AgentUpgradeResponse
   | AgentLogsResponse
+  | AgentStatsResponse
   | AgentError;
 
 export type AgentMessage = AgentRequestMessage | AgentResponseMessage;

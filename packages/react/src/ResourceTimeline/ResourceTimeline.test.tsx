@@ -5,7 +5,6 @@ import { createReference } from '@medplum/core';
 import type { Attachment, Bundle, Encounter, Resource, ResourceType } from '@medplum/fhirtypes';
 import { HomerEncounter, MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
-import { MemoryRouter } from 'react-router';
 import { act, fireEvent, render, screen, waitFor } from '../test-utils/render';
 import type { ResourceTimelineProps } from './ResourceTimeline';
 import { ResourceTimeline } from './ResourceTimeline';
@@ -28,11 +27,9 @@ describe('ResourceTimeline', () => {
   async function setup<T extends Resource>(args: ResourceTimelineProps<T>): Promise<void> {
     await act(async () => {
       render(
-        <MemoryRouter>
-          <MedplumProvider medplum={medplum}>
-            <ResourceTimeline {...args} />
-          </MedplumProvider>
-        </MemoryRouter>
+        <MedplumProvider medplum={medplum}>
+          <ResourceTimeline {...args} />
+        </MedplumProvider>
       );
     });
   }
@@ -47,6 +44,28 @@ describe('ResourceTimeline', () => {
 
     const items = screen.getAllByTestId('timeline-item');
     expect(items).toBeDefined();
+  });
+
+  test('Shows skeleton while loading, then hides it', async () => {
+    let resolveLoad: (value: PromiseSettledResult<Bundle>[]) => void = () => undefined;
+    const pendingLoad = new Promise<PromiseSettledResult<Bundle>[]>((resolve) => {
+      resolveLoad = resolve;
+    });
+
+    await setup({
+      value: HomerEncounter,
+      loadTimelineResources: () => pendingLoad,
+    });
+
+    expect(screen.getAllByTestId('timeline-item-skeleton').length).toBeGreaterThan(0);
+    expect(screen.queryByTestId('timeline-item')).toBeNull();
+
+    await act(async () => {
+      resolveLoad(await loadTimelineResources(medplum, 'Encounter', HomerEncounter.id as string));
+    });
+
+    await waitFor(() => screen.getAllByTestId('timeline-item'));
+    expect(screen.queryByTestId('timeline-item-skeleton')).toBeNull();
   });
 
   test('Renders resource', async () => {
@@ -103,7 +122,7 @@ describe('ResourceTimeline', () => {
     await setup({
       value: HomerEncounter,
       loadTimelineResources,
-      createCommunication: jest.fn(),
+      createCommunication: vi.fn(),
       createMedia: (resource: Encounter, operator: ProfileResource, content: Attachment) => ({
         resourceType: 'Media',
         status: 'completed',

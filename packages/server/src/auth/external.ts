@@ -5,14 +5,16 @@ import {
   concatUrls,
   ContentType,
   encodeBase64,
+  isString,
   OAuthGrantType,
   OAuthTokenAuthMethod,
   OperationOutcomeError,
   parseJWTPayload,
+  resolveId,
 } from '@medplum/core';
-import type { ClientApplication, DomainConfiguration, IdentityProvider, Project } from '@medplum/fhirtypes';
+import type { ClientApplication, DomainConfiguration, IdentityProvider, Project, User } from '@medplum/fhirtypes';
 import type { Request, Response } from 'express';
-import fetch from 'node-fetch';
+import { createRemoteJWKSet, customFetch, jwtVerify } from 'jose';
 import { randomUUID } from 'node:crypto';
 import { getConfig } from '../config/loader';
 import { sendOutcome } from '../fhir/outcomes';
@@ -21,6 +23,7 @@ import { getLogger, globalLogger } from '../logger';
 import { getClientRedirectUri } from '../oauth/clients';
 import type { CodeChallengeMethod } from '../oauth/utils';
 import { getClientApplication, tryLogin } from '../oauth/utils';
+import { safeFetch } from '../util/url';
 import { getDomainConfiguration } from './method';
 
 /*
@@ -30,6 +33,7 @@ import { getDomainConfiguration } from './method';
 
 export interface ExternalAuthState {
   domain?: string;
+  issuer?: string;
   projectId?: string;
   clientId?: string;
   scope?: string;
@@ -39,6 +43,14 @@ export interface ExternalAuthState {
   codeChallengeMethod?: CodeChallengeMethod;
   redirectUri?: string;
   returnTo?: string;
+}
+
+type IdentitySource = NonNullable<IdentityProvider['identitySource']>;
+type IdentityMappingMode = NonNullable<IdentityProvider['identityMappingMode']>;
+
+interface ExternalLoginIdentity {
+  email?: string;
+  externalId?: string;
 }
 
 export async function externalCallbackHandler(req: Request, res: Response): Promise<void> {
@@ -75,23 +87,18 @@ export async function externalCallbackHandler(req: Request, res: Response): Prom
 
   const userInfo = await verifyExternalCode(idp, code, body.codeChallenge);
 
-  let email: string | undefined = undefined;
-  let externalId: string | undefined = undefined;
-  if (idp.useSubject) {
-    externalId = userInfo.sub as string | undefined;
-    if (!externalId) {
-      sendOutcome(res, badRequest('External token does not contain subject'));
+  let identity: ExternalLoginIdentity;
+  try {
+    identity = await resolveExternalLoginIdentity(idp, userInfo);
+  } catch (err) {
+    if (err instanceof OperationOutcomeError) {
+      sendOutcome(res, err.outcome);
       return;
     }
-  } else {
-    email = (userInfo.email as string | undefined)?.toLowerCase();
-    if (!email) {
-      sendOutcome(res, badRequest('External token does not contain email address'));
-      return;
-    }
+    throw err;
   }
 
-  if (body.domain && !email?.endsWith('@' + body.domain)) {
+  if (body.domain && !identity.email?.endsWith('@' + body.domain)) {
     sendOutcome(res, badRequest('Email address does not match domain'));
     return;
   }
@@ -107,11 +114,11 @@ export async function externalCallbackHandler(req: Request, res: Response): Prom
 
   const login = await tryLogin({
     authMethod: 'external',
-    email,
-    externalId,
+    email: identity.email,
+    externalId: identity.externalId,
     projectId,
     clientId: body.clientId,
-    scope: body.scope ?? 'openid offline',
+    scope: body.scope ?? 'openid offline_access',
     nonce: body.nonce ?? randomUUID(),
     launchId: body.launch,
     codeChallenge: body.codeChallenge,
@@ -119,6 +126,11 @@ export async function externalCallbackHandler(req: Request, res: Response): Prom
     remoteAddress: req.ip,
     userAgent: req.get('User-Agent'),
   });
+
+  // The identity provider authenticated the user, which is the control this flag records.
+  await getGlobalSystemRepo().patchResource<User>('User', resolveId(login.user) as string, [
+    { op: 'add', path: '/emailVerified', value: true },
+  ]);
 
   if (login.membership && body.redirectUri && client) {
     // Get the redirect URI from the client application
@@ -194,7 +206,53 @@ async function getIdentityProvider(
     idp = domainConfig.identityProvider;
   }
 
+  if (!idp && state.issuer) {
+    idp = getConfig().externalAuthProviders?.find((provider) => provider.issuer === state.issuer)?.identityProvider;
+  }
+
   return { idp, client };
+}
+
+async function resolveExternalLoginIdentity(
+  idp: IdentityProvider,
+  userInfo: Record<string, unknown>
+): Promise<ExternalLoginIdentity> {
+  const identitySource = getIdentitySource(idp);
+  const identityMappingMode = getIdentityMappingMode(idp);
+
+  if (identitySource === 'email' && identityMappingMode === 'user-email') {
+    let email: string | undefined;
+    if (isString(userInfo.email)) {
+      email = userInfo.email.toLowerCase();
+    }
+    if (!email) {
+      throw new OperationOutcomeError(badRequest('External token does not contain email address'));
+    }
+    return { email };
+  }
+
+  if (identitySource === 'subject' && identityMappingMode === 'project-membership-external-id') {
+    let externalId: string | undefined;
+    if (isString(userInfo.sub)) {
+      externalId = userInfo.sub;
+    }
+    if (!externalId) {
+      throw new OperationOutcomeError(badRequest('External token does not contain subject'));
+    }
+    return { externalId };
+  }
+
+  throw new OperationOutcomeError(badRequest('Unsupported identity provider configuration'));
+}
+
+function getIdentitySource(idp: IdentityProvider): IdentitySource {
+  // Fallback to preserve legacy behavior
+  return idp.identitySource ?? (idp.useSubject ? 'subject' : 'email');
+}
+
+function getIdentityMappingMode(idp: IdentityProvider): IdentityMappingMode {
+  // Fallback to preserve legacy behavior
+  return idp.identityMappingMode ?? (idp.useSubject ? 'project-membership-external-id' : 'user-email');
 }
 
 /**
@@ -209,8 +267,13 @@ async function verifyExternalCode(
   code: string,
   codeVerifier: string | undefined
 ): Promise<Record<string, unknown>> {
+  if (!idp.tokenUrl) {
+    throw new OperationOutcomeError(badRequest('Missing token URL for external identity provider'));
+  }
+
   const headers: HeadersInit = {
     Accept: ContentType.JSON,
+    'Accept-Encoding': 'identity',
     'Content-Type': ContentType.FORM_URL_ENCODED,
   };
 
@@ -224,6 +287,10 @@ async function verifyExternalCode(
   }
 
   if (idp.tokenAuthMethod === OAuthTokenAuthMethod.ClientSecretPost) {
+    if (!idp.clientId || !idp.clientSecret) {
+      throw new OperationOutcomeError(badRequest('Missing client ID or client secret for external identity provider'));
+    }
+
     params.append('client_id', idp.clientId);
     params.append('client_secret', idp.clientSecret);
   } else {
@@ -232,7 +299,7 @@ async function verifyExternalCode(
   }
 
   try {
-    const response = await fetch(idp.tokenUrl, {
+    const response = await safeFetch(idp.tokenUrl, {
       method: 'POST',
       headers,
       body: params.toString(),
@@ -245,11 +312,49 @@ async function verifyExternalCode(
       throw new OperationOutcomeError(badRequest('Failed to verify code - check your identity provider configuration'));
     }
 
-    return parseJWTPayload(responseBody.id_token);
+    return await verifyExternalIdToken(idp, responseBody.id_token);
   } catch (err: any) {
+    if (err instanceof OperationOutcomeError) {
+      // Preserve specific validation messages (e.g. from id_token verification).
+      throw err;
+    }
     globalLogger.warn('Unhandled error in external auth check', err);
     throw new OperationOutcomeError(badRequest('Failed to verify code - check your identity provider configuration'));
   }
+}
+
+/**
+ * Parses the id_token returned by the external identity provider, verifying its signature when a
+ * JWKS is available.
+ *
+ * When the identity provider publishes a JWKS (`jwksUrl`), the id_token signature and issuer are
+ * checked before the claims are read. The audience is checked against `idp.audience` when set,
+ * otherwise against `idp.clientId`, since an OIDC id_token is audienced to the client it was issued
+ * for. Providers without a configured `jwksUrl` retain the existing behavior of relying on the
+ * server-to-server token endpoint response; configuring `jwksUrl` (and `issuer`) is recommended so
+ * that claims are cryptographically verified.
+ * @param idp - The identity provider configuration.
+ * @param idToken - The raw id_token from the token endpoint response.
+ * @returns The id_token claims.
+ */
+async function verifyExternalIdToken(idp: IdentityProvider, idToken: unknown): Promise<Record<string, unknown>> {
+  if (!isString(idToken)) {
+    throw new OperationOutcomeError(badRequest('Missing id_token in external identity provider response'));
+  }
+
+  if (idp.jwksUrl) {
+    if (!idp.issuer) {
+      throw new OperationOutcomeError(badRequest('Missing issuer for external identity provider'));
+    }
+    const jwks = createRemoteJWKSet(new URL(idp.jwksUrl), { [customFetch]: safeFetch });
+    const { payload } = await jwtVerify(idToken, jwks, {
+      issuer: idp.issuer,
+      audience: idp.audience ?? idp.clientId,
+    });
+    return payload;
+  }
+
+  return parseJWTPayload(idToken);
 }
 
 /**

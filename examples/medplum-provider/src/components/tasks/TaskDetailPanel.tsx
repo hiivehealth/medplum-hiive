@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { Box, Paper, ScrollArea, SegmentedControl, Text } from '@mantine/core';
+import { Box, Flex, Paper, ScrollArea, SegmentedControl, Text } from '@mantine/core';
 import type { MedplumClient } from '@medplum/core';
 import type { Patient, Reference, ResourceType, Task } from '@medplum/fhirtypes';
 import {
@@ -13,8 +13,11 @@ import {
 } from '@medplum/react';
 import type { JSX } from 'react';
 import { useEffect, useState } from 'react';
+import { usePatientActionsMenu } from '../../pages/patient/usePatientActionsMenu';
 import { showErrorNotification } from '../../utils/notifications';
 import { usePharmacyDialog } from '../pharmacy/usePharmacyDialog';
+import { ScriptSureMessageTaskActions } from './ScriptSureMessageTaskActions';
+import { isScriptSureMessageTask } from './ScriptSureMessageTaskActions.utils';
 import classes from './TaskBoard.module.css';
 import { TaskInputNote } from './TaskInputNote';
 import { TaskProperties } from './TaskProperties';
@@ -41,6 +44,7 @@ export function TaskDetailPanel(props: TaskDetailPanelProps): JSX.Element | null
 
   const patientRef = task?.for as Reference<Patient>;
   const selectedPatient = useResource<Patient>(patientRef);
+  const { headerMenuItems, actionsModals, openEditModal } = usePatientActionsMenu(selectedPatient);
 
   if (!task) {
     return (
@@ -52,6 +56,11 @@ export function TaskDetailPanel(props: TaskDetailPanelProps): JSX.Element | null
 
   const handleTaskChange = async (updatedTask: Task): Promise<void> => {
     await medplum.updateResource(updatedTask);
+    setTask(updatedTask);
+    onTaskChange?.(updatedTask);
+  };
+
+  const handleServerTaskChange = (updatedTask: Task): void => {
     setTask(updatedTask);
     onTaskChange?.(updatedTask);
   };
@@ -84,18 +93,34 @@ export function TaskDetailPanel(props: TaskDetailPanelProps): JSX.Element | null
 
   return (
     <>
+      {actionsModals}
       <Box
         h="100%"
         style={{
           flex: 1,
+          minWidth: 0,
+          overflow: 'hidden',
         }}
         className={classes.borderRight}
       >
-        <TaskInputNote
-          task={task}
-          onTaskChange={handleTaskChange}
-          onDeleteTask={onDeleteTask ? handleDeleteTask : undefined}
-        />
+        {isScriptSureMessageTask(task) ? (
+          <Flex direction="column" h="100%">
+            <ScriptSureMessageTaskActions task={task} onTaskChange={handleServerTaskChange} />
+            <Box flex={1} mih={0}>
+              <TaskInputNote
+                task={task}
+                onTaskChange={handleTaskChange}
+                onDeleteTask={onDeleteTask ? handleDeleteTask : undefined}
+              />
+            </Box>
+          </Flex>
+        ) : (
+          <TaskInputNote
+            task={task}
+            onTaskChange={handleTaskChange}
+            onDeleteTask={onDeleteTask ? handleDeleteTask : undefined}
+          />
+        )}
       </Box>
 
       <Box h="100%" w="400px">
@@ -130,12 +155,18 @@ export function TaskDetailPanel(props: TaskDetailPanelProps): JSX.Element | null
               </ScrollArea>
             )}
             {activeTab === 'patient-summary' && selectedPatient?.resourceType === 'Patient' && (
-              <ScrollArea h="calc(100vh - 120px)">
+              <ScrollArea
+                h="calc(100vh - 120px)"
+                bg="light-dark(var(--mantine-color-white), var(--mantine-color-body))"
+              >
                 <PatientSummary
                   patient={selectedPatient}
                   sections={getDefaultSections().map((s) =>
                     s.key === 'pharmacies' ? createPharmaciesSection(PharmacyDialogComponent) : s
                   )}
+                  headerMenuItems={headerMenuItems}
+                  headerLink={selectedPatient}
+                  onEditPatient={openEditModal}
                 />
               </ScrollArea>
             )}

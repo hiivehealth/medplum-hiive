@@ -6,7 +6,7 @@ import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { initTestAuth } from '../../test.setup';
+import { getSuperAdminAccessToken } from '../../test.setup';
 
 const app = express();
 const system = 'http://terminology.hl7.org/CodeSystem/v3-RoleCode';
@@ -18,7 +18,7 @@ describe('CodeSystem subsumes', () => {
     const config = await loadTestConfig();
     await initApp(app, config);
 
-    accessToken = await initTestAuth({ superAdmin: true });
+    accessToken = await getSuperAdminAccessToken();
     expect(accessToken).toBeDefined();
   });
 
@@ -39,7 +39,7 @@ describe('CodeSystem subsumes', () => {
           { name: 'codeB', valueCode: 'ITWINBRO' },
         ],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toStrictEqual('Parameters');
     const output = res2.body as Parameters;
     expect(output.parameter?.find((p) => p.name === 'outcome')?.valueCode).toBe('subsumes');
@@ -58,7 +58,7 @@ describe('CodeSystem subsumes', () => {
           { name: 'codeB', valueCode: 'SIGOTHR' },
         ],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toStrictEqual('Parameters');
     const output = res2.body as Parameters;
     expect(output.parameter?.find((p) => p.name === 'outcome')?.valueCode).toBe('subsumed-by');
@@ -77,7 +77,7 @@ describe('CodeSystem subsumes', () => {
           { name: 'codeB', valueCode: 'INLAW' },
         ],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toStrictEqual('Parameters');
     const output = res2.body as Parameters;
     expect(output.parameter?.find((p) => p.name === 'outcome')?.valueCode).toBe('equivalent');
@@ -96,7 +96,7 @@ describe('CodeSystem subsumes', () => {
           { name: 'codeB', valueCode: 'VET' },
         ],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toStrictEqual('Parameters');
     const output = res2.body as Parameters;
     expect(output.parameter?.find((p) => p.name === 'outcome')?.valueCode).toBe('not-subsumed');
@@ -114,7 +114,7 @@ describe('CodeSystem subsumes', () => {
           { name: 'codeA', valueCode: 'SIB' },
         ],
       });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.resourceType).toStrictEqual('OperationOutcome');
   });
 
@@ -123,7 +123,7 @@ describe('CodeSystem subsumes', () => {
       .get(`/fhir/R4/CodeSystem/$subsumes?system=${system}&codeA=SIB&codeB=ITWINBRO`)
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toStrictEqual('Parameters');
     const output = res2.body as Parameters;
     expect(output.parameter?.find((p) => p.name === 'outcome')?.valueCode).toBe('subsumes');
@@ -134,7 +134,7 @@ describe('CodeSystem subsumes', () => {
       .get(`/fhir/R4/CodeSystem?url=${system}`)
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.resourceType).toStrictEqual('Bundle');
     const codeSystem = (res.body as Bundle).entry?.[0]?.resource;
 
@@ -142,7 +142,7 @@ describe('CodeSystem subsumes', () => {
       .get(`/fhir/R4/CodeSystem/${codeSystem?.id}/$subsumes?codeA=SIB&codeB=ITWINBRO`)
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toStrictEqual('Parameters');
     const output = res2.body as Parameters;
     expect(output.parameter?.find((p) => p.name === 'outcome')?.valueCode).toBe('subsumes');

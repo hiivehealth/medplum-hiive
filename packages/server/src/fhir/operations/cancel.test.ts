@@ -1,0 +1,343 @@
+// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+// SPDX-License-Identifier: Apache-2.0
+import type { WithId } from '@medplum/core';
+import {
+  HTTP_TERMINOLOGY_HL7_ORG,
+  createReference,
+  parseSearchRequest,
+  toServiceTypeCodeableConcepts,
+} from '@medplum/core';
+import type { Appointment, HealthcareService, Parameters, Practitioner, Schedule, Slot } from '@medplum/fhirtypes';
+import express from 'express';
+import supertest from 'supertest';
+import { initApp, shutdownApp } from '../../app';
+import { loadTestConfig } from '../../config/loader';
+import type { SystemRepository } from '../../fhir/repo';
+import type { TestProjectResult } from '../../test.setup';
+import { createTestProject } from '../../test.setup';
+
+const CANCELATION_REASON_SYSTEM = `${HTTP_TERMINOLOGY_HL7_ORG}/CodeSystem/appointment-cancellation-reason`;
+
+const app = express();
+const request = supertest(app);
+
+describe('Appointment/$cancel', () => {
+  let project: TestProjectResult<{ withAccessToken: true; withRepo: true }>;
+  let systemRepo: SystemRepository;
+  let practitioner: WithId<Practitioner>;
+  let schedule: WithId<Schedule>;
+
+  beforeAll(async () => {
+    const config = await loadTestConfig();
+    // try to be more resilient to concurrent tests touching the same tables
+    config.transactionAttempts = 5;
+    await initApp(app, config);
+    project = await createTestProject({ withAccessToken: true, withRepo: true });
+    systemRepo = project.repo.getSystemRepo();
+
+    practitioner = await systemRepo.createResource<Practitioner>({
+      resourceType: 'Practitioner',
+      meta: { project: project.project.id },
+    });
+
+    schedule = await systemRepo.createResource<Schedule>({
+      resourceType: 'Schedule',
+      actor: [createReference(practitioner)],
+      meta: { project: project.project.id },
+    });
+  });
+
+  afterAll(async () => {
+    await shutdownApp();
+  });
+
+  async function makeSlot(): Promise<WithId<Slot>> {
+    return systemRepo.createResource<Slot>({
+      resourceType: 'Slot',
+      status: 'busy',
+      start: '2026-05-15T14:00:00Z',
+      end: '2026-05-15T15:00:00Z',
+      schedule: createReference(schedule),
+      meta: { project: project.project.id },
+    });
+  }
+
+  async function makeAppointment(
+    status: Appointment['status'],
+    slots: WithId<Slot>[] = []
+  ): Promise<WithId<Appointment>> {
+    // Appointments that are not proposed/cancelled/waitlist require start and end
+    const noStartEnd: Appointment['status'][] = ['proposed', 'cancelled', 'waitlist'];
+    const needsDates = !noStartEnd.includes(status);
+    return systemRepo.createResource<Appointment>({
+      resourceType: 'Appointment',
+      status,
+      ...(needsDates ? { start: '2026-05-15T14:00:00Z', end: '2026-05-15T15:00:00Z' } : {}),
+      participant: [{ actor: createReference(practitioner), status: 'accepted' }],
+      slot: slots.map((slot) => createReference(slot)),
+      meta: { project: project.project.id },
+    });
+  }
+
+  test('Succeeds for a booked appointment', async () => {
+    const slot = await makeSlot();
+    const appointment = await makeAppointment('booked', [slot]);
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+  });
+
+  test('Succeeds for a pending appointment', async () => {
+    const slot = await makeSlot();
+    const appointment = await makeAppointment('pending', [slot]);
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+  });
+
+  test('Returns cancelled appointment', async () => {
+    const slot = await makeSlot();
+    const appointment = await makeAppointment('booked', [slot]);
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+
+    const updated = response.body as Appointment;
+    expect(updated).toMatchObject({ resourceType: 'Appointment', id: appointment.id, status: 'cancelled' });
+  });
+
+  test('Sets cancelation reason from a plain JSON body', async () => {
+    const appointment = await makeAppointment('booked');
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`)
+      .send({ cancelationReason: { coding: [{ system: CANCELATION_REASON_SYSTEM, code: 'pat' }], text: 'Patient' } });
+
+    expect(response).toHaveStatus(200);
+    expect(response.body).toMatchObject({
+      resourceType: 'Appointment',
+      status: 'cancelled',
+      cancelationReason: { coding: [{ system: CANCELATION_REASON_SYSTEM, code: 'pat' }], text: 'Patient' },
+    });
+  });
+
+  test('Sets cancelation reason from a Parameters body', async () => {
+    const appointment = await makeAppointment('booked');
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [
+          {
+            name: 'cancelationReason',
+            valueCodeableConcept: {
+              coding: [{ system: CANCELATION_REASON_SYSTEM, code: 'pat-cpp' }],
+              text: 'Patient: Canceled via Patient Portal',
+            },
+          },
+        ],
+      } satisfies Parameters);
+
+    expect(response).toHaveStatus(200);
+    expect(response.body).toMatchObject({
+      resourceType: 'Appointment',
+      status: 'cancelled',
+      cancelationReason: {
+        coding: [{ system: CANCELATION_REASON_SYSTEM, code: 'pat-cpp' }],
+        text: 'Patient: Canceled via Patient Portal',
+      },
+    });
+  });
+
+  test('Leaves cancelation reason unset when omitted', async () => {
+    const appointment = await makeAppointment('booked');
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+    expect(response.body).toMatchObject({ resourceType: 'Appointment', status: 'cancelled' });
+    expect(response.body.cancelationReason).toBeUndefined();
+  });
+
+  test('Deletes the referenced slot', async () => {
+    const slot = await makeSlot();
+    const appointment = await makeAppointment('booked', [slot]);
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+
+    const remaining = await systemRepo.searchResources<Slot>(parseSearchRequest(`Slot?_id=${slot.id}`));
+    expect(remaining).toHaveLength(0);
+  });
+
+  test('Deletes multiple slots', async () => {
+    const slot1 = await makeSlot();
+    const slot2 = await makeSlot();
+    const appointment = await makeAppointment('booked', [slot1, slot2]);
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+
+    const remaining = await systemRepo.searchResources<Slot>(parseSearchRequest(`Slot?_id=${slot1.id},${slot2.id}`));
+    expect(remaining).toHaveLength(0);
+  });
+
+  test('Succeeds for appointment with no slots', async () => {
+    const appointment = await makeAppointment('booked');
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+  });
+
+  test('Succeeds for an appointment belonging to an inactive HealthcareService', async () => {
+    // An appointment booked while the service was active must remain cancelable
+    // after the service is deactivated, even though $find/$book now reject it.
+    const inactiveService = await systemRepo.createResource<HealthcareService>({
+      resourceType: 'HealthcareService',
+      name: 'Inactive Visit',
+      active: false,
+      type: [{ coding: [{ system: 'https://example.com/fhir', code: 'inactive-visit' }] }],
+      meta: { project: project.project.id },
+    });
+    const serviceType = toServiceTypeCodeableConcepts(inactiveService);
+
+    const serviceSchedule = await systemRepo.createResource<Schedule>({
+      resourceType: 'Schedule',
+      actor: [createReference(practitioner)],
+      serviceType,
+      meta: { project: project.project.id },
+    });
+    const slot = await systemRepo.createResource<Slot>({
+      resourceType: 'Slot',
+      status: 'busy',
+      start: '2026-05-15T14:00:00Z',
+      end: '2026-05-15T15:00:00Z',
+      schedule: createReference(serviceSchedule),
+      serviceType,
+      meta: { project: project.project.id },
+    });
+    const appointment = await systemRepo.createResource<Appointment>({
+      resourceType: 'Appointment',
+      status: 'booked',
+      start: '2026-05-15T14:00:00Z',
+      end: '2026-05-15T15:00:00Z',
+      serviceType,
+      participant: [{ actor: createReference(practitioner), status: 'accepted' }],
+      slot: [createReference(slot)],
+      meta: { project: project.project.id },
+    });
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+    expect(response.body).toMatchObject({ resourceType: 'Appointment', id: appointment.id, status: 'cancelled' });
+  });
+
+  test('Succeeds for an appointment on a Schedule that has since been deactivated', async () => {
+    // An appointment booked while the schedule was active must remain cancelable
+    // after the schedule is deactivated, even though $find/$book now reject it.
+    const activeSchedule = await systemRepo.createResource<Schedule>({
+      resourceType: 'Schedule',
+      actor: [createReference(practitioner)],
+      meta: { project: project.project.id },
+    });
+    const slot = await systemRepo.createResource<Slot>({
+      resourceType: 'Slot',
+      status: 'busy',
+      start: '2026-05-15T14:00:00Z',
+      end: '2026-05-15T15:00:00Z',
+      schedule: createReference(activeSchedule),
+      meta: { project: project.project.id },
+    });
+    const appointment = await makeAppointment('booked', [slot]);
+    await systemRepo.updateResource<Schedule>({ ...activeSchedule, active: false });
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(200);
+    expect(response.body).toMatchObject({ resourceType: 'Appointment', id: appointment.id, status: 'cancelled' });
+
+    const remaining = await systemRepo.searchResources<Slot>(parseSearchRequest(`Slot?_id=${slot.id}`));
+    expect(remaining).toHaveLength(0);
+  });
+
+  test.each(['cancelled', 'fulfilled', 'noshow', 'entered-in-error'] as Appointment['status'][])(
+    'Returns 400 for non-cancelable status: %s',
+    async (status) => {
+      const appointment = await makeAppointment(status);
+
+      const response = await request
+        .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+        .set('Authorization', `Bearer ${project.accessToken}`);
+
+      expect(response.body).toMatchObject({
+        resourceType: 'OperationOutcome',
+        issue: [
+          {
+            severity: 'error',
+            code: 'invalid',
+            details: { text: `Appointment cannot be canceled in '${status}' status` },
+          },
+        ],
+      });
+      expect(response).toHaveStatus(400);
+    }
+  );
+
+  test('Returns 404 when appointment does not exist', async () => {
+    const response = await request
+      .post('/fhir/R4/Appointment/00000000-0000-0000-0000-000000000000/$cancel')
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(404);
+  });
+
+  test('Returns 400 when a referenced slot does not exist', async () => {
+    const appointment = await systemRepo.createResource<Appointment>({
+      resourceType: 'Appointment',
+      status: 'booked',
+      start: '2026-05-15T14:00:00Z',
+      end: '2026-05-15T15:00:00Z',
+      participant: [{ actor: createReference(practitioner), status: 'accepted' }],
+      slot: [{ reference: 'Slot/00000000-0000-0000-0000-000000000000' }],
+      meta: { project: project.project.id },
+    });
+
+    const response = await request
+      .post(`/fhir/R4/Appointment/${appointment.id}/$cancel`)
+      .set('Authorization', `Bearer ${project.accessToken}`);
+
+    expect(response).toHaveStatus(400);
+    expect(response.body).toMatchObject({
+      resourceType: 'OperationOutcome',
+      issue: [{ severity: 'error', code: 'invalid', details: { text: 'Loading slots failed' } }],
+    });
+  });
+});

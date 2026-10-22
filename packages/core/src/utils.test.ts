@@ -4,14 +4,17 @@ import type {
   Attachment,
   Bundle,
   CodeableConcept,
+  Coding,
   DeviceDeviceName,
   Observation,
   ObservationDefinition,
   Patient,
   Resource,
+  Slot,
   User,
 } from '@medplum/fhirtypes';
 import { vi } from 'vitest';
+import { HL7_V2_0203 } from './constants';
 import { ContentType } from './contenttype';
 import { OperationOutcomeError } from './outcomes';
 import { PropertyType } from './types';
@@ -20,12 +23,15 @@ import {
   addProfileToResource,
   arrayBufferToBase64,
   arrayBufferToHex,
+  assertNever,
   calculateAge,
   calculateAgeString,
   capitalize,
   codeableConceptMatchesToken,
   codingMatchesToken,
   concatUrls,
+  countBy,
+  countWhere,
   createReference,
   deepClone,
   deepEquals,
@@ -42,8 +48,10 @@ import {
   getDateProperty,
   getDisplayString,
   getExtension,
+  getExtensions,
   getExtensionValue,
   getIdentifier,
+  getIdentifierByType,
   getImageSrc,
   getPathDifference,
   getQueryString,
@@ -60,6 +68,7 @@ import {
   isValidHostname,
   lazy,
   mapByIdentifier,
+  MRN_IDENTIFIER_TYPE,
   NOOP,
   parseReference,
   preciseEquals,
@@ -76,7 +85,9 @@ import {
   sortStringArray,
   splitN,
   stringify,
+  sumBy,
   trimTrailingEmptyElements,
+  tryParseReference,
 } from './utils';
 
 if (typeof btoa === 'undefined') {
@@ -126,19 +137,33 @@ describe('Core Utils', () => {
     expect(resolveId({ reference: 'Patient/123' })).toBe('123');
   });
 
-  test('parseReference', () => {
+  test('parseReference and tryParseReference', () => {
     expect(() => parseReference(undefined)).toThrow(OperationOutcomeError);
-    expect(() => parseReference({})).toThrow(OperationOutcomeError);
-    expect(() => parseReference({ id: '123' })).toThrow(OperationOutcomeError);
-    expect(() => parseReference({ reference: 'Patient' })).toThrow(OperationOutcomeError);
-    expect(() => parseReference({ reference: '/' })).toThrow(OperationOutcomeError);
-    expect(() => parseReference({ reference: 'Patient/' })).toThrow(OperationOutcomeError);
-    expect(parseReference({ reference: 'Patient/123' })).toStrictEqual(['Patient', '123']);
+    expect(tryParseReference(undefined)).toBeUndefined();
 
-    // Destructuring test
-    const [resourceType, id] = parseReference({ reference: 'Patient/123' });
-    expect(resourceType).toStrictEqual('Patient');
-    expect(id).toStrictEqual('123');
+    expect(() => parseReference({})).toThrow(OperationOutcomeError);
+    expect(tryParseReference({})).toBeUndefined();
+
+    expect(() => parseReference({ id: '123' })).toThrow(OperationOutcomeError);
+    expect(tryParseReference({ id: '123' })).toBeUndefined();
+
+    expect(() => parseReference({ reference: 'Patient' })).toThrow(OperationOutcomeError);
+    expect(tryParseReference({ reference: 'Patient' })).toBeUndefined();
+
+    expect(() => parseReference({ reference: '/' })).toThrow(OperationOutcomeError);
+    expect(tryParseReference({ reference: '/' })).toBeUndefined();
+
+    expect(() => parseReference({ reference: 'Patient/' })).toThrow(OperationOutcomeError);
+    expect(tryParseReference({ reference: 'Patient/' })).toBeUndefined();
+
+    expect(() => parseReference({ reference: '#contained' })).toThrow(OperationOutcomeError);
+    expect(tryParseReference({ reference: '#contained' })).toBeUndefined();
+
+    expect(parseReference({ reference: 'Patient/123' })).toStrictEqual(['Patient', '123']);
+    expect(tryParseReference({ reference: 'Patient/123' })).toStrictEqual(['Patient', '123']);
+
+    expect(parseReference({ reference: 'Patient/123/_history/1' })).toStrictEqual(['Patient', '123']);
+    expect(tryParseReference({ reference: 'Patient/123/_history/1' })).toStrictEqual(['Patient', '123']);
   });
 
   test('isProfileResource', () => {
@@ -219,7 +244,65 @@ describe('Core Utils', () => {
         medicationCodeableConcept: { text: 'foo' },
       })
     ).toStrictEqual('foo');
+    expect(
+      getDisplayString({
+        resourceType: 'MedicationStatement',
+        status: 'active',
+        subject: { reference: 'Patient/123' },
+        medicationCodeableConcept: { coding: [{ display: 'Lisinopril 10 MG' }] },
+      })
+    ).toStrictEqual('Lisinopril 10 MG');
+    expect(
+      getDisplayString({
+        resourceType: 'DocumentReference',
+        status: 'current',
+        description: 'Patient-shared health summary',
+        content: [{ attachment: { contentType: 'application/pdf', data: '...' } }],
+      })
+    ).toStrictEqual('Patient-shared health summary');
+    expect(
+      getDisplayString({
+        resourceType: 'DocumentReference',
+        status: 'current',
+        type: { coding: [{ display: 'Patient summary Document' }] },
+        content: [{ attachment: { contentType: 'application/pdf', data: '...' } }],
+      })
+    ).toStrictEqual('Patient summary Document');
     expect(getDisplayString({ resourceType: 'PractitionerRole', code: [{ text: 'foo' }] })).toStrictEqual('foo');
+    expect(
+      getDisplayString({
+        resourceType: 'Appointment',
+        status: 'booked',
+        participant: [{ status: 'accepted' }],
+        serviceType: [{ text: 'Consultation' }],
+      })
+    ).toStrictEqual('Consultation');
+    expect(
+      getDisplayString({
+        resourceType: 'Appointment',
+        id: '123',
+        status: 'booked',
+        participant: [{ status: 'accepted' }],
+      })
+    ).toStrictEqual('Appointment/123');
+    expect(
+      getDisplayString({
+        resourceType: 'Slot',
+        id: '123',
+        status: 'free',
+        schedule: { reference: 'Schedule/123' },
+        start: '2021-06-01T12:00:00Z',
+        end: '2021-06-01T13:00:00Z',
+      })
+    ).toMatch(/2021.* - .*2021/);
+    expect(
+      getDisplayString({
+        resourceType: 'Slot',
+        id: '123',
+        status: 'free',
+        schedule: { reference: 'Schedule/123' },
+      } as Slot)
+    ).toStrictEqual('Slot/123');
     expect(
       getDisplayString({
         resourceType: 'Subscription',
@@ -565,6 +648,105 @@ describe('Core Utils', () => {
     ).toBeUndefined();
   });
 
+  test('Get identifier by type', () => {
+    const type: Coding = { system: 'http://example.com/types', code: 'MR' };
+    const typed = (coding: Coding[] | undefined, value: string): Patient => ({
+      resourceType: 'Patient',
+      identifier: [{ type: { coding }, value }],
+    });
+
+    expect(getIdentifierByType({} as unknown as Resource, type)).toBeUndefined();
+    expect(getIdentifierByType({ identifier: null } as unknown as Resource, type)).toBeUndefined();
+    expect(getIdentifierByType({ identifier: undefined } as unknown as Resource, type)).toBeUndefined();
+    expect(getIdentifierByType({ identifier: [] } as unknown as Resource, type)).toBeUndefined();
+    expect(getIdentifierByType({ identifier: {} } as unknown as Resource, type)).toBeUndefined();
+
+    // Non-array identifier is normalized to an array
+    expect(
+      getIdentifierByType(
+        { resourceType: 'SpecimenDefinition', identifier: { type: { coding: [type] }, value: 'y' } },
+        type
+      )
+    ).toStrictEqual('y');
+
+    expect(getIdentifierByType(typed([type], 'y'), type)).toStrictEqual('y');
+    expect(getIdentifierByType(typed([{ system: type.system, code: 'DL' }], 'y'), type)).toBeUndefined();
+    expect(getIdentifierByType(typed(undefined, 'y'), type)).toBeUndefined();
+    expect(getIdentifierByType(typed([], 'y'), type)).toBeUndefined();
+
+    // Right code, different system: must not match
+    expect(getIdentifierByType(typed([{ system: 'http://example.com/other', code: 'MR' }], 'y'), type)).toBeUndefined();
+    expect(getIdentifierByType(typed([{ code: 'MR' }], 'y'), type)).toBeUndefined();
+
+    // Multiple codings from the same system: any of them can match
+    expect(getIdentifierByType(typed([{ system: type.system, code: 'DL' }, type], 'y'), type)).toStrictEqual('y');
+
+    // Identifier with no type at all
+    expect(
+      getIdentifierByType({ resourceType: 'Patient', identifier: [{ system: 'x', value: 'y' }] }, type)
+    ).toBeUndefined();
+
+    // A malformed type argument matches nothing
+    expect(getIdentifierByType(typed([type], 'y'), {})).toBeUndefined();
+    expect(getIdentifierByType(typed([type], 'y'), { code: 'MR' })).toBeUndefined();
+    expect(getIdentifierByType(typed([type], 'y'), { system: type.system })).toBeUndefined();
+
+    // Multiple identifiers, only the later one matches
+    expect(
+      getIdentifierByType(
+        {
+          resourceType: 'Patient',
+          identifier: [
+            { system: 'x', value: 'first' },
+            { type: { coding: [{ system: 'http://example.com/other', code: 'MR' }] }, value: 'second' },
+            { type: { coding: [type] }, value: 'third' },
+          ],
+        },
+        type
+      )
+    ).toStrictEqual('third');
+
+    // First match wins
+    expect(
+      getIdentifierByType(
+        {
+          resourceType: 'Patient',
+          identifier: [
+            { type: { coding: [type] }, value: 'first' },
+            { type: { coding: [type] }, value: 'second' },
+          ],
+        },
+        type
+      )
+    ).toStrictEqual('first');
+  });
+
+  test('Get identifier by type - MRN', () => {
+    const patient: Patient = {
+      resourceType: 'Patient',
+      identifier: [
+        {
+          system: 'http://hospital.example.com/ssn',
+          type: { coding: [{ system: HL7_V2_0203, code: 'SS' }] },
+          value: '999-99-9999',
+        },
+        {
+          system: 'http://hospital.example.com/mrn',
+          type: { coding: [{ system: HL7_V2_0203, code: 'MR' }], text: 'Medical Record Number' },
+          value: 'MRN-12345',
+        },
+      ],
+      name: [{ given: ['Alice'], family: 'Smith' }],
+    };
+
+    expect(getIdentifierByType(patient, MRN_IDENTIFIER_TYPE)).toStrictEqual('MRN-12345');
+    expect(getIdentifierByType({ resourceType: 'Patient' }, MRN_IDENTIFIER_TYPE)).toBeUndefined();
+    expect(MRN_IDENTIFIER_TYPE).toStrictEqual({
+      system: 'http://terminology.hl7.org/CodeSystem/v2-0203',
+      code: 'MR',
+    });
+  });
+
   test('Set identifier', () => {
     const r1: Patient = { resourceType: 'Patient' };
     setIdentifier(r1, 'x', 'y');
@@ -684,6 +866,48 @@ describe('Core Utils', () => {
 
     expect(getExtension(resource, 'http://example.com')).toBe(resource.extension?.[0]);
     expect(getExtension(resource, 'http://example.com', 'key1')).toBe(resource.extension?.[0]?.extension?.[0]);
+  });
+
+  test('Get repeating extension objects', () => {
+    const resource: Patient = {
+      resourceType: 'Patient',
+      extension: [
+        { url: 'http://example.com/basic', valueString: 'abcde' },
+        {
+          url: 'http://example.com/complex',
+          extension: [
+            { url: 'key1', valueCode: 'foo' },
+            { url: 'key2', valueString: 'other' },
+            { url: 'key1', valueCode: 'bar' },
+          ],
+        },
+        {
+          url: 'http://example.com/complex',
+          extension: [{ url: 'key1', valueCode: 'baz' }],
+        },
+      ],
+    };
+
+    // Every match at one level.
+    expect(getExtensions(resource, 'http://example.com/complex')).toHaveLength(2);
+
+    // Repeats are gathered across every matching parent, not just the first. The getExtension call below is
+    // the deliberate contrast: given the same urls it reads one of the three, which is what this exists to fix.
+    expect(getExtensions(resource, ['http://example.com/complex', 'key1']).map((e) => e.valueCode)).toStrictEqual([
+      'foo',
+      'bar',
+      'baz',
+    ]);
+    expect(getExtension(resource, 'http://example.com/complex', 'key1')).toHaveProperty('valueCode', 'foo');
+
+    expect(getExtensions(resource, 'http://example.com/basic')).toStrictEqual([resource.extension?.[0]]);
+    expect(getExtensions(resource, 'http://example.com/missing')).toStrictEqual([]);
+    expect(getExtensions(resource, ['http://example.com/basic', 'nope'])).toStrictEqual([]);
+    // No URL to match, and inputs that hold no extensions at all.
+    expect(getExtensions(resource, [])).toStrictEqual([]);
+    expect(getExtensions(undefined, 'http://example.com/basic')).toStrictEqual([]);
+    const noExtensions: Patient = { resourceType: 'Patient' };
+    expect(getExtensions(noExtensions, 'http://example.com/basic')).toStrictEqual([]);
   });
 
   test('Stringify', () => {
@@ -1761,5 +1985,100 @@ describe('isDefined', () => {
     const input: (number | null | undefined)[] = [0, undefined, 1, null, 2];
     const result: number[] = input.filter(isDefined);
     expect(result).toEqual([0, 1, 2]);
+  });
+});
+
+describe('assertNever', () => {
+  test('throws with the unexpected value in the message', () => {
+    expect(() => {
+      // @ts-expect-error Testing assertNever violation
+      assertNever('oops');
+    }).toThrow('Unexpected value: "oops"');
+
+    // When receiving an object, make sure we don't emit the useless "[object Object]" string.
+    expect(() => {
+      // @ts-expect-error Testing assertNever violation
+      assertNever({ type: 'test' });
+    }).toThrow(`Unexpected value: {"type":"test"}`);
+  });
+
+  test('triggers typescript error when a union type is not fully handled', () => {
+    type MyUnion = 'a' | 'b' | 'c';
+
+    function handle(arg1: MyUnion): number {
+      if (arg1 === 'a') {
+        return 1;
+      }
+
+      if (arg1 === 'b') {
+        return 2;
+      }
+
+      // @ts-expect-error We didn't handle `c` from the union, so this assertion is flagged by the type checker
+      return assertNever(arg1);
+    }
+
+    expect(handle('a')).toBe(1);
+    expect(() => handle('c')).toThrow('Unexpected value: "c"');
+  });
+
+  test('is usable as an exhaustive check in a switch statement', () => {
+    type AB = 'a' | 'b';
+
+    function handle(x: AB): number {
+      switch (x) {
+        case 'a':
+          return 1;
+        case 'b':
+          return 2;
+        default:
+          return assertNever(x);
+      }
+    }
+
+    expect(handle('a')).toBe(1);
+    expect(handle('b')).toBe(2);
+  });
+});
+
+describe('sumBy', () => {
+  test('sums numbers', () => {
+    expect(sumBy([1, 2, 3], (x) => x)).toBe(6);
+  });
+
+  test('empty iterable is zero', () => {
+    expect(sumBy([], (x) => x)).toBe(0);
+  });
+
+  test('accepts non-array iterables', () => {
+    expect(sumBy(new Set([1, 2, 3]), (x) => x)).toBe(6);
+  });
+});
+
+describe('countWhere', () => {
+  test('counts matching elements', () => {
+    expect(countWhere([1, 2, 3], (x) => x > 1)).toBe(2);
+  });
+
+  test('empty iterable is zero', () => {
+    expect(countWhere([], () => true)).toBe(0);
+  });
+
+  test('accepts non-array iterables', () => {
+    expect(countWhere(new Set([1, 2, 3]), (x) => x > 1)).toBe(2);
+  });
+});
+
+describe('countBy', () => {
+  test('counts elements by key without zero-fill', () => {
+    expect(countBy(['a', 'b', 'a'], (x) => x)).toEqual({ a: 2, b: 1 });
+  });
+
+  test('empty iterable is empty map', () => {
+    expect(countBy([], (x) => x)).toEqual({});
+  });
+
+  test('accepts non-array iterables', () => {
+    expect(countBy(new Set(['a', 'b', 'a']), (x) => x)).toEqual({ a: 1, b: 1 });
   });
 });

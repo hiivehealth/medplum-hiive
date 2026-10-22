@@ -10,7 +10,9 @@ For a vendor-neutral overview of diagnostic ordering concepts and the FHIR data 
 
 This guide explains how laboratory orders work in the Medplum-Health Gorilla labs integration.
 
-The high-level workflow for sending laboratory & imaging orders is:
+This guide covers building an order form with Medplum's React components and `useHealthGorillaLabOrder` hook, using Medplum FHIR resources and `send-to-health-gorilla` to submit orders. The [Lab Ordering iFrame](./iframe.md) is an optional alternative that embeds Health Gorilla's hosted interface. Choose either approach for your ordering workflow; the form components and hook do not require the iframe bot.
+
+The high-level workflow for sending laboratory & imaging orders from a custom order form is:
 
 1. Present the provider with the appropriate lab order form (CPOE)
 2. Create the appropriate FHIR resources based on that information
@@ -113,7 +115,8 @@ const {
 | `setOrderNotes`                 | Adds notes/instructions for the lab                                                                             |
 | `createOrderBundle`             | Creates FHIR resources for the complete order                                                                   |
 | `setPerformingLab`              | Sets which lab will process the tests                                                                           |
-| `setPerformingLabAccountNumber` | Sets the clients lab account number to be used for selected lab (e.g. Quest account number)                     |
+| `setPerformingLabAccountNumber` | Overrides the practice-level lab account number for the order (see [Lab Account Numbers](#lab-account-numbers)) |
+| `setPerformingLabPhysicianAccountNumber` | Overrides the physician-level lab account number for the order (see [Lab Account Numbers](#lab-account-numbers)) |
 | `validateOrder`                 | Checks order for required fields and valid data                                                                 |
 
 #### Example
@@ -126,8 +129,6 @@ Lab Selection:
   loadOptions={searchAvailableLabs}
   onChange={(e) => {
     setPerformingLab(e.value as Organization);
-    // Account number can be hardcoded or dynamic
-    setPerformingLabAccountNumber(accountNumber);
   }}
 />
 ```
@@ -231,6 +232,67 @@ async function handleOrderCreation() {
 }
 ```
 
+## Lab Account Numbers
+
+Some labs (notably **Labcorp**) require account numbers to be included with each order. Account number requirements vary by lab—some require none, some require one, and some require both of the following:
+
+### Physician-level account number
+
+Stored as an `identifier` on the `Practitioner` resource with type `AN` and an `assigner` reference pointing to the performing lab's `Organization` in Medplum. The `send-to-health-gorilla` bot automatically reads this identifier and includes it in the order—no form input required.
+
+```json
+{
+  "resourceType": "Practitioner",
+  "identifier": [
+    {
+      "type": {
+        "coding": [{ "system": "http://terminology.hl7.org/CodeSystem/v2-0203", "code": "AN" }]
+      },
+      "value": "[PHYSICIAN_ACCOUNT_NUMBER]",
+      "assigner": { "reference": "Organization/[PERFORMING_LAB_ORGANIZATION_ID]" }
+    }
+  ]
+}
+```
+
+This storage model supports only one AN per (practitioner, lab) — a second `identifier` with the
+same `assigner` replaces the first on the next practitioner sync, it isn't added alongside it. If a
+practitioner needs to order under multiple physician-level accounts with the same lab (e.g. multiple
+clinic locations), you can override the account number at order time using
+`setPerformingLabPhysicianAccountNumber` from the `useHealthGorillaLabOrder` hook, instead of trying
+to store more than one account on the `Practitioner` resource:
+
+```tsx
+setPerformingLabPhysicianAccountNumber(selectedAccountNumber);
+```
+
+### Practice-level account number
+
+Stored as a nested extension on the `Practitioner` resource, keyed by lab. Each entry has a `lab` sub-extension (reference to the performing lab `Organization`) and a `value` sub-extension (the account number string). The bot automatically reads it and includes it in the order—no form input required.
+
+```json
+{
+  "resourceType": "Practitioner",
+  "extension": [
+    {
+      "url": "https://medplum.com/integrations/health-gorilla/lab-org-account",
+      "extension": [
+        { "url": "lab", "valueReference": { "reference": "Organization/[PERFORMING_LAB_ORGANIZATION_ID]" } },
+        { "url": "value", "valueString": "[PRACTICE_ACCOUNT_NUMBER]" }
+      ]
+    }
+  ]
+}
+```
+
+Multiple entries can be added per lab, and the bot will select the one matching the order's performing lab.
+
+If a practitioner orders under multiple practice-level accounts with the same lab (e.g. multiple clinic locations), you can override the account number at order time using `setPerformingLabAccountNumber` from the `useHealthGorillaLabOrder` hook:
+
+```tsx
+setPerformingLabAccountNumber(selectedAccountNumber);
+```
+
 ## FHIR Data Model
 
 Laboratory orders use a two-level hierarchy of FHIR resources, with a parent order containing multiple individual tests.
@@ -268,6 +330,8 @@ The parent order is represented by a `ServiceRequest` resource with the profile 
 - The ordering provider (`ServiceRequest.requester`)
 - The performing laboratory (`ServiceRequest.performer`)
 - Overall order status (`ServiceRequest.status`)
+- Diagnosis codes (`ServiceRequest.reasonCode`)
+- Minimum Patient demographic information (`ServiceRequest.subject`)
 - Shared documentation (`ServiceRequest.supportingInfo`)
 
 Each individual test within the order is represented by its own `ServiceRequest` resource that:
@@ -275,6 +339,50 @@ Each individual test within the order is represented by its own `ServiceRequest`
 - Links back to the parent order using `ServiceRequest.basedOn`
 - Contains the specific test code from the performing lab's compendium
 - Holds test-specific details, including Ask on Order Entry (AoE) questions.
+
+### Diagnosis codes
+
+ICD-10 diagnosis codes belong on the **parent** lab order as `ServiceRequest.reasonCode`. Child test `ServiceRequest` resources do not carry diagnoses; they only hold the lab test `code`.
+
+When using `useHealthGorillaLabOrder`, call `setDiagnoses` (or `addDiagnosis` / `removeDiagnosis`) with ICD-10 `CodeableConcept`s — typically from a `ValueSetAutocomplete` bound to `http://hl7.org/fhir/sid/icd-10-cm`. `createOrderBundle` passes that state into `createLabOrderBundle()`, which writes it to the parent order's `reasonCode`.
+
+If you build the order bundle yourself, set `reasonCode` on the parent order to ICD-10 `CodeableConcept`s before calling `$health-gorilla-send`. The `send-to-health-gorilla` bot reads `reasonCode` from the parent order and includes those codes on the outbound Health Gorilla `RequestGroup`. For Health Gorilla compatibility, it rewrites coding systems from `http://hl7.org/fhir/sid/icd-10-cm` to `http://hl7.org/fhir/sid/icd-10`.
+
+Diagnosis codes are especially important for Medicare orders (see [capture diagnosis codes for Medicare patients](/docs/integration/health-gorilla#show-abn-and-capture-diagnosis-codes-for-medicare-patients)).
+
+### Patient requirements
+
+The order's `ServiceRequest.subject` must reference a `Patient` that satisfies the **Medplum Health Gorilla Patient** profile (`https://medplum.com/profiles/integrations/health-gorilla/StructureDefinition/MedplumHealthGorillaPatient`). Before transmitting an order, `send-to-health-gorilla` validates and syncs that patient to Health Gorilla; missing required demographics cause the send to fail.
+
+| Requirement                 | FHIR path                                 | Notes                                                                                                                          |
+| --------------------------- | ----------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
+| Birth date                  | `Patient.birthDate`                       | Required                                                                                                                       |
+| Name                        | `Patient.name`                            | At least one name with `family` and at least one `given`                                                                       |
+| Address                     | `Patient.address`                         | At least one address with `line`, `city`, `state`, and `postalCode`. If `country` is omitted, the send bot defaults it to `US` |
+| Medical record number (MRN) | `Patient.identifier`                      | Exactly one identifier with type code `MR` (`http://terminology.hl7.org/CodeSystem/v2-0203`)                                   |
+| Phone                       | `Patient.telecom`                         | At least one phone with `use` of `home` or `mobile`                                                                            |
+| Sex                         | `Patient.gender` **or** US Core Birth Sex | Either `gender`, or the [US Core Birth Sex](http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex) extension        |
+
+Email and work phone are allowed by the profile but are not required to send an order.
+
+Example of the required MRN identifier:
+
+```json
+{
+  "type": {
+    "coding": [
+      {
+        "system": "http://terminology.hl7.org/CodeSystem/v2-0203",
+        "code": "MR"
+      }
+    ]
+  },
+  "system": "https://example.com/mrn",
+  "value": "123456"
+}
+```
+
+Use FHIR profile validation in your project so patients are complete at registration time, rather than discovering gaps only when an order is submitted.
 
 ### Supporting Resources
 
@@ -327,7 +435,7 @@ Orders progress through several states:
    - Cannot be reactivated
    - Set by the client application
 
-::: caution
+:::caution
 
 Important: Once an order becomes `active`, it cannot be modified in the lab's system, even if updated in Medplum.
 
@@ -343,7 +451,7 @@ Actions:
 
 1. Syncs patient and practitioner data with Health Gorilla
 2. Assigns Health Gorilla identifiers
-3. Transmits order with billing information
+3. Transmits order with billing information and diagnosis codes from `ServiceRequest.reasonCode`
 4. Updates order status
 5. Downloads and stores:
    - Requisition forms
@@ -351,7 +459,9 @@ Actions:
 
 ### split-order Bot
 
-In some cases, the `send-to-health-gorilla`, but will return an error as follows, asking for the order to be split and resubmitted.
+Some performing labs require a single multi-test order to be split into multiple requisitions before submission. That lab-side constraint is why the `split-order` bot exists: it is a Medplum preprocessing step that turns one parent order into the per-requisition orders Health Gorilla expects for those labs.
+
+When splitting is required, `send-to-health-gorilla` returns an error like the following, asking for the order to be split and resubmitted:
 
 ```ts
 {
@@ -380,7 +490,7 @@ In some cases, the `send-to-health-gorilla`, but will return an error as follows
 
 ```
 
-In this case, you can use the split order but to create new orders based off of the original. Each of these orders can then be submitted to `send-to-health-gorilla`
+In that case, use the `split-order` bot to create new orders from the original. Each of those orders can then be submitted to `send-to-health-gorilla`.
 
 Example payload:
 

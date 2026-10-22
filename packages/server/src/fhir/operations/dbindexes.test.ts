@@ -8,7 +8,8 @@ import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
 import { DatabaseMode, getDatabasePool } from '../../database';
-import { initTestAuth } from '../../test.setup';
+import { getSuperAdminAccessToken } from '../../test.setup';
+import { GLOBAL_SHARD_ID } from '../sharding';
 
 describe('dbgetginindexes', () => {
   const app = express();
@@ -18,10 +19,10 @@ describe('dbgetginindexes', () => {
   beforeAll(async () => {
     const config = await loadTestConfig();
     await initApp(app, config);
-    accessToken = await initTestAuth({ project: { superAdmin: true } });
+    accessToken = await getSuperAdminAccessToken();
 
     // Create a test table
-    const client = getDatabasePool(DatabaseMode.WRITER);
+    const client = getDatabasePool(DatabaseMode.WRITER, GLOBAL_SHARD_ID);
     await client.query(`DROP TABLE IF EXISTS ${escapedTableName}`);
     await client.query(`CREATE TABLE ${escapedTableName} (aaa UUID[], bbb TEXT[])`);
     await client.query(
@@ -44,7 +45,7 @@ describe('dbgetginindexes', () => {
       .get('/fhir/R4/$db-indexes?tableName=')
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject({
       resourceType: 'Parameters',
       parameter: [
@@ -61,7 +62,7 @@ describe('dbgetginindexes', () => {
       .get(`/fhir/R4/$db-indexes?tableName=${tableName}`)
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject({
       resourceType: 'Parameters',
       parameter: expect.arrayContaining([
@@ -97,7 +98,7 @@ describe('dbgetginindexes', () => {
       .get(`/fhir/R4/$db-indexes?tableName=${encodeURIComponent('Robert"; DROP TABLE Students;')}`)
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
       issue: [

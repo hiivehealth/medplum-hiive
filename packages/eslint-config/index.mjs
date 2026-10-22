@@ -7,12 +7,20 @@ import importPlugin from 'eslint-plugin-import';
 import jsdoc from 'eslint-plugin-jsdoc';
 import noOnlyTestsPlugin from 'eslint-plugin-no-only-tests';
 import reactHooks from 'eslint-plugin-react-hooks';
-import reactRefresh from 'eslint-plugin-react-refresh';
+import reactRefreshPlugin from 'eslint-plugin-react-refresh';
+// eslint-disable-next-line import/no-unresolved -- Node resolves this package export; eslint-plugin-import does not.
 import tseslint from 'typescript-eslint';
+import noTransactionCallbackInvokingRepo from './rules/no-transaction-callback-invoking-repo.mjs';
 
 // Workaround for eslint-plugin-header ESLint 9 compatibility issue.
 // See: https://github.com/Stuk/eslint-plugin-header/issues/57#issuecomment-2378485611
 headerPlugin.rules.header.meta.schema = false;
+
+const medplumPlugin = {
+  rules: {
+    'no-transaction-callback-invoking-repo': noTransactionCallbackInvokingRepo,
+  },
+};
 
 /**
  * Core config applies to all source files.
@@ -147,7 +155,7 @@ export const tsConfig = {
     },
     tseslint.configs.strict,
     reactHooks.configs.flat.recommended,
-    reactRefresh.configs.recommended,
+    reactRefreshPlugin.configs.recommended,
   ],
   plugins: {
     'no-only-tests': noOnlyTestsPlugin,
@@ -278,13 +286,13 @@ export const medplumEslintConfig = [
       'packages/eslint-config/index.cjs',
       'packages/expo-medplum-polyfills/build',
       'packages/generator/output/',
-      'packages/react/.storybook/',
+      'packages/storybook/.storybook/',
+      'packages/storybook/storybook-static',
       'package-lock.json',
       '**/.turbo',
       '**/coverage/',
       '**/dist/',
       '**/node_modules/',
-      '**/babel.config.*',
       '**/jest.sequencer.*',
       '**/postcss.config.*',
       '**/rollup.config.*',
@@ -295,13 +303,54 @@ export const medplumEslintConfig = [
   },
   coreConfig,
   tsConfig,
+  {
+    files: ['packages/fhir-router/**/*.ts', 'packages/server/**/*.ts'],
+    plugins: {
+      medplum: medplumPlugin,
+    },
+    rules: {
+      'medplum/no-transaction-callback-invoking-repo': 'error',
+    },
+  },
+  {
+    // Workers act as a job's user only via runJobInAuthenticatedContext. runInAuthenticatedContext
+    // alone would retry a job whose auth state was revoked instead of failing it; the other imports
+    // skip the revocation check entirely.
+    files: ['packages/server/src/workers/**/*.ts'],
+    ignores: ['packages/server/src/workers/utils.ts', '**/*.test.ts'],
+    rules: {
+      'no-restricted-imports': [
+        'error',
+        {
+          patterns: [
+            {
+              regex: '(^|/)context$',
+              importNames: ['runInAuthenticatedContext', 'AuthenticatedRequestContext'],
+              message: 'Use runJobInAuthenticatedContext',
+            },
+            {
+              regex: '(^|/)fhir/accesspolicy$',
+              importNames: ['getRepoForLogin'],
+              message: 'Use runJobInAuthenticatedContext',
+            },
+            {
+              regex: '(^|/)request-context-store$',
+              importNames: ['requestContextStore'],
+              message: 'Use runJobInAuthenticatedContext or tryRunInRequestContext',
+            },
+          ],
+        },
+      ],
+    },
+  },
   /**
-   * vite.config.ts is often outside package tsconfig include (e.g. rootDir src); skip type-aware parsing.
+   * vite.config.ts and vitest.config.ts are often outside package tsconfig include (e.g. rootDir src);
+   * skip type-aware parsing.
    *
-   * we don't need type checking for vite.config.ts files
+   * we don't need type checking for vite.config.ts or vitest.config.ts files
    */
   {
-    files: ['**/vite.config.ts'],
+    files: ['**/vite.config.ts', '**/vite.*.config.ts', '**/vitest.config.ts'],
     extends: [tseslint.configs.disableTypeChecked],
   },
 ];

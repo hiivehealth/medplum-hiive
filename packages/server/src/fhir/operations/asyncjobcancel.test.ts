@@ -7,14 +7,15 @@ import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { initTestAuth, withTestContext } from '../../test.setup';
-import { getGlobalSystemRepo } from '../repo';
+import { getSuperAdminTestProject, withTestContext } from '../../test.setup';
+import type { Repository } from '../repo';
 import { asyncJobCancelHandler } from './asyncjobcancel';
 
 const app = express();
 
 describe('AsyncJob/$cancel', () => {
   let accessToken: string;
+  let repo: Repository;
 
   beforeAll(async () => {
     const config = await loadTestConfig();
@@ -22,8 +23,7 @@ describe('AsyncJob/$cancel', () => {
   });
 
   beforeEach(async () => {
-    accessToken = await initTestAuth({ superAdmin: true });
-    expect(accessToken).toBeDefined();
+    ({ accessToken, repo } = await getSuperAdminTestProject());
   });
 
   afterAll(async () => {
@@ -41,7 +41,7 @@ describe('AsyncJob/$cancel', () => {
         requestTime: new Date().toISOString(),
         request: 'random-request',
       } satisfies AsyncJob);
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     expect(res.body).toBeDefined();
 
     const asyncJob = res.body as AsyncJob;
@@ -49,7 +49,7 @@ describe('AsyncJob/$cancel', () => {
     const res2 = await request(app)
       .post(`/fhir/R4/AsyncJob/${asyncJob.id}/$cancel`)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res2.status).toStrictEqual(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body).toMatchObject(allOk);
 
     const res3 = await request(app)
@@ -57,7 +57,7 @@ describe('AsyncJob/$cancel', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
 
-    expect(res3.status).toStrictEqual(200);
+    expect(res3).toHaveStatus(200);
     expect(res3.body).toMatchObject<AsyncJob>({
       id: asyncJob.id,
       resourceType: 'AsyncJob',
@@ -78,7 +78,7 @@ describe('AsyncJob/$cancel', () => {
         requestTime: new Date().toISOString(),
         request: 'random-request',
       } satisfies AsyncJob);
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     expect(res.body).toBeDefined();
 
     const asyncJob = res.body as AsyncJob;
@@ -86,7 +86,7 @@ describe('AsyncJob/$cancel', () => {
     const res2 = await request(app)
       .post(`/fhir/R4/AsyncJob/${asyncJob.id}/$cancel`)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res2.status).toStrictEqual(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body).toMatchObject(allOk);
 
     const res3 = await request(app)
@@ -94,7 +94,7 @@ describe('AsyncJob/$cancel', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON);
 
-    expect(res3.status).toStrictEqual(200);
+    expect(res3).toHaveStatus(200);
     expect(res3.body).toMatchObject<AsyncJob>({
       id: asyncJob.id,
       resourceType: 'AsyncJob',
@@ -115,7 +115,7 @@ describe('AsyncJob/$cancel', () => {
         requestTime: new Date().toISOString(),
         request: 'random-request',
       } satisfies AsyncJob);
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     expect(res.body).toBeDefined();
 
     const asyncJob = res.body as AsyncJob;
@@ -123,7 +123,7 @@ describe('AsyncJob/$cancel', () => {
     const res2 = await request(app)
       .post(`/fhir/R4/AsyncJob/${asyncJob.id}/$cancel`)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res2.status).toStrictEqual(400);
+    expect(res2).toHaveStatus(400);
 
     const outcome = res2.body as OperationOutcome;
     expect(outcome).toMatchObject(
@@ -149,7 +149,7 @@ describe('AsyncJob/$cancel', () => {
   test('Cancelled job does not get added to super admin project', () =>
     withTestContext(async () => {
       // We create the resource with system repo so that it is like how system AsyncJobs get created
-      const asyncJob = await getGlobalSystemRepo().createResource<AsyncJob>({
+      const asyncJob = await repo.getSystemRepo().createResource<AsyncJob>({
         resourceType: 'AsyncJob',
         status: 'accepted',
         requestTime: new Date().toISOString(),
@@ -160,7 +160,7 @@ describe('AsyncJob/$cancel', () => {
         .post(`/fhir/R4/AsyncJob/${asyncJob.id}/$cancel`)
         .set('Authorization', 'Bearer ' + accessToken)
         .set('X-Medplum', 'extended');
-      expect(res2.status).toStrictEqual(200);
+      expect(res2).toHaveStatus(200);
       expect(res2.body).toMatchObject(allOk);
 
       const res3 = await request(app)
@@ -168,7 +168,7 @@ describe('AsyncJob/$cancel', () => {
         .set('Authorization', 'Bearer ' + accessToken)
         .set('X-Medplum', 'extended');
 
-      expect(res3.status).toStrictEqual(200);
+      expect(res3).toHaveStatus(200);
       expect(res3.body).toStrictEqual({
         id: asyncJob.id,
         resourceType: 'AsyncJob',

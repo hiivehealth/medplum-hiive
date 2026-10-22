@@ -117,7 +117,8 @@ export interface User {
   externalId?: string;
 
   /**
-   * The email address that uniquely identifies the user.
+   * The email address that uniquely identifies the user. Must be all
+   * lowercase.
    */
   email?: string;
 
@@ -152,6 +153,13 @@ export interface User {
    * Whether the user has completed MFA enrollment.
    */
   mfaEnrolled?: boolean;
+
+  /**
+   * The MFA methods the user has enrolled in. 'totp' uses an authenticator
+   * application; 'email' sends a magic link to the user's email address on
+   * login.
+   */
+  mfaMethod?: ('totp' | 'email')[];
 
   /**
    * Optional project if the user only exists for the project. This is used

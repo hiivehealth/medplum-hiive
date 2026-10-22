@@ -4,7 +4,6 @@ import { Notifications } from '@mantine/notifications';
 import { allOk } from '@medplum/core';
 import { HomerSimpson, MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
-import { MemoryRouter } from 'react-router';
 import { act, fireEvent, render, screen } from '../test-utils/render';
 import type { PatientExportFormProps } from './PatientExportForm';
 import { PatientExportForm } from './PatientExportForm';
@@ -13,20 +12,18 @@ describe('PatientExportForm', () => {
   async function setup(args: PatientExportFormProps, medplum = new MockClient()): Promise<void> {
     await act(async () => {
       render(
-        <MemoryRouter>
+        <MedplumProvider medplum={medplum}>
           <Notifications />
-          <MedplumProvider medplum={medplum}>
-            <PatientExportForm {...args} />
-          </MedplumProvider>
-        </MemoryRouter>
+          <PatientExportForm {...args} />
+        </MedplumProvider>
       );
     });
   }
 
   beforeAll(() => {
     // Mock URL.createObjectURL
-    URL.createObjectURL = jest.fn();
-    URL.revokeObjectURL = jest.fn();
+    URL.createObjectURL = vi.fn();
+    URL.revokeObjectURL = vi.fn();
 
     // Mock document.createEvent
     type MyDocument = typeof document & {
@@ -41,7 +38,7 @@ describe('PatientExportForm', () => {
       const result = (document as MyDocument).originalCreateElement(tagName, options);
       if (tagName === 'a') {
         // jsdom does not support click() or download attributes, so we will implement them here
-        result.click = jest.fn();
+        result.click = vi.fn();
       }
       return result;
     };

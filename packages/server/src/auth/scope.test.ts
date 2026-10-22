@@ -1,35 +1,51 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { Login, User } from '@medplum/fhirtypes';
+import { createReference } from '@medplum/core';
+import type { Login, Patient, SmartAppLaunch, User } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import express from 'express';
 import { authenticator } from 'otplib';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../app';
 import { loadTestConfig } from '../config/loader';
-import { getGlobalSystemRepo } from '../fhir/repo';
+import type { SystemRepository } from '../fhir/repo';
+import { getProjectSystemRepo } from '../fhir/repo';
 import { withTestContext } from '../test.setup';
 import { registerNew } from './register';
 
 describe('Scope', () => {
   const app = express();
-  const systemRepo = getGlobalSystemRepo();
+  let systemRepo: SystemRepository;
   const email = `multi${randomUUID()}@example.com`;
   const password = randomUUID();
+  // Patient scopes require a Patient context, which is provided to the login by this launch
+  let launchId: string;
 
   beforeAll(async () => {
     const config = await loadTestConfig();
     await initApp(app, config);
 
-    await withTestContext(() =>
-      registerNew({
+    await withTestContext(async () => {
+      const { project } = await registerNew({
         firstName: 'Scope',
         lastName: 'Scope',
         projectName: 'Scope Project',
         email,
         password,
-      })
-    );
+      });
+      systemRepo = await getProjectSystemRepo(project);
+
+      const patient = await systemRepo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { project: project.id },
+      });
+      const launch = await systemRepo.createResource<SmartAppLaunch>({
+        resourceType: 'SmartAppLaunch',
+        meta: { project: project.id },
+        patient: createReference(patient),
+      });
+      launchId = launch.id;
+    });
   });
 
   afterAll(async () => {
@@ -40,7 +56,7 @@ describe('Scope', () => {
     const res = await request(app).post('/auth/scope').type('json').send({
       scope: 'openid profile',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Missing login');
   });
@@ -49,7 +65,7 @@ describe('Scope', () => {
     const res = await request(app).post('/auth/scope').type('json').send({
       login: '123',
     });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Missing scope');
   });
@@ -59,7 +75,7 @@ describe('Scope', () => {
       login: randomUUID(),
       scope: 'openid profile',
     });
-    expect(res.status).toBe(404);
+    expect(res).toHaveStatus(404);
     expect(res.body.issue).toBeDefined();
     expect(res.body.issue[0].details.text).toBe('Not found');
   });
@@ -70,7 +86,7 @@ describe('Scope', () => {
       email,
       password,
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.login).toBeDefined();
 
     const login = await systemRepo.readResource<Login>('Login', res1.body.login);
@@ -85,7 +101,7 @@ describe('Scope', () => {
       login: res1.body.login,
       scope: 'openid profile',
     });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue).toBeDefined();
     expect(res2.body.issue[0].details.text).toBe('Login revoked');
   });
@@ -96,7 +112,7 @@ describe('Scope', () => {
       email,
       password,
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.login).toBeDefined();
 
     const login = await systemRepo.readResource<Login>('Login', res1.body.login);
@@ -111,9 +127,35 @@ describe('Scope', () => {
       login: res1.body.login,
       scope: 'openid profile',
     });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue).toBeDefined();
     expect(res2.body.issue[0].details.text).toBe('Login granted');
+  });
+
+  test('Missing membership', async () => {
+    const res1 = await request(app).post('/auth/login').type('json').send({
+      scope: 'openid profile',
+      email,
+      password,
+    });
+    expect(res1).toHaveStatus(200);
+    expect(res1.body.login).toBeDefined();
+
+    const login = await systemRepo.readResource<Login>('Login', res1.body.login);
+    await withTestContext(() =>
+      systemRepo.updateResource({
+        ...login,
+        membership: undefined,
+      })
+    );
+
+    const res2 = await request(app).post('/auth/scope').type('json').send({
+      login: res1.body.login,
+      scope: 'openid profile',
+    });
+    expect(res2).toHaveStatus(400);
+    expect(res2.body.issue).toBeDefined();
+    expect(res2.body.issue[0].details.text).toBe('Login profile not set');
   });
 
   test('Success', async () => {
@@ -122,7 +164,7 @@ describe('Scope', () => {
       email,
       password,
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.login).toBeDefined();
     expect(res1.body.code).toBeDefined();
 
@@ -130,7 +172,7 @@ describe('Scope', () => {
       login: res1.body.login,
       scope: 'openid profile',
     });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
   });
 
@@ -140,7 +182,7 @@ describe('Scope', () => {
       email,
       password,
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.login).toBeDefined();
     expect(res1.body.code).toBeDefined();
 
@@ -148,7 +190,7 @@ describe('Scope', () => {
       login: res1.body.login,
       scope: 'openid profile patient/Condition.rs?category=health-concern',
     });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue).toBeDefined();
     expect(res2.body.issue[0].details.text).toBe('Invalid scope');
   });
@@ -158,8 +200,9 @@ describe('Scope', () => {
       scope: 'openid profile patient/Condition.crs',
       email,
       password,
+      launch: launchId,
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.login).toBeDefined();
     expect(res1.body.code).toBeDefined();
 
@@ -167,7 +210,7 @@ describe('Scope', () => {
       login: res1.body.login,
       scope: 'openid profile patient/Condition.read', // V1 scope is equivalent to `rs`, a subset of the one above
     });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
   });
 
@@ -176,8 +219,9 @@ describe('Scope', () => {
       scope: 'openid profile patient/Condition.rs',
       email,
       password,
+      launch: launchId,
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.login).toBeDefined();
     expect(res1.body.code).toBeDefined();
 
@@ -185,7 +229,7 @@ describe('Scope', () => {
       login: res1.body.login,
       scope: 'openid profile patient/Condition.rs?category=health-concern',
     });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.code).toBeDefined();
   });
 
@@ -194,8 +238,9 @@ describe('Scope', () => {
       scope: 'openid profile patient/Condition.rs?encounter=Encounter/1',
       email,
       password,
+      launch: launchId,
     });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.login).toBeDefined();
     expect(res1.body.code).toBeDefined();
 
@@ -203,7 +248,7 @@ describe('Scope', () => {
       login: res1.body.login,
       scope: 'openid profile patient/Condition.rs?category=health-concern',
     });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue).toBeDefined();
     expect(res2.body.issue[0].details.text).toBe('Invalid scope');
   });
@@ -241,7 +286,7 @@ describe('Scope', () => {
         email: mfaEmail,
         password: mfaPassword,
       });
-      expect(loginRes.status).toBe(200);
+      expect(loginRes).toHaveStatus(200);
       expect(loginRes.body.login).toBeDefined();
       expect(loginRes.body.mfaRequired).toBe(true);
       expect(loginRes.body.code).toBeUndefined();
@@ -250,7 +295,7 @@ describe('Scope', () => {
         login: loginRes.body.login,
         scope: 'openid profile',
       });
-      expect(scopeRes.status).toBe(200);
+      expect(scopeRes).toHaveStatus(200);
       expect(scopeRes.body.mfaRequired).toBe(true);
       expect(scopeRes.body.code).toBeUndefined();
     });
@@ -261,7 +306,7 @@ describe('Scope', () => {
         email: mfaEmail,
         password: mfaPassword,
       });
-      expect(loginRes.status).toBe(200);
+      expect(loginRes).toHaveStatus(200);
       expect(loginRes.body.mfaRequired).toBe(true);
 
       const mfaRes = await request(app)
@@ -271,14 +316,14 @@ describe('Scope', () => {
           login: loginRes.body.login,
           token: authenticator.generate(mfaSecret),
         });
-      expect(mfaRes.status).toBe(200);
+      expect(mfaRes).toHaveStatus(200);
       expect(mfaRes.body.code).toBeDefined();
 
       const scopeRes = await request(app).post('/auth/scope').type('json').send({
         login: loginRes.body.login,
         scope: 'openid profile',
       });
-      expect(scopeRes.status).toBe(200);
+      expect(scopeRes).toHaveStatus(200);
       expect(scopeRes.body.code).toBeDefined();
       expect(scopeRes.body.mfaRequired).toBeUndefined();
     });

@@ -3,7 +3,6 @@
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { ReactElement } from 'react';
-import { MemoryRouter } from 'react-router';
 import { act, fireEvent, render, screen } from '../test-utils/render';
 import { RequestGroupDisplay } from './RequestGroupDisplay';
 
@@ -11,22 +10,18 @@ const medplum = new MockClient();
 
 async function setup(ui: ReactElement): Promise<void> {
   await act(async () => {
-    render(
-      <MemoryRouter>
-        <MedplumProvider medplum={medplum}>{ui}</MedplumProvider>
-      </MemoryRouter>
-    );
+    render(<MedplumProvider medplum={medplum}>{ui}</MedplumProvider>);
   });
 }
 
 describe('RequestGroupDisplay', () => {
   test('Renders undefined', async () => {
-    await setup(<RequestGroupDisplay onStart={jest.fn()} onEdit={jest.fn()} />);
+    await setup(<RequestGroupDisplay onStart={vi.fn()} onEdit={vi.fn()} />);
   });
 
   test('Renders reference', async () => {
-    const onStart = jest.fn();
-    const onEdit = jest.fn();
+    const onStart = vi.fn();
+    const onEdit = vi.fn();
 
     await setup(
       <RequestGroupDisplay

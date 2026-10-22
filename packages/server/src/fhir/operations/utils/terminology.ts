@@ -1,19 +1,28 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { WithId } from '@medplum/core';
-import { badRequest, createReference, OperationOutcomeError, Operator, resolveId } from '@medplum/core';
+import type { Filter, WithId } from '@medplum/core';
+import { badRequest, EMPTY, OperationOutcomeError, Operator } from '@medplum/core';
 import type {
   CodeSystem,
   CodeSystemProperty,
   ConceptMap,
-  Reference,
   ValueSet,
   ValueSetComposeIncludeFilter,
 } from '@medplum/fhirtypes';
-import type { Pool, PoolClient } from 'pg';
 import { r4ProjectId } from '../../../constants';
 import type { Repository } from '../../repo';
-import { Column, Condition, Conjunction, Disjunction, SelectQuery, SqlFunction, Union } from '../../sql';
+import type { PgQueryable } from '../../sql';
+import {
+  Column,
+  Condition,
+  Conjunction,
+  Constant,
+  Disjunction,
+  Negation,
+  SelectQuery,
+  SqlFunction,
+  Union,
+} from '../../sql';
 
 export const parentProperty = 'http://hl7.org/fhir/concept-properties#parent';
 export const childProperty = 'http://hl7.org/fhir/concept-properties#child';
@@ -33,7 +42,6 @@ export async function findTerminologyResource<T extends TerminologyResource>(
   if (!url) {
     throw new OperationOutcomeError(badRequest(`${resourceType} not specified`));
   }
-  const project = repo.currentProject();
 
   const versionDelim = url.lastIndexOf('|');
   if (versionDelim > 0) {
@@ -41,67 +49,106 @@ export async function findTerminologyResource<T extends TerminologyResource>(
     options = { ...options, version: options?.version ?? url.slice(versionDelim + 1) };
   }
 
-  const filters = [{ code: 'url', operator: Operator.EQUALS, value: url }];
+  const filters: Filter[] = [
+    { code: 'url', operator: Operator.EQUALS, value: url },
+    { code: 'status', operator: Operator.NOT_EQUALS, value: 'retired' },
+  ];
   if (options?.version) {
     filters.push({ code: 'version', operator: Operator.EQUALS, value: options.version });
   }
-  const results = await repo.searchResources<T>({
-    resourceType,
-    filters,
-    sortRules: [
-      // Select highest version (by lexical sort -- no version is assumed to be "current")
-      { code: 'version', descending: true },
-      // Break ties by selecting more recently-updated resource (lexically -- no date is assumed to be current)
-      { code: 'date', descending: true },
-    ],
-  });
 
-  const systemRepo = repo.getSystemRepo();
-  if (!results.length) {
+  // Need extended mode for meta.project
+  const extendedRepo = repo.withOverrideConfig({ extendedMode: true });
+  const results = await extendedRepo.searchResources<T>({ resourceType, filters, count: 25 });
+
+  const candidates = options?.ownProjectOnly
+    ? results.filter((r) => r.meta?.project === repo.currentProject()?.id)
+    : results;
+  if (!candidates.length) {
     throw new OperationOutcomeError(badRequest(`${resourceType} ${url} not found`));
-  } else if (results.length === 1 || !sameTerminologyResourceVersion(results[0], results[1])) {
-    if (options?.ownProjectOnly) {
-      const fullResource = await systemRepo.readReference(createReference(results[0]));
-      if (fullResource.meta?.project === repo.currentProject()?.id) {
-        return results[0];
-      }
-    } else {
-      return results[0];
-    }
-  } else {
-    const resourceReferences: Reference<T>[] = [];
-    for (const resource of results) {
-      resourceReferences.push(createReference(resource));
-    }
-    const resources = await systemRepo.readReferences(resourceReferences);
-    const projectResource = resources.find((r) => r instanceof Error || (project && r.meta?.project === project.id));
-    if (projectResource instanceof Error) {
-      throw projectResource;
-    } else if (projectResource) {
-      return projectResource;
-    }
-    if (!options?.ownProjectOnly && project?.link) {
-      for (const linkedProject of project.link) {
-        const linkedResource = resources.find(
-          (r) => !(r instanceof Error) && r.meta?.project === resolveId(linkedProject.project)
-        ) as WithId<T> | undefined;
-        if (linkedResource) {
-          return linkedResource;
-        }
-      }
-    }
-    const baseResource = resources.find((r) => r instanceof Error || r.meta?.project === r4ProjectId);
-    if (baseResource instanceof Error) {
-      throw baseResource;
-    } else if (baseResource) {
-      return baseResource;
-    }
   }
-  throw new OperationOutcomeError(badRequest(`${resourceType} ${url} not found`));
+
+  const ranks = projectRanks(repo);
+  candidates.sort((a, b) => compareTerminologyResources(a, b, ranks));
+  return repo.removeHiddenFields(candidates[0]); // May need to strip extended mode
 }
 
-function sameTerminologyResourceVersion(a: TerminologyResource, b: TerminologyResource): boolean {
-  return a.version === b.version && a.date === b.date;
+function projectRanks(repo: Repository): Map<string, number> {
+  const ranks = new Map<string, number>();
+  for (const project of repo.getConfig().projects ?? EMPTY) {
+    if (!ranks.has(project.id)) {
+      ranks.set(project.id, ranks.size);
+    }
+  }
+  // System repository has no Projects of its own, need to add R4 manually
+  if (!ranks.has(r4ProjectId)) {
+    ranks.set(r4ProjectId, ranks.size);
+  }
+  return ranks;
+}
+
+function projectRank(resource: TerminologyResource, ranks: Map<string, number>): number {
+  const projectId = resource.meta?.project;
+  return (projectId ? ranks.get(projectId) : undefined) ?? Number.MAX_SAFE_INTEGER;
+}
+
+/**
+ * Orders terminology resources so the most preferred candidate sorts first:
+ *   1. Project linking order
+ *   2. More complete content, for CodeSystems (e.g. 'complete' over 'example')
+ *   3. Most current version (missing version = "current")
+ *   4. Most recent date (missing date = "current")
+ *   5. Resource ID, so that selection is stable
+ * @param a - The first resource to compare.
+ * @param b - The second resource to compare.
+ * @param ranks - Project ranks, by Project ID.
+ * @returns A negative number if `a` sorts first, positive if `b` sorts first, or zero if equivalent.
+ */
+function compareTerminologyResources(
+  a: WithId<TerminologyResource>,
+  b: WithId<TerminologyResource>,
+  ranks: Map<string, number>
+): number {
+  return (
+    projectRank(a, ranks) - projectRank(b, ranks) ||
+    contentModeRank(a) - contentModeRank(b) ||
+    compareDescending(a.version, b.version) ||
+    compareDescending(a.date, b.date) ||
+    a.id.localeCompare(b.id)
+  );
+}
+
+function compareDescending(a: string | undefined, b: string | undefined): number {
+  if (a === b) {
+    return 0;
+  } else if (a === undefined) {
+    return -1;
+  } else if (b === undefined) {
+    return 1;
+  }
+  return b.localeCompare(a);
+}
+
+// Ranks CodeSystem.content by completeness; a lower rank is more complete and therefore preferred.
+const CODE_SYSTEM_CONTENT_RANK: Record<string, number> = {
+  complete: 0,
+  supplement: 1,
+  fragment: 2,
+  example: 3,
+  'not-present': 4,
+};
+
+/**
+ * Ranks a terminology resource by how complete its content is (lower is more complete/preferred).
+ * Only CodeSystem has a content mode; other resource types are all ranked equally.
+ * @param resource - The resource to rank.
+ * @returns The content rank, where a lower value is more preferred.
+ */
+function contentModeRank(resource: TerminologyResource): number {
+  if (resource.resourceType !== 'CodeSystem' || !resource.content) {
+    return 0;
+  }
+  return CODE_SYSTEM_CONTENT_RANK[resource.content] ?? Number.MAX_SAFE_INTEGER;
 }
 
 export function selectCoding(systemId: string, ...code: string[]): SelectQuery {
@@ -122,15 +169,21 @@ export function addPropertyFilter(
 ): SelectQuery {
   const multiValue = condition.op.endsWith('in');
   const values = multiValue ? condition.value.split(',') : condition.value;
-  const propertyQuery = new SelectQuery('Coding_Property').whereExpr(
-    new Conjunction([
-      new Condition(new Column(query.effectiveTableName, 'id'), '=', new Column('Coding_Property', 'coding')),
-      new Condition(new Column('Coding_Property', 'property'), '=', property.id),
-      new Condition('value', multiValue ? 'IN' : '=', values),
-    ])
-  );
+  const whereClauses = [
+    new Condition(new Column(query.effectiveTableName, 'id'), '=', new Column('Coding_Property', 'coding')),
+    new Condition(new Column('Coding_Property', 'property'), '=', property.id),
+  ];
+  if (condition.op !== 'exists') {
+    whereClauses.push(new Condition('value', multiValue ? 'IN' : '=', values));
+  }
 
-  query.whereExpr(new SqlFunction('EXISTS', [propertyQuery]));
+  const propertyQuery = new SqlFunction('EXISTS', [
+    new SelectQuery('Coding_Property').whereExpr(new Conjunction(whereClauses)),
+  ]);
+
+  query.whereExpr(
+    condition.op === 'exists' && condition.value === 'false' ? new Negation(propertyQuery) : propertyQuery
+  );
   return query;
 }
 
@@ -183,7 +236,7 @@ export function getParentProperty(codeSystem: CodeSystem): CodeSystemProperty {
 }
 
 export async function resolveProperty(
-  db: Pool | PoolClient,
+  db: PgQueryable,
   codeSystem: WithId<CodeSystem>,
   property: CodeSystemProperty
 ): Promise<WithId<CodeSystemProperty> | undefined> {
@@ -229,6 +282,11 @@ export function addDescendants(
     new Condition(new Column('Coding', 'id'), '=', new Column(propertyTable, 'coding')),
   ]);
   propertyJoinCondition.where(new Column(propertyTable, 'property'), '=', property.id);
+  // Provably-true predicate: relationship-property rows always have a positive `target` coding id. Emitting it as a
+  // literal (not a bound parameter) lets the planner prove the partial `Coding_Property_reverse_rel_lookup_idx`
+  // predicate (`target > 0`) and drive the recursion via a parameterized nested-loop on that index, instead of
+  // hash-scanning every row of the parent property on each recursion level.
+  propertyJoinCondition.whereExpr(new Constant(`"${propertyTable}"."target" > 0`));
   query.join('INNER JOIN', 'Coding_Property', propertyTable, propertyJoinCondition);
 
   const recursiveCTE = 'cte_descendants';

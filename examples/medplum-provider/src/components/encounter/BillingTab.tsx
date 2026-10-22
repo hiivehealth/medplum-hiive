@@ -3,18 +3,18 @@
 import { Button, Card, Flex, Group, Menu, Skeleton, Stack, Tooltip } from '@mantine/core';
 import { useDebouncedCallback } from '@mantine/hooks';
 import { notifications, showNotification } from '@mantine/notifications';
-import type { WithId } from '@medplum/core';
-import { getIdentifier, getReferenceString, HTTP_HL7_ORG } from '@medplum/core';
+import type { PatchOperation, WithId } from '@medplum/core';
+import { CPT, createReference, getReferenceString } from '@medplum/core';
 import type {
-  Bot,
   ChargeItem,
   Claim,
-  ClaimDiagnosis,
+  ClaimResponse,
   Condition,
   Coverage,
   Encounter,
   EncounterDiagnosis,
   Media,
+  Organization,
   Patient,
   Practitioner,
   Reference,
@@ -24,87 +24,83 @@ import { IconCircleOff, IconDownload, IconFileText, IconSend } from '@tabler/ico
 import type { JSX } from 'react';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { SAVE_TIMEOUT_MS } from '../../config/constants';
-import { useDebouncedUpdateResource } from '../../hooks/useDebouncedUpdateResource';
 import { ChartNoteStatus } from '../../types/encounter';
-import { calculateTotalPrice } from '../../utils/chargeitems';
-import { createClaimFromEncounter, getCptChargeItems } from '../../utils/claims';
+import { BILLING_ORGANIZATION_IDENTIFIER } from '../../utils/billing';
+import { refreshCandidClaimResponse } from '../../utils/candid';
+import { getChargeItemsForEncounter } from '../../utils/chargeitems';
+import { buildClaimFromEncounter } from '../../utils/claims';
 import { createSelfPayCoverage, isSelfPayCoverage } from '../../utils/coverage';
 import { showErrorNotification } from '../../utils/notifications';
+import {
+  CANDID_SUBMIT_CLAIM_OPERATION,
+  isCustomOperationAvailable,
+  STEDI_SUBMIT_CLAIM_OPERATION,
+} from '../../utils/operations';
 import { ChargeItemList } from '../ChargeItem/ChargeItemList';
 import { ConditionList } from '../Conditions/ConditionList';
 import { ClaimSubmittedPanel } from './ClaimSubmittedPanel';
 import { SubmitClaimModal } from './SubmitClaimModal';
 import { VisitDetailsPanel } from './VisitDetailsPanel';
 
-const CANDID_IDENTIFIER_SYSTEM = 'https://candidhealth.com/encounter-id';
-
-interface CandidServiceLine {
-  chargeAmountCents?: number;
-}
-
-interface CandidFullEncounter {
-  encounterId?: string;
-  createdAt?: string;
-  claims?: { status?: string }[];
-  serviceLines?: CandidServiceLine[];
-}
-
-interface CandidBotResponse {
-  fullEncounter?: CandidFullEncounter;
-}
-
 export interface BillingTabProps {
   patient: WithId<Patient>;
   encounter: WithId<Encounter>;
   setEncounter: (encounter: WithId<Encounter>) => void;
+  /** Fired only after an encounter change is persisted (unlike setEncounter, which may be optimistic). */
+  onEncounterSaved?: (encounter: WithId<Encounter>) => void;
   practitioner: WithId<Practitioner> | undefined;
   setPractitioner: (practitioner: WithId<Practitioner>) => void;
-  chargeItems: WithId<ChargeItem>[] | undefined;
-  setChargeItems: (chargeItems: WithId<ChargeItem>[]) => void;
-  claim: WithId<Claim> | undefined;
-  setClaim: (claim: WithId<Claim>) => void;
   chartNoteStatus: ChartNoteStatus;
 }
 
 export const BillingTab = (props: BillingTabProps): JSX.Element => {
-  const {
-    encounter,
-    setEncounter,
-    claim,
-    patient,
-    practitioner,
-    setPractitioner,
-    chargeItems,
-    setChargeItems,
-    setClaim,
-    chartNoteStatus,
-  } = props;
+  const { encounter, setEncounter, onEncounterSaved, patient, practitioner, setPractitioner, chartNoteStatus } = props;
   const medplum = useMedplum();
-  const candidEncounterId = claim ? getIdentifier(claim, CANDID_IDENTIFIER_SYSTEM) : undefined;
+  const [claim, setClaim] = useState<WithId<Claim> | undefined>();
+  const [chargeItems, setChargeItems] = useState<WithId<ChargeItem>[]>([]);
   const [conditions, setConditions] = useState<Condition[]>([]);
   const [coverages, setCoverages] = useState<WithId<Coverage>[]>([]);
   const [coverage, setCoverage] = useState<WithId<Coverage> | undefined>();
   const [submitting, setSubmitting] = useState(false);
   const [confirmModalOpen, setConfirmModalOpen] = useState(false);
-  const [billingBot, setBillingBot] = useState<WithId<Bot> | null | undefined>(undefined);
-  const [getEncounterBot, setGetEncounterBot] = useState<WithId<Bot> | null | undefined>(undefined);
-  const [stediBot, setStediBot] = useState<WithId<Bot> | null | undefined>(undefined);
-  const [stediSubmitting, setStediSubmitting] = useState(false);
-  const [stediClaimId, setStediClaimId] = useState(
-    claim ? getIdentifier(claim, 'https://www.stedi.com/claims') : undefined
-  );
-  const [candidStatus, setCandidStatus] = useState<string | undefined>();
-  const [candidCreatedAt, setCandidCreatedAt] = useState<string | undefined>();
-  const [resolvedCandidEncounterId, setResolvedCandidEncounterId] = useState<string | undefined>();
-  const [candidClaimAmount, setCandidClaimAmount] = useState<number | undefined>();
-  const [candidLoading, setCandidLoading] = useState(false);
-  const [backgroundChecking, setBackgroundChecking] = useState(false);
-  const conditionsRef = useRef(conditions);
-  conditionsRef.current = conditions;
-  const claimRef = useRef(claim);
-  claimRef.current = claim;
-  const debouncedUpdateResource = useDebouncedUpdateResource(medplum);
-  const debouncedUpdateClaim = useDebouncedUpdateResource(medplum);
+  const [claimResponse, setClaimResponse] = useState<WithId<ClaimResponse> | null | undefined>(undefined);
+  const [claimResponseLoading, setClaimResponseLoading] = useState(false);
+  const [billingOrganization, setBillingOrganization] = useState<Reference<Organization> | undefined>();
+  // Which claim submission operations are deployed in this project; undefined until resolved.
+  const [submitOperations, setSubmitOperations] = useState<{ candid: boolean; stedi: boolean } | undefined>();
+
+  useEffect(() => {
+    Promise.all([
+      isCustomOperationAvailable(medplum, CANDID_SUBMIT_CLAIM_OPERATION),
+      isCustomOperationAvailable(medplum, STEDI_SUBMIT_CLAIM_OPERATION),
+    ])
+      .then(([candid, stedi]) => setSubmitOperations({ candid, stedi }))
+      .catch(showErrorNotification);
+  }, [medplum]);
+
+  useEffect(() => {
+    const fetchClaim = async (): Promise<void> => {
+      const response = await medplum.searchOne(
+        'Claim',
+        { encounter: getReferenceString(encounter), status: 'active,draft' },
+        { cache: 'no-cache' }
+      );
+      if (response) {
+        setClaim(response);
+      }
+    };
+
+    fetchClaim().catch((err) => showErrorNotification(err));
+  }, [encounter, medplum]);
+
+  useEffect(() => {
+    const loadChargeItems = async (): Promise<void> => {
+      const chargeItemsResult = await getChargeItemsForEncounter(medplum, encounter);
+      setChargeItems(chargeItemsResult);
+    };
+
+    loadChargeItems().catch((err) => showErrorNotification(err));
+  }, [encounter, medplum]);
 
   useEffect(() => {
     const fetchCoverage = async (): Promise<void> => {
@@ -129,245 +125,210 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
     fetchCoverage().catch((err) => showErrorNotification(err));
   }, [medplum, patient]);
 
+  // Default the billing organization: an existing draft claim records the previous choice;
+  // otherwise use the billing organization on the practitioner's active PractitionerRole, looked up
+  // the same way the visit's insurance eligibility check does. The picker stays editable either way.
   useEffect(() => {
-    medplum
-      .searchOne('Bot', { identifier: 'https://medplum.com/integrations/candid-health|send-to-candid' })
-      .then((bot) => setBillingBot(bot ?? null))
-      .catch(() => setBillingBot(null));
-  }, [medplum]);
+    const resolveBillingOrganization = async (): Promise<Reference<Organization> | undefined> => {
+      if (claim?.provider?.reference?.startsWith('Organization/')) {
+        return claim.provider as Reference<Organization>;
+      }
+      if (!practitioner) {
+        return undefined;
+      }
+      const role = await medplum.searchOne('PractitionerRole', {
+        practitioner: getReferenceString(practitioner),
+        active: 'true',
+        'organization.identifier': BILLING_ORGANIZATION_IDENTIFIER,
+      });
+      return role?.organization;
+    };
 
-  useEffect(() => {
-    medplum
-      .searchOne('Bot', { identifier: 'https://medplum.com/integrations/candid-health|get-encounter' })
-      .then((bot) => setGetEncounterBot(bot ?? null))
-      .catch(() => setGetEncounterBot(null));
-  }, [medplum]);
+    resolveBillingOrganization()
+      .then((organization) => {
+        if (organization) {
+          setBillingOrganization(organization);
+        }
+      })
+      .catch((err) => showErrorNotification(err));
+  }, [claim, practitioner, medplum]);
 
-  useEffect(() => {
-    medplum
-      .searchOne('Bot', { identifier: 'https://www.medplum.com/bots|submit-claim-to-stedi' })
-      .then((bot) => setStediBot(bot ?? null))
-      .catch(() => setStediBot(null));
-  }, [medplum]);
-
-  useEffect(() => {
-    setStediClaimId(claim ? getIdentifier(claim, 'https://www.stedi.com/claims') : undefined);
-  }, [claim]);
-
-  const processCandidResponse = useCallback((result: CandidBotResponse): void => {
-    const encounterId = result?.fullEncounter?.encounterId;
-    if (encounterId) {
-      setResolvedCandidEncounterId(encounterId);
-    }
-    const status = result?.fullEncounter?.claims?.[0]?.status;
-    if (status) {
-      setCandidStatus(status);
-    }
-    const createdAt = result?.fullEncounter?.createdAt;
-    if (createdAt) {
-      setCandidCreatedAt(createdAt);
-    }
-    const serviceLines = result?.fullEncounter?.serviceLines;
-    if (serviceLines?.length) {
-      const totalCents = serviceLines.reduce(
-        (sum: number, line: CandidServiceLine) => sum + (line.chargeAmountCents ?? 0),
-        0
-      );
-      setCandidClaimAmount(totalCents / 100);
-    }
-  }, []);
-
-  const fetchCandidEncounter = useCallback(async (): Promise<void> => {
-    if (!getEncounterBot || !claimRef.current) {
+  const fetchClaimResponse = useCallback(async (): Promise<void> => {
+    if (!claim?.id) {
+      setClaimResponse(null);
       return;
     }
-    const payload = candidEncounterId ? { encounterId: candidEncounterId } : { externalId: encounter.id };
-    setCandidLoading(true);
+    setClaimResponseLoading(true);
     try {
-      const result = await medplum.executeBot(getEncounterBot.id, payload, 'application/json');
-      processCandidResponse(result);
-    } catch (err) {
-      showErrorNotification('Unable to fetch Candid Health claim: ' + err);
+      // Candid claims are refreshed on load: the claim carries the Candid encounter id, so the
+      // get-encounter bot can pull the latest state onto the stored ClaimResponse
+      try {
+        await refreshCandidClaimResponse(medplum, claim);
+      } catch (err) {
+        showErrorNotification(err);
+      }
+      const result = await medplum.searchOne(
+        'ClaimResponse',
+        { request: getReferenceString(claim) },
+        { cache: 'no-cache' }
+      );
+      setClaimResponse(result ?? null);
     } finally {
-      setCandidLoading(false);
+      setClaimResponseLoading(false);
     }
-  }, [candidEncounterId, encounter.id, getEncounterBot, medplum, processCandidResponse]);
+  }, [claim, medplum]);
 
+  // Refetch the ClaimResponse whenever the resolved claim changes (e.g. after the claim loads or is
+  // (re)persisted). The synchronous clear in fetchClaimResponse is intentional, so suppress the rule.
   useEffect(() => {
-    if (!candidEncounterId) {
-      return;
-    }
-    fetchCandidEncounter().catch(showErrorNotification);
-  }, [candidEncounterId, fetchCandidEncounter]);
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    fetchClaimResponse().catch((err) => showErrorNotification(err));
+  }, [fetchClaimResponse]);
 
-  // Background safeguard: if claim exists but has no Candid encounter ID, silently check via externalId.
-  useEffect(() => {
-    if (!claim?.id || candidEncounterId || !getEncounterBot) {
-      return;
-    }
-    setBackgroundChecking(true);
-    medplum
-      .executeBot(getEncounterBot.id, { externalId: encounter.id }, 'application/json')
-      .then(processCandidResponse)
-      .catch(() => undefined)
-      .finally(() => setBackgroundChecking(false));
-  }, [claim?.id, candidEncounterId, encounter.id, getEncounterBot, medplum, processCandidResponse]);
-
-  const handleDiagnosisChange = useCallback(
-    async (diagnosis: EncounterDiagnosis[]): Promise<void> => {
-      const updatedEncounter = { ...encounter, diagnosis };
-      setEncounter(updatedEncounter);
-      await debouncedUpdateResource(updatedEncounter);
-    },
-    [encounter, setEncounter, debouncedUpdateResource]
-  );
-
-  // Creates the claim if it doesn't exist yet, otherwise updates it with the given patch.
-  // Always folds in current diagnosis and insurance so every save is complete.
-  // Pass creationArgs to override encounter/practitioner/items used at creation time.
-  const syncClaim = useCallback(
-    async (
-      patch: Partial<Claim> = {},
-      creationArgs?: { enc?: WithId<Encounter>; prac?: WithId<Practitioner>; items?: WithId<ChargeItem>[] }
-    ): Promise<void> => {
-      const currentClaim = claimRef.current;
-      if (currentClaim) {
-        const updatedClaim = {
-          ...currentClaim,
-          diagnosis: createDiagnosisArray(conditionsRef.current),
-          ...(coverage && {
-            insurance: [{ sequence: 1, focal: true, coverage: { reference: getReferenceString(coverage) } }],
-          }),
-          ...patch,
-        };
-        setClaim(updatedClaim);
-        debouncedUpdateClaim(updatedClaim).catch((err) => showErrorNotification(err));
-        return;
-      }
-      const enc = creationArgs?.enc ?? encounter;
-      const prac = creationArgs?.prac ?? practitioner;
-      const items = creationArgs?.items ?? chargeItems;
-      if (!patient?.id || !enc?.id || !prac?.id || !items?.length) {
-        return;
-      }
-      const newClaim = await createClaimFromEncounter(medplum, patient, enc, prac, items);
-      if (newClaim) {
-        setClaim(newClaim);
-      }
-    },
-    [chargeItems, coverage, debouncedUpdateClaim, encounter, medplum, patient, practitioner, setClaim]
-  );
-
-  // Re-sync claim whenever conditions, coverage, or claim id changes.
-  useEffect(() => {
-    if (!claimRef.current) {
-      return;
-    }
-    syncClaim().catch((err) => showErrorNotification(err));
-  }, [conditions, coverage, claim?.id, syncClaim]);
-
-  const handleEncounterChange = useDebouncedCallback(async (updatedEncounter: Encounter): Promise<void> => {
+  const debouncedPatchDiagnosis = useDebouncedCallback(async (diagnosis: EncounterDiagnosis[]): Promise<void> => {
     try {
-      const savedEncounter = await medplum.updateResource(updatedEncounter);
-      setEncounter(savedEncounter);
-
-      let currentPractitioner = practitioner;
-      if (savedEncounter?.participant?.[0]?.individual) {
-        const practitionerResult = await medplum.readReference(savedEncounter.participant[0].individual);
-        currentPractitioner = practitionerResult as WithId<Practitioner>;
-        setPractitioner(currentPractitioner);
-      }
-
-      if (!patient?.id || !savedEncounter?.id || !currentPractitioner?.id || !chargeItems?.length) {
-        return;
-      }
-
-      await syncClaim(
-        { provider: { reference: getReferenceString(currentPractitioner) } },
-        { enc: savedEncounter, prac: currentPractitioner }
-      );
+      const savedEncounter = await medplum.patchResource('Encounter', encounter.id, [
+        { op: 'add', path: '/diagnosis', value: diagnosis },
+      ]);
+      onEncounterSaved?.(savedEncounter);
     } catch (err) {
       showErrorNotification(err);
     }
   }, SAVE_TIMEOUT_MS);
 
-  const updateChargeItems = useCallback(
-    async (updatedChargeItems: WithId<ChargeItem>[]): Promise<void> => {
-      setChargeItems(updatedChargeItems);
-      if (!patient?.id || !encounter?.id || !practitioner?.id || !updatedChargeItems.length) {
-        return;
-      }
-      await syncClaim(
-        {
-          item: getCptChargeItems(updatedChargeItems, { reference: getReferenceString(encounter) }),
-          total: { value: calculateTotalPrice(updatedChargeItems) },
-        },
-        { items: updatedChargeItems }
-      );
+  const handleDiagnosisChange = useCallback(
+    async (diagnosis: EncounterDiagnosis[]): Promise<void> => {
+      setEncounter({ ...encounter, diagnosis });
+      debouncedPatchDiagnosis(diagnosis);
     },
-    [patient, encounter, practitioner, syncClaim, setChargeItems]
+    [encounter, setEncounter, debouncedPatchDiagnosis]
   );
 
-  const exportClaimAsCMS1500 = async (): Promise<void> => {
-    if (!claim?.id) {
+  const generateClaim = useCallback(
+    async (insuranceRefs?: Reference<Coverage>[]): Promise<WithId<Claim>> => {
+      if (!practitioner) {
+        throw new Error('A practitioner is required to create a claim');
+      }
+      const insurance = insuranceRefs ?? (coverage ? [{ reference: getReferenceString(coverage) }] : undefined);
+      const built = buildClaimFromEncounter({
+        patient,
+        encounter,
+        practitioner,
+        chargeItems,
+        conditions,
+        insurance,
+        billingOrganization,
+      });
+
+      const existingClaim = await medplum.searchOne(
+        'Claim',
+        { encounter: getReferenceString(encounter), status: 'active,draft' },
+        { cache: 'no-cache' }
+      );
+
+      const saved = existingClaim?.id
+        ? await medplum.updateResource({
+            ...existingClaim,
+            ...built,
+            status: existingClaim.status ?? built.status,
+            created: existingClaim.created ?? built.created,
+          })
+        : await medplum.createResource(built);
+      setClaim(saved);
+      return saved;
+    },
+    [patient, encounter, practitioner, chargeItems, conditions, coverage, billingOrganization, medplum, setClaim]
+  );
+
+  // Visit-details edits accumulate here (keyed by path, latest edit per field wins) so rapid
+  // multi-field changes merge into one patch instead of the debounce dropping all but the last.
+  const pendingEncounterOpsRef = useRef(new Map<string, PatchOperation>());
+
+  const flushEncounterOps = useDebouncedCallback(async (): Promise<void> => {
+    // A remove on a missing path is rejected, and so is an empty location list, so clearing a service
+    // facility the encounter never had (or one selected and cleared within a single debounce) is a no-op.
+    const ops = [...pendingEncounterOpsRef.current.values()].filter(
+      (op) => !(op.op === 'remove' && op.path === '/location' && !encounter.location)
+    );
+    pendingEncounterOpsRef.current.clear();
+    if (ops.length === 0) {
       return;
     }
-
-    const response = await medplum.post<Media>(medplum.fhirUrl('Claim', '$export'), {
-      resourceType: 'Parameters',
-      parameter: [{ name: 'resource', resource: claim }],
-    });
-
-    if (response.resourceType === 'Media' && response.content?.url) {
-      window.open(response.content.url, '_blank');
-    } else {
-      showErrorNotification('Failed to download PDF');
+    // Nested period ops can only apply once the period object exists on the resource.
+    if (!encounter.period && ops.some((op) => op.path.startsWith('/period/'))) {
+      ops.unshift({ op: 'add', path: '/period', value: {} });
     }
-  };
 
-  const submitClaim = useCallback(
-    async (claimOverride?: WithId<Claim>): Promise<void> => {
-      const claimToSubmit = claimOverride ?? claim;
-      if (!claimToSubmit) {
-        return;
+    try {
+      const savedEncounter = await medplum.patchResource('Encounter', encounter.id, ops);
+      setEncounter(savedEncounter);
+      onEncounterSaved?.(savedEncounter);
+
+      if (savedEncounter?.participant?.[0]?.individual) {
+        const practitionerResult = await medplum.readReference(savedEncounter.participant[0].individual);
+        setPractitioner(practitionerResult as WithId<Practitioner>);
       }
+    } catch (err) {
+      showErrorNotification(err);
+    }
+  }, SAVE_TIMEOUT_MS);
 
-      const currentConditions = conditionsRef.current;
-      if (!currentConditions || currentConditions.length === 0) {
-        showNotification({
-          title: 'Missing Diagnosis',
-          message: 'Please add at least one diagnosis before submitting a claim',
-          color: 'red',
-        });
-        return;
+  const handleEncounterChange = useCallback(
+    (ops: PatchOperation[]): void => {
+      for (const op of ops) {
+        pendingEncounterOpsRef.current.set(op.path, op);
       }
+      flushEncounterOps();
+    },
+    [flushEncounterOps]
+  );
 
-      if (!billingBot) {
-        return;
+  const exportClaimAsCMS1500 = useCallback(async (): Promise<void> => {
+    try {
+      const saved = await generateClaim();
+      const response = await medplum.post<Media>(medplum.fhirUrl('Claim', '$export'), {
+        resourceType: 'Parameters',
+        parameter: [{ name: 'resource', resource: saved }],
+      });
+
+      if (response.resourceType === 'Media' && response.content?.url) {
+        window.open(response.content.url, '_blank');
+      } else {
+        showErrorNotification('Failed to download PDF');
       }
+    } catch (err) {
+      showErrorNotification(err);
+    }
+  }, [generateClaim, medplum]);
 
+  const runClaimSubmit = useCallback(
+    async (
+      coverageRefs: Reference<Coverage>[],
+      operation: '$candid-submit-claim' | '$stedi-submit-claim',
+      successTitle: string,
+      successMessage: string
+    ): Promise<void> => {
       setSubmitting(true);
-      debouncedUpdateClaim.cancel();
       try {
-        const result = await medplum.executeBot(billingBot.id, claimToSubmit, 'application/fhir+json');
-        showNotification({
-          title: 'Claim Submitted',
-          message: result?.message || 'Claim successfully submitted to Candid Health',
-          color: 'green',
+        const saved = await generateClaim(coverageRefs);
+        const result = await medplum.post(medplum.fhirUrl('Claim', saved.id, operation), {
+          resourceType: 'Parameters',
+          parameter: [],
         });
-        const updatedClaim = await medplum.readResource('Claim', claimToSubmit.id);
-        setClaim(updatedClaim);
-        await fetchCandidEncounter();
+        showNotification({ title: successTitle, message: successMessage, color: 'green' });
+        if (result?.resourceType === 'ClaimResponse') {
+          setClaimResponse(result as WithId<ClaimResponse>);
+        } else {
+          await fetchClaimResponse();
+        }
       } catch (err) {
-        let errorMessage: string | undefined;
         try {
           const parsed = JSON.parse((err as Error).message);
-          errorMessage = parsed?.errorMessage;
           notifications.show({
             color: 'red',
             icon: <IconCircleOff />,
             title: 'Error',
-            message: errorMessage,
+            message: parsed?.errorMessage,
           });
         } catch {
           showErrorNotification(err);
@@ -376,53 +337,31 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
         setSubmitting(false);
       }
     },
-    [billingBot, claim, debouncedUpdateClaim, fetchCandidEncounter, medplum, setClaim]
+    [generateClaim, fetchClaimResponse, medplum]
+  );
+
+  const submitToCandid = useCallback(
+    async (insurance: Reference<Coverage>[]): Promise<void> => {
+      await runClaimSubmit(
+        insurance,
+        '$candid-submit-claim',
+        'Claim Submitted',
+        'Claim successfully submitted to Candid Health'
+      );
+    },
+    [runClaimSubmit]
   );
 
   const submitToStedi = useCallback(
     async (insurance: Reference<Coverage>[]): Promise<void> => {
-      if (!claim || !stediBot) {
-        return;
-      }
-      if (!conditionsRef.current?.length) {
-        showNotification({
-          title: 'Missing Diagnosis',
-          message: 'Please add at least one diagnosis before submitting a claim',
-          color: 'red',
-        });
-        return;
-      }
-      if (insurance.length === 0) {
-        return;
-      }
-      setStediSubmitting(true);
-      debouncedUpdateClaim.cancel();
-      try {
-        const claimPayload = {
-          ...claim,
-          insurance: insurance.map((cov, index) => ({
-            sequence: index + 1,
-            focal: index === 0,
-            coverage: cov,
-          })),
-        };
-        const result = await medplum.executeBot(stediBot.id, claimPayload, 'application/fhir+json');
-        const updatedClaim = await medplum.searchOne('Claim', { _id: claim.id }, { cache: 'no-cache' });
-        if (updatedClaim) {
-          setClaim(updatedClaim);
-        }
-        showNotification({
-          title: 'Submitted to Stedi',
-          message: result?.message || 'Claim successfully submitted to Stedi',
-          color: 'green',
-        });
-      } catch (err) {
-        showErrorNotification(err);
-      } finally {
-        setStediSubmitting(false);
-      }
+      await runClaimSubmit(
+        insurance,
+        '$stedi-submit-claim',
+        'Submitted to Stedi',
+        'Claim successfully submitted to Stedi'
+      );
     },
-    [claim, debouncedUpdateClaim, medplum, setClaim, stediBot]
+    [runClaimSubmit]
   );
 
   const ensureSelfPayCoverage = useCallback(async (): Promise<WithId<Coverage>> => {
@@ -436,6 +375,7 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
   }, [coverages, medplum, patient]);
 
   const LOCKED_TOOLTIP = 'Sign and Lock the encounter in order to enable this action';
+  const NO_SUBMIT_OPERATION_TOOLTIP = 'Claim submission is not enabled for this project';
 
   const exportClaimMenu = (disabled?: boolean): JSX.Element => (
     <Menu shadow="md" width={200}>
@@ -490,38 +430,6 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
     </Menu>
   );
 
-  const handleConfirmSubmit = useCallback(
-    async (coverageRefs: Reference<Coverage>[]): Promise<void> => {
-      setConfirmModalOpen(false);
-      if (!claim || coverageRefs.length === 0) {
-        showNotification({
-          title: 'Missing Coverage',
-          message: 'Please select at least one coverage before submitting a claim',
-          color: 'red',
-        });
-        return;
-      }
-
-      const firstCoverage = coverages.find((c) => getReferenceString(c) === coverageRefs[0].reference);
-      if (firstCoverage) {
-        setCoverage(firstCoverage);
-      }
-
-      debouncedUpdateClaim.cancel();
-      const updatedClaim = await medplum.updateResource({
-        ...claim,
-        insurance: coverageRefs.map((ref, index) => ({
-          sequence: index + 1,
-          focal: index === 0,
-          coverage: ref,
-        })),
-      });
-      setClaim(updatedClaim);
-      await submitClaim(updatedClaim);
-    },
-    [claim, coverages, debouncedUpdateClaim, medplum, setClaim, submitClaim]
-  );
-
   const handleSubmitClaimClick = useCallback(async (): Promise<void> => {
     if (!conditions.length) {
       showNotification({
@@ -539,10 +447,12 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
   }, [conditions, coverages, medplum, patient]);
 
   const renderClaimCard = (): JSX.Element | null => {
-    if (!claim) {
+    const hasCptItems = chargeItems.some((item) => item.code?.coding?.some((c) => c.system === CPT));
+    if (!hasCptItems && !claim && !claimResponse) {
       return null;
     }
-    if (candidLoading || backgroundChecking || getEncounterBot === undefined || stediBot === undefined) {
+
+    if (claimResponseLoading) {
       return (
         <Card withBorder shadow="sm" p="md">
           <Skeleton height={20} width="60%" mb="sm" />
@@ -550,65 +460,48 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
         </Card>
       );
     }
-    if (candidEncounterId || candidStatus || stediClaimId) {
-      return (
-        <ClaimSubmittedPanel
-          status={candidStatus ?? (stediClaimId ? 'submitted' : undefined)}
-          claimAmount={candidClaimAmount ?? claim.total?.value ?? 0}
-          createdAt={candidCreatedAt ?? claim.meta?.lastUpdated}
-          candidEncounterId={resolvedCandidEncounterId ?? candidEncounterId}
-          exportMenu={exportClaimMenu()}
-        />
-      );
+
+    if (claimResponse) {
+      return <ClaimSubmittedPanel claimResponse={claimResponse} exportMenu={exportClaimMenu()} />;
+    }
+    const isLocked = chartNoteStatus === ChartNoteStatus.SignedAndLocked;
+    const canSubmitClaim = Boolean(submitOperations?.candid || submitOperations?.stedi);
+    let submitTooltip: string | undefined;
+    if (!isLocked) {
+      submitTooltip = LOCKED_TOOLTIP;
+    } else if (!canSubmitClaim) {
+      submitTooltip = NO_SUBMIT_OPERATION_TOOLTIP;
     }
     return (
       <Card withBorder shadow="sm">
         <Flex justify="space-between">
-          {exportClaimMenu(chartNoteStatus !== ChartNoteStatus.SignedAndLocked)}
-          {(billingBot || stediBot) && (
-            <>
-              <SubmitClaimModal
-                opened={confirmModalOpen}
-                submitting={submitting}
-                coverages={coverages}
-                selectedCoverage={coverage}
-                patient={patient}
-                conditions={conditions}
-                practitioner={practitioner}
-                showCandidButton={!!billingBot}
-                showStediButton={!!stediBot}
-                stediSubmitting={stediSubmitting}
-                onClose={() => setConfirmModalOpen(false)}
-                onSubmitClaim={handleConfirmSubmit}
-                onSubmitToStedi={submitToStedi}
-                ensureSelfPayCoverage={ensureSelfPayCoverage}
-              />
-              <Tooltip label={LOCKED_TOOLTIP} disabled={chartNoteStatus === ChartNoteStatus.SignedAndLocked}>
-                <Button
-                  component="div"
-                  variant="outline"
-                  leftSection={<IconSend size={16} />}
-                  loading={submitting || stediSubmitting}
-                  onClick={chartNoteStatus === ChartNoteStatus.SignedAndLocked ? handleSubmitClaimClick : undefined}
-                  disabled={chartNoteStatus !== ChartNoteStatus.SignedAndLocked || submitting || stediSubmitting}
-                  data-disabled={chartNoteStatus !== ChartNoteStatus.SignedAndLocked || undefined}
-                >
-                  Submit Claim
-                </Button>
-              </Tooltip>
-            </>
-          )}
-          {billingBot === null && stediBot === null && (
+          {exportClaimMenu(!isLocked)}
+
+          <SubmitClaimModal
+            opened={confirmModalOpen}
+            coverages={coverages}
+            selectedCoverage={coverage}
+            patient={patient}
+            conditions={conditions}
+            practitioner={practitioner}
+            onClose={() => setConfirmModalOpen(false)}
+            onSubmitClaim={submitOperations?.candid ? submitToCandid : undefined}
+            onSubmitToStedi={submitOperations?.stedi ? submitToStedi : undefined}
+            ensureSelfPayCoverage={ensureSelfPayCoverage}
+          />
+          <Tooltip label={submitTooltip} disabled={!submitTooltip}>
             <Button
+              component="div"
               variant="outline"
               leftSection={<IconSend size={16} />}
-              onClick={() => {
-                window.open('https://www.medplum.com/contact', '_blank');
-              }}
+              loading={submitting}
+              onClick={isLocked && canSubmitClaim ? handleSubmitClaimClick : undefined}
+              disabled={!isLocked || !canSubmitClaim || submitting}
+              data-disabled={!isLocked || !canSubmitClaim || undefined}
             >
-              Request to connect a billing service
+              Submit Claim
             </Button>
-          )}
+          </Tooltip>
         </Flex>
       </Card>
     );
@@ -622,7 +515,11 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
         <VisitDetailsPanel
           practitioner={practitioner}
           encounter={encounter}
+          billingOrganization={billingOrganization}
           onEncounterChange={handleEncounterChange}
+          onBillingOrganizationChange={(organization) =>
+            setBillingOrganization(organization ? createReference(organization) : undefined)
+          }
         />
       </Group>
 
@@ -636,34 +533,12 @@ export const BillingTab = (props: BillingTabProps): JSX.Element => {
         />
       )}
 
-      {chargeItems && (
-        <ChargeItemList
-          patient={patient}
-          encounter={encounter}
-          chargeItems={chargeItems}
-          updateChargeItems={updateChargeItems}
-        />
-      )}
+      <ChargeItemList
+        patient={patient}
+        encounter={encounter}
+        chargeItems={chargeItems}
+        updateChargeItems={setChargeItems}
+      />
     </Stack>
   );
-};
-
-const createDiagnosisArray = (conditions: Condition[]): ClaimDiagnosis[] => {
-  return conditions.map((condition, index) => {
-    const icd10Coding = condition.code?.coding?.find((c) => c.system === `${HTTP_HL7_ORG}/fhir/sid/icd-10-cm`);
-    return {
-      diagnosisCodeableConcept: {
-        coding: icd10Coding
-          ? [
-              {
-                ...icd10Coding,
-                system: `${HTTP_HL7_ORG}/fhir/sid/icd-10`,
-              },
-            ]
-          : [],
-      },
-      sequence: index + 1,
-      type: [{ coding: [{ code: index === 0 ? 'principal' : 'secondary' }] }],
-    };
-  });
 };

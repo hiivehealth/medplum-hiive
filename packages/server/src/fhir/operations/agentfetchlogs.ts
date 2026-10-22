@@ -2,26 +2,23 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { AgentLogsResponse, WithId } from '@medplum/core';
 import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
-import type { Agent, OperationDefinition } from '@medplum/fhirtypes';
+import type { Agent, ParametersParameter } from '@medplum/fhirtypes';
+import { makeOperationDefinition } from './definitions';
 import { handleBulkAgentOperation, sendAndHandleAgentRequest } from './utils/agentutils';
 import { parseInputParameters } from './utils/parameters';
 
-export const operation: OperationDefinition = {
-  resourceType: 'OperationDefinition',
-  name: 'agent-fetch-logs',
-  status: 'active',
-  kind: 'operation',
-  code: 'fetch-logs',
-  experimental: true,
-  resource: ['Agent'],
-  system: false,
-  type: true,
-  instance: true,
-  parameter: [
-    { use: 'in', name: 'limit', type: 'integer', min: 0, max: '1' },
-    { use: 'out', name: 'return', type: 'Parameters', min: 1, max: '1' },
-  ],
-};
+export const operation = makeOperationDefinition(
+  { scope: 'type-and-instance', resource: 'Agent' },
+  {
+    name: 'agent-fetch-logs',
+    code: 'fetch-logs',
+    parameter: [
+      { use: 'in', name: 'limit', type: 'integer', min: 0, max: '1' },
+      { use: 'in', name: 'before', type: 'string', min: 0, max: '1' },
+      { use: 'out', name: 'return', type: 'Parameters', min: 1, max: '1' },
+    ],
+  }
+);
 
 /**
  * Handles HTTP requests for the Agent $fetch-logs operation.
@@ -34,7 +31,9 @@ export const operation: OperationDefinition = {
  * @returns The FHIR response.
  */
 export async function agentFetchLogsHandler(req: FhirRequest): Promise<FhirResponse> {
-  const { limit: _limit, ...rest } = req.query;
+  // Strip pagination params from the query so they are not mistaken for Agent
+  // search filters by `handleBulkAgentOperation`. They are parsed separately.
+  const { limit: _limit, before: _before, ...rest } = req.query;
   const params = parseInputParameters<AgentFetchLogsOptions>(operation, req);
   req.query = rest;
 
@@ -43,23 +42,29 @@ export async function agentFetchLogsHandler(req: FhirRequest): Promise<FhirRespo
 
 export type AgentFetchLogsOptions = {
   limit?: number;
+  before?: string;
 };
 
 async function fetchLogs(agent: WithId<Agent>, options: AgentFetchLogsOptions): Promise<FhirResponse> {
   return sendAndHandleAgentRequest<AgentLogsResponse>(
     agent,
-    { type: 'agent:logs:request', limit: options?.limit },
+    { type: 'agent:logs:request', limit: options?.limit, before: options?.before },
     'agent:logs:response',
     {
       successHandler: (response) => {
+        const parameter: ParametersParameter[] = [
+          {
+            name: 'logs',
+            valueString: response.logs.map((msg) => JSON.stringify(msg)).join('\n'),
+          },
+          { name: 'hasMore', valueBoolean: response.hasMore ?? false },
+        ];
+        if (response.nextBefore !== undefined) {
+          parameter.push({ name: 'nextBefore', valueString: response.nextBefore });
+        }
         return {
           resourceType: 'Parameters',
-          parameter: [
-            {
-              name: 'logs',
-              valueString: response.logs.map((msg) => JSON.stringify(msg)).join('\n'),
-            },
-          ],
+          parameter,
         };
       },
     }

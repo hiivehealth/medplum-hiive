@@ -6,14 +6,16 @@ import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { createTestProject, initTestAuth } from '../../test.setup';
+import { createTestProject, getSuperAdminAccessToken } from '../../test.setup';
 
 describe('$explain', () => {
   const app = express();
+  let accessToken: string;
 
   beforeAll(async () => {
     const config = await loadTestConfig();
     await initApp(app, config);
+    accessToken = await getSuperAdminAccessToken();
   });
 
   afterAll(async () => {
@@ -21,8 +23,6 @@ describe('$explain', () => {
   });
 
   test.each(['json', 'text'])('Success with %s format', async (format) => {
-    const accessToken = await initTestAuth({ project: { superAdmin: true } });
-
     const res1 = await request(app)
       .post('/fhir/R4/$explain')
       .set('Authorization', 'Bearer ' + accessToken)
@@ -35,22 +35,34 @@ describe('$explain', () => {
           { name: 'format', valueString: format },
         ],
       } satisfies Parameters);
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
 
     const output = res1.body.parameter as ParametersParameter[];
-    expect(output).toHaveLength(3);
-    expect(output).toStrictEqual(
-      expect.arrayContaining<ParametersParameter>([
-        { name: 'query', valueString: expect.stringContaining('SELECT "Patient"') },
-        { name: 'parameters', valueString: expect.stringContaining('$1 = ') },
-        { name: 'explain', valueString: expect.stringContaining(format === 'json' ? '{"Plan":' : '(cost=') },
-      ])
-    );
+    expect(output).toContainExactly([
+      { name: 'query', valueString: expect.stringContaining('SELECT "Patient"') },
+      { name: 'parameters', valueString: expect.stringContaining('$1 = ') },
+      { name: 'explain', valueString: expect.stringContaining(format === 'json' ? '{"Plan":' : '(cost=') },
+    ]);
+  });
+
+  test.each(['json', 'text'])('Unicode characters in explain output escaped', async (format) => {
+    const res = await request(app)
+      .post('/fhir/R4/$explain')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        query: 'Observation?code:text=hemoglobin',
+        analyze: true,
+        count: false,
+        format,
+      });
+    expect(res).toHaveStatus(200);
+
+    const output = res.body.parameter as ParametersParameter[];
+    expect(output).toContainEqual({ name: 'parameters', valueString: expect.stringContaining('\\x03') });
   });
 
   test('Returns count when count parameter is true', async () => {
-    const accessToken = await initTestAuth({ project: { superAdmin: true } });
-
     const res = await request(app)
       .post('/fhir/R4/$explain')
       .set('Authorization', 'Bearer ' + accessToken)
@@ -63,15 +75,13 @@ describe('$explain', () => {
         ],
       } satisfies Parameters);
 
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     const output = res.body.parameter as ParametersParameter[];
     expect(output).toContainEqual(expect.objectContaining({ name: 'countEstimate', valueInteger: expect.any(Number) }));
     expect(output).toContainEqual(expect.objectContaining({ name: 'countAccurate', valueInteger: expect.any(Number) }));
   });
 
   test('Does not return count when count parameter is omitted', async () => {
-    const accessToken = await initTestAuth({ project: { superAdmin: true } });
-
     const res = await request(app)
       .post('/fhir/R4/$explain')
       .set('Authorization', 'Bearer ' + accessToken)
@@ -81,7 +91,7 @@ describe('$explain', () => {
         parameter: [{ name: 'query', valueString: 'Patient?active=true' }],
       } satisfies Parameters);
 
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     const output = res.body.parameter as ParametersParameter[];
     expect(output.find((p) => p.name === 'countEstimate')).toBeUndefined();
     expect(output.find((p) => p.name === 'countAccurate')).toBeUndefined();
@@ -93,8 +103,6 @@ describe('$explain', () => {
       withClient: true,
       project: { link: [{ project: createReference(linkedProject) }] },
     });
-    const accessToken = await initTestAuth({ project: { superAdmin: true } });
-
     const res1 = await request(app)
       .post('/fhir/R4/$explain')
       .set('Authorization', 'Bearer ' + accessToken)
@@ -104,7 +112,7 @@ describe('$explain', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'query', valueString: 'Patient?active=true' }],
       } satisfies Parameters);
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
 
     const output = res1.body.parameter as ParametersParameter[];
     const plan = output.find((p) => p.name === 'explain')?.valueString;

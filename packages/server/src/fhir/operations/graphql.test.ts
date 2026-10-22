@@ -5,6 +5,8 @@ import type { Binary, Bundle, Encounter, Patient, Practitioner, Resource, Servic
 import { randomUUID } from 'crypto';
 import express from 'express';
 import request from 'supertest';
+import type { MockInstance } from 'vitest';
+import { vi } from 'vitest';
 import { initApp, shutdownApp } from '../../app';
 import { registerNew } from '../../auth/register';
 import { loadTestConfig } from '../../config/loader';
@@ -13,6 +15,9 @@ import { getCacheRedis } from '../../redis';
 import { addTestUser, createTestProject, withTestContext } from '../../test.setup';
 import { Repository } from '../repo';
 import * as searchFile from '../search';
+import { normalizeShardId, PLACEHOLDER_SHARD_ID } from '../sharding';
+
+const shardId = normalizeShardId(PLACEHOLDER_SHARD_ID);
 
 const app = express();
 let practitioner: Practitioner;
@@ -42,6 +47,7 @@ describe('GraphQL', () => {
       practitioner = aliceRegistration.profile as Practitioner;
 
       const aliceRepo = new Repository({
+        routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
         author: createReference(aliceRegistration.profile),
         projects: [aliceRegistration.project],
       });
@@ -107,27 +113,29 @@ describe('GraphQL', () => {
 
       // Invite Bob with the access policy
       const bobRegistration = await addTestUser(aliceRegistration.project, {
-        resourceType: 'AccessPolicy',
-        resource: [
-          {
-            resourceType: 'Encounter',
-          },
-          {
-            resourceType: 'Patient',
-            hiddenFields: ['telecom'],
-          },
-          {
-            resourceType: 'ServiceRequest',
-            criteria: 'ServiceRequest?status=completed',
-          },
-        ],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          resource: [
+            {
+              resourceType: 'Encounter',
+            },
+            {
+              resourceType: 'Patient',
+              hiddenFields: ['telecom'],
+            },
+            {
+              resourceType: 'ServiceRequest',
+              criteria: 'ServiceRequest?status=completed',
+            },
+          ],
+        },
       });
       bobAccessToken = bobRegistration.accessToken;
     });
   });
 
   afterEach(() => {
-    jest.restoreAllMocks();
+    vi.restoreAllMocks();
   });
 
   afterAll(async () => {
@@ -234,7 +242,7 @@ describe('GraphQL', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.JSON)
       .send(introspectionRequest);
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.headers['cache-control']).toBe('public, max-age=31536000');
     expect(res1.text).toMatch(/_count/);
     expect(res1.text).toMatch(/_sort/);
@@ -245,7 +253,7 @@ describe('GraphQL', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.JSON)
       .send(introspectionRequest);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.text).toStrictEqual(res1.text);
   });
 
@@ -264,7 +272,7 @@ describe('GraphQL', () => {
           }
         }`,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.headers['cache-control']).toBe('public, max-age=31536000');
   });
 
@@ -282,7 +290,7 @@ describe('GraphQL', () => {
           }
         }`,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.headers['content-type']).toBe('application/json; charset=utf-8');
     expect(res.headers['cache-control']).toBe('no-store, no-cache, must-revalidate');
   });
@@ -303,7 +311,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.Patient).toBeDefined();
     expect(res.body.data.Patient.photo[0].url).toBeDefined();
     expect(res.body.data.Patient.photo[0].url).toMatch(/^http/);
@@ -324,7 +332,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.Patient).toBeNull();
     expect(res.body.errors[0].message).toStrictEqual('Not found');
   });
@@ -344,7 +352,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.PatientList).toBeDefined();
   });
 
@@ -362,7 +370,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.PatientList).toBeDefined();
     expect(res.body.data.PatientList.length).toBe(1);
   });
@@ -382,7 +390,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.PatientList).toBeDefined();
   });
 
@@ -400,7 +408,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.EncounterList).toBeDefined();
     expect(res.body.data.EncounterList.length).toBe(1);
   });
@@ -419,7 +427,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.EncounterList).toBeDefined();
     expect(res.body.data.EncounterList.length).toBe(1);
   });
@@ -439,7 +447,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.EncounterList).toBeDefined();
     expect(res.body.data.EncounterList.length >= 2).toBe(true);
 
@@ -463,7 +471,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.EncounterList).toBeDefined();
     expect(res.body.data.EncounterList.length >= 2).toBe(true);
 
@@ -501,7 +509,7 @@ describe('GraphQL', () => {
         }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.Encounter).toBeDefined();
   });
 
@@ -534,7 +542,7 @@ describe('GraphQL', () => {
         }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.Encounter).toBeDefined();
     expect(res.body.data.Encounter.subject.resource).toBeNull();
   });
@@ -560,7 +568,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.PatientList).toBeDefined();
     expect(res.body.data.PatientList[0].ObservationList).toBeDefined();
   });
@@ -586,7 +594,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
   });
 
   test.skip('Max depth', async () => {
@@ -626,7 +634,7 @@ describe('GraphQL', () => {
         }
     `,
       });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
 
     // 10 levels of nesting is too much
     const res2 = await request(app)
@@ -684,7 +692,7 @@ describe('GraphQL', () => {
         }
     `,
       });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue[0].details.text).toStrictEqual('Field "id" exceeds max depth (depth=13, max=12)');
   });
 
@@ -722,7 +730,7 @@ describe('GraphQL', () => {
         }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.EncounterList).toBeDefined();
     expect(res.body.data.EncounterList).toHaveLength(2);
 
@@ -746,7 +754,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.Practitioner).toBeNull();
   });
 
@@ -775,7 +783,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.Patient).toBeDefined();
     expect(res.body.data.Patient.generalPractitioner[0].resource).toBeNull();
   });
@@ -795,7 +803,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.ServiceRequest).toBeNull();
   });
 
@@ -822,7 +830,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.Encounter).toBeDefined();
     expect(res.body.data.Encounter.basedOn[0].resource).toBeNull();
   });
@@ -844,7 +852,7 @@ describe('GraphQL', () => {
         resourceType: 'Patient',
         name: [{ given: ['Alice'], family: 'Smith' }],
       });
-    expect(res1.status).toBe(201);
+    expect(res1).toHaveStatus(201);
 
     // GraphQL request with one search is ok
     const res2 = await request(app)
@@ -860,7 +868,7 @@ describe('GraphQL', () => {
         }
     `,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.data.PatientList).toHaveLength(1);
 
     // GraphQL request with nested search is not ok
@@ -882,7 +890,7 @@ describe('GraphQL', () => {
         }
     `,
       });
-    expect(res3.status).toBe(200);
+    expect(res3).toHaveStatus(200);
     expect(res3.body.data.PatientList).toHaveLength(1);
     expect(res3.body.data.PatientList[0].encounters).toBeNull();
     expect(res3.body.errors).toHaveLength(1);
@@ -907,19 +915,19 @@ describe('GraphQL', () => {
               }
             }`,
         });
-      expect(res.status).toBe(200);
+      expect(res).toHaveStatus(200);
 
       return res.body.data;
     }
 
-    let searchByReferenceSpy: jest.SpyInstance<ReturnType<typeof searchFile.searchByReferenceImpl>>;
+    let searchByReferenceSpy: MockInstance<typeof searchFile.searchByReferenceImpl>;
 
     beforeEach(async () => {
-      searchByReferenceSpy = jest.spyOn(searchFile, 'searchByReferenceImpl');
+      searchByReferenceSpy = vi.spyOn(searchFile, 'searchByReferenceImpl');
     });
 
     afterEach(() => {
-      jest.restoreAllMocks();
+      vi.restoreAllMocks();
     });
 
     test('disabled without project setting', async () => {
@@ -1043,25 +1051,29 @@ describe('GraphQL', () => {
       hasId(obs);
 
       const { accessToken: restrictedAccessToken } = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        resource: [
-          {
-            resourceType: 'Patient',
-          },
-        ],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          resource: [
+            {
+              resourceType: 'Patient',
+            },
+          ],
+        },
       });
 
       const { accessToken: hiddenBodySiteAccessToken } = await addTestUser(project, {
-        resourceType: 'AccessPolicy',
-        resource: [
-          {
-            resourceType: 'Patient',
-          },
-          {
-            resourceType: 'Observation',
-            hiddenFields: ['bodySite'],
-          },
-        ],
+        accessPolicy: {
+          resourceType: 'AccessPolicy',
+          resource: [
+            {
+              resourceType: 'Patient',
+            },
+            {
+              resourceType: 'Observation',
+              hiddenFields: ['bodySite'],
+            },
+          ],
+        },
       });
 
       // No AccessPolicy
@@ -1133,22 +1145,22 @@ describe('GraphQL', () => {
   });
 
   test('Uses reader instance when available', async () => {
-    const readerSpy = jest.spyOn(getDatabasePool(DatabaseMode.READER), 'query');
-    const writerSpy = jest.spyOn(getDatabasePool(DatabaseMode.WRITER), 'query');
+    const readerSpy = vi.spyOn(getDatabasePool(DatabaseMode.READER, shardId), 'query');
+    const writerSpy = vi.spyOn(getDatabasePool(DatabaseMode.WRITER, shardId), 'query');
 
     const res = await request(app)
       .post('/fhir/R4/$graphql')
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.JSON)
       .send({ query: `{ PatientList(_id: "${patient.id}") { id } }` });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(readerSpy).toHaveBeenCalledTimes(1);
     expect(writerSpy).toHaveBeenCalledTimes(0);
   });
 
   test('GraphQL in batch users writer', async () => {
-    const readerSpy = jest.spyOn(getDatabasePool(DatabaseMode.READER), 'query');
-    const writerSpy = jest.spyOn(getDatabasePool(DatabaseMode.WRITER), 'query');
+    const readerSpy = vi.spyOn(getDatabasePool(DatabaseMode.READER, shardId), 'query');
+    const writerSpy = vi.spyOn(getDatabasePool(DatabaseMode.WRITER, shardId), 'query');
 
     const batch: Bundle = {
       resourceType: 'Bundle',
@@ -1170,7 +1182,7 @@ describe('GraphQL', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON)
       .send(batch);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.resourceType).toStrictEqual('Bundle');
     expect(res.body.entry[0].resource.data.PatientList).toHaveLength(1);
     expect(res.body.entry[0].resource.data.PatientList[0].id).toBe(patient.id);
@@ -1201,7 +1213,7 @@ describe('GraphQL', () => {
           }
         `,
       });
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(res1.body.data.EncounterConnection.edges).toHaveLength(1);
     const firstId = res1.body.data.EncounterConnection.edges[0].resource.id;
     expect([encounter1.id, encounter2.id]).toContain(firstId);
@@ -1225,7 +1237,7 @@ describe('GraphQL', () => {
           }
         `,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.data.EncounterConnection.edges).toHaveLength(1);
     const secondId = res2.body.data.EncounterConnection.edges[0].resource.id;
     expect([encounter1.id, encounter2.id]).toContain(secondId);
@@ -1242,10 +1254,10 @@ describe('GraphQL', () => {
         name: [{ text: 'Charlie Smith' }],
         generalPractitioner: [createReference(practitioner)],
       } satisfies Patient);
-    expect(patRes.status).toBe(201);
+    expect(patRes).toHaveStatus(201);
 
     const redis = getCacheRedis();
-    const mgetSpy = jest.spyOn(redis, 'mget');
+    const mgetSpy = vi.spyOn(redis, 'mget');
 
     const res = await request(app)
       .post('/fhir/R4/$graphql')
@@ -1265,7 +1277,7 @@ describe('GraphQL', () => {
       }
     `,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.data.PatientList).toBeDefined();
     // Only one instance of the practitioner ID should be looked up
     expect(mgetSpy).toHaveBeenCalledWith([getReferenceString(practitioner)]);
