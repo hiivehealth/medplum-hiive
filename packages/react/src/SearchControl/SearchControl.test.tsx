@@ -5,21 +5,20 @@ import { Operator } from '@medplum/core';
 import type { Bundle } from '@medplum/fhirtypes';
 import { HomerSimpson, MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
-import { MemoryRouter } from 'react-router';
 import { act, fireEvent, render, screen } from '../test-utils/render';
 import type { SearchControlProps } from './SearchControl';
 import { SearchControl } from './SearchControl';
 
 describe('SearchControl', () => {
   beforeEach(() => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
   });
 
   afterEach(async () => {
     await act(async () => {
-      jest.runOnlyPendingTimers();
+      vi.runOnlyPendingTimers();
     });
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   async function setup(
@@ -28,13 +27,11 @@ describe('SearchControl', () => {
     medplum: MockClient = new MockClient()
   ): Promise<{ rerender: (props: SearchControlProps) => Promise<void> }> {
     if (returnVal) {
-      medplum.search = jest.fn().mockResolvedValue(returnVal);
+      medplum.search = vi.fn().mockResolvedValue(returnVal);
     }
     const { rerender: _rerender } = await act(async () =>
       render(<SearchControl {...props} />, ({ children }) => (
-        <MemoryRouter>
-          <MedplumProvider medplum={medplum}>{children}</MedplumProvider>
-        </MemoryRouter>
+        <MedplumProvider medplum={medplum}>{children}</MedplumProvider>
       ))
     );
     return {
@@ -57,7 +54,7 @@ describe('SearchControl', () => {
         ],
         fields: ['id', '_lastUpdated', 'name'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -66,6 +63,35 @@ describe('SearchControl', () => {
 
     expect(props.onLoad).toHaveBeenCalled();
     expect(screen.getByText('Homer Simpson')).toBeInTheDocument();
+  });
+
+  test('Hides actions button when no actions are available', async () => {
+    await setup({ search: { resourceType: 'Patient' } });
+
+    expect(screen.getByRole('button', { name: 'Refresh' })).toBeInTheDocument();
+    expect(screen.queryByRole('button', { name: 'Actions' })).not.toBeInTheDocument();
+  });
+
+  test('Renders additional columns', async () => {
+    const props: SearchControlProps = {
+      search: {
+        resourceType: 'Patient',
+        fields: ['id', 'name'],
+      },
+      additionalColumns: [
+        {
+          name: 'Custom Column',
+          renderCell: (resource) => <span>cell-{resource.id}</span>,
+        },
+      ],
+    };
+
+    await setup(props);
+
+    expect(await screen.findByText('Homer Simpson')).toBeInTheDocument();
+    // The additional column header and a computed cell for the row are rendered.
+    expect(screen.getByText('Custom Column')).toBeInTheDocument();
+    expect(screen.getByText(`cell-${HomerSimpson.id}`)).toBeInTheDocument();
   });
 
   test('Rerender does not trigger `loadResult` when `search` deep equals `memoizedSearch`', async () => {
@@ -83,7 +109,7 @@ describe('SearchControl', () => {
 
     const props = {
       search,
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     const { rerender } = await setup(props);
@@ -117,7 +143,7 @@ describe('SearchControl', () => {
 
     const props = {
       search,
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     const { rerender } = await setup(props);
@@ -168,7 +194,7 @@ describe('SearchControl', () => {
         ],
         fields: ['id', '_lastUpdated', 'name'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -190,7 +216,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -204,7 +230,7 @@ describe('SearchControl', () => {
         resourceType: 'Observation',
         fields: ['value[x]'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -226,7 +252,7 @@ describe('SearchControl', () => {
         ],
         fields: ['id', '_lastUpdated', 'name'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
       checkboxesEnabled: true,
     };
 
@@ -247,7 +273,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
       checkboxesEnabled: true,
     };
 
@@ -262,7 +288,7 @@ describe('SearchControl', () => {
         resourceType: 'Patient',
         fields: ['id', '_lastUpdated', 'name', 'birthDate', 'active', 'email', 'phone'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -278,7 +304,7 @@ describe('SearchControl', () => {
         resourceType: 'Patient',
         fields: ['id', '_lastUpdated', 'name', 'address-city', 'address-state'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -301,7 +327,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -322,7 +348,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onChange: jest.fn(),
+      onChange: vi.fn(),
     };
 
     await setup(props);
@@ -374,7 +400,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onChange: jest.fn(),
+      onChange: vi.fn(),
     };
 
     await setup(props);
@@ -389,7 +415,7 @@ describe('SearchControl', () => {
   });
 
   test('New button', async () => {
-    const onNew = jest.fn();
+    const onNew = vi.fn();
 
     await setup({
       search: {
@@ -398,17 +424,17 @@ describe('SearchControl', () => {
       onNew,
     });
 
-    expect(await screen.findByText('New...')).toBeInTheDocument();
+    expect(await screen.findByLabelText('New Patient')).toBeInTheDocument();
 
     await act(async () => {
-      fireEvent.click(screen.getByText('New...'));
+      fireEvent.click(screen.getByLabelText('New Patient'));
     });
 
     expect(onNew).toHaveBeenCalled();
   });
 
   test('Export button', async () => {
-    const onExportCsv = jest.fn();
+    const onExportCsv = vi.fn();
 
     await setup({
       search: {
@@ -417,10 +443,12 @@ describe('SearchControl', () => {
       onExportCsv,
     });
 
-    expect(await screen.findByText('Export...')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(await screen.findByLabelText('Actions'));
+    });
 
     await act(async () => {
-      fireEvent.click(screen.getByText('Export...'));
+      fireEvent.click(await screen.findByText('Export'));
     });
 
     expect(await screen.findByText('Export as CSV')).toBeInTheDocument();
@@ -431,26 +459,37 @@ describe('SearchControl', () => {
   });
 
   test('Delete button', async () => {
-    const onDelete = jest.fn();
+    const onDelete = vi.fn();
 
     await setup({
       search: {
         resourceType: 'Patient',
       },
+      checkboxesEnabled: true,
       onDelete,
     });
 
-    expect(await screen.findByText('Delete...')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(await screen.findByTestId('all-checkbox'));
+    });
 
     await act(async () => {
-      fireEvent.click(screen.getByText('Delete...'));
+      fireEvent.click(await screen.findByLabelText('Actions'));
+    });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByText('Delete'));
+    });
+
+    await act(async () => {
+      fireEvent.click(await screen.findByRole('button', { name: 'Delete' }));
     });
 
     expect(onDelete).toHaveBeenCalled();
   });
 
   test('Bulk button', async () => {
-    const onBulk = jest.fn();
+    const onBulk = vi.fn();
 
     await setup({
       search: {
@@ -459,10 +498,12 @@ describe('SearchControl', () => {
       onBulk,
     });
 
-    expect(await screen.findByText('Bulk...')).toBeInTheDocument();
+    await act(async () => {
+      fireEvent.click(await screen.findByLabelText('Actions'));
+    });
 
     await act(async () => {
-      fireEvent.click(screen.getByText('Bulk...'));
+      fireEvent.click(await screen.findByText('Bulk Apply'));
     });
 
     expect(onBulk).toHaveBeenCalled();
@@ -480,8 +521,8 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onClick: jest.fn(),
-      onAuxClick: jest.fn(),
+      onClick: vi.fn(),
+      onAuxClick: vi.fn(),
     };
 
     await setup(props);
@@ -508,8 +549,8 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onClick: jest.fn(),
-      onAuxClick: jest.fn(),
+      onClick: vi.fn(),
+      onAuxClick: vi.fn(),
     };
 
     await setup(props);
@@ -556,7 +597,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -586,7 +627,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -604,37 +645,43 @@ describe('SearchControl', () => {
     });
   });
 
-  test('Filter editor onOk', async () => {
-    const props: SearchControlProps = {
-      search: {
-        resourceType: 'Patient',
-        filters: [
-          {
-            code: 'name',
-            operator: Operator.EQUALS,
-            value: 'Simpson',
-          },
-        ],
-      },
-      onLoad: jest.fn(),
-    };
-
-    await setup(props);
-
-    expect(await screen.findByTestId('search-control')).toBeInTheDocument();
-
+  async function openFieldOptions(): Promise<void> {
+    await setup({ search: { resourceType: 'Patient', fields: ['name'] }, onLoad: vi.fn() });
     await act(async () => {
-      fireEvent.click(screen.getByText('Filters'));
+      fireEvent.click(screen.getByText('Fields'));
     });
-
-    expect(await screen.findByText('OK')).toBeInTheDocument();
-
     await act(async () => {
-      fireEvent.click(screen.getByText('OK'));
+      fireEvent.focus(await screen.findByPlaceholderText('Select fields to display'));
     });
+    await screen.findByRole('option', { name: 'Name', hidden: true });
+  }
+
+  function fieldOption(name: string): HTMLElement | null {
+    return screen.queryByRole('option', { name, hidden: true });
+  }
+
+  test('Field editor offers resource properties that have no search parameter', async () => {
+    await openFieldOptions();
+    expect(fieldOption('Photo')).toBeInTheDocument();
+    expect(fieldOption('Marital Status')).toBeInTheDocument();
+    expect(fieldOption('Meta')).toBeInTheDocument();
   });
 
-  test('Filter editor onCancel', async () => {
+  test('Field editor offers a property once, even when a search parameter shares its name', async () => {
+    await openFieldOptions();
+    expect(fieldOption('Birth Date')).toBeInTheDocument();
+    expect(fieldOption('Birthdate')).toBeNull();
+    expect(screen.getAllByRole('option', { name: 'ID', hidden: true })).toHaveLength(1);
+  });
+
+  test('Field editor still offers search parameters that are not properties', async () => {
+    await openFieldOptions();
+    expect(fieldOption('Last Updated')).toBeInTheDocument();
+    expect(fieldOption('Phone')).toBeInTheDocument();
+  });
+
+  test('Filter popover applies a removed filter to the search', async () => {
+    const onChange = vi.fn();
     const props: SearchControlProps = {
       search: {
         resourceType: 'Patient',
@@ -646,22 +693,28 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
+      onChange,
     };
 
     await setup(props);
 
     expect(await screen.findByTestId('search-control')).toBeInTheDocument();
+    expect(screen.getByRole('button', { name: 'Filters' })).toHaveAccessibleDescription('1 Filter Applied');
 
     await act(async () => {
       fireEvent.click(screen.getByText('Filters'));
     });
 
-    expect(await screen.findByLabelText('Close')).toBeInTheDocument();
+    expect(await screen.findByText('Add Filter')).toBeInTheDocument();
+    expect(screen.getByLabelText('Filter 1 field', { selector: 'input' })).toHaveValue('Name');
 
     await act(async () => {
-      fireEvent.click(screen.getByLabelText('Close'));
+      fireEvent.click(screen.getByLabelText('Remove filter 1'));
     });
+
+    expect(onChange).toHaveBeenCalledTimes(1);
+    expect(onChange.mock.calls[0][0].definition.filters).toEqual([]);
   });
 
   test('Popup menu and prompt', async () => {
@@ -677,7 +730,7 @@ describe('SearchControl', () => {
         ],
         fields: ['id', 'name'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -716,7 +769,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
       checkboxesEnabled: true,
     };
 
@@ -751,7 +804,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
       checkboxesEnabled: true,
     };
 
@@ -791,7 +844,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
       checkboxesEnabled: true,
     };
 
@@ -832,7 +885,7 @@ describe('SearchControl', () => {
         ],
         fields: ['id', '_lastUpdated', 'name'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
       hideToolbar: true,
     };
 
@@ -856,7 +909,7 @@ describe('SearchControl', () => {
         ],
         fields: ['id', '_lastUpdated', 'name'],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
       hideFilters: true,
     };
 
@@ -880,7 +933,7 @@ describe('SearchControl', () => {
           },
         ],
       },
-      onLoad: jest.fn(),
+      onLoad: vi.fn(),
     };
 
     await setup(props);
@@ -891,7 +944,7 @@ describe('SearchControl', () => {
   });
 
   test('Refresh results', async () => {
-    const onLoad = jest.fn();
+    const onLoad = vi.fn();
 
     const props: SearchControlProps = {
       search: {
@@ -924,8 +977,114 @@ describe('SearchControl', () => {
     expect(onLoad).toHaveBeenCalled();
   });
 
+  test('Row keyboard navigation', async () => {
+    const onClick = vi.fn();
+    const onAuxClick = vi.fn();
+    await setup({
+      search: {
+        resourceType: 'Patient',
+        filters: [{ code: 'name', operator: Operator.EQUALS, value: 'Simpson' }],
+      },
+      checkboxesEnabled: true,
+      onClick,
+      onAuxClick,
+    });
+    expect(await screen.findByTestId('search-control')).toBeInTheDocument();
+    const rows = screen.getAllByTestId('search-control-row');
+    expect(rows.length).toBeGreaterThan(1);
+    const first = rows[0];
+    const second = rows[1];
+    const last = rows[rows.length - 1];
+
+    // Roving tab index: one tab stop, following focus
+    expect(first).toHaveAttribute('tabindex', '0');
+    expect(second).toHaveAttribute('tabindex', '-1');
+    await act(async () => {
+      second.focus();
+    });
+    expect(first).toHaveAttribute('tabindex', '-1');
+    expect(second).toHaveAttribute('tabindex', '0');
+
+    // Arrow keys move between rows and stop at the edges
+    await act(async () => {
+      first.focus();
+      fireEvent.keyDown(first, { key: 'ArrowDown' });
+    });
+    expect(second).toHaveFocus();
+    await act(async () => {
+      fireEvent.keyDown(second, { key: 'ArrowUp' });
+    });
+    expect(first).toHaveFocus();
+    await act(async () => {
+      fireEvent.keyDown(first, { key: 'ArrowUp' });
+    });
+    expect(first).toHaveFocus();
+    await act(async () => {
+      last.focus();
+      fireEvent.keyDown(last, { key: 'ArrowDown' });
+    });
+    expect(last).toHaveFocus();
+
+    // Home and End
+    await act(async () => {
+      fireEvent.keyDown(last, { key: 'Home' });
+    });
+    expect(first).toHaveFocus();
+    await act(async () => {
+      fireEvent.keyDown(first, { key: 'End' });
+    });
+    expect(last).toHaveFocus();
+
+    // Enter clicks the row; Ctrl/Cmd+Enter is an aux click
+    await act(async () => {
+      fireEvent.keyDown(first, { key: 'Enter' });
+    });
+    expect(onClick).toHaveBeenCalledTimes(1);
+    expect(onClick.mock.calls[0][0].resource.id).toEqual(HomerSimpson.id);
+    expect(onAuxClick).not.toHaveBeenCalled();
+    await act(async () => {
+      fireEvent.keyDown(first, { key: 'Enter', ctrlKey: true });
+      fireEvent.keyDown(first, { key: 'Enter', metaKey: true });
+    });
+    expect(onAuxClick).toHaveBeenCalledTimes(2);
+    expect(onClick).toHaveBeenCalledTimes(1);
+
+    // Space toggles the row checkbox without clicking the row
+    const checkbox = screen.getAllByTestId<HTMLInputElement>('row-checkbox')[0];
+    expect(checkbox.checked).toEqual(false);
+    await act(async () => {
+      fireEvent.keyDown(first, { key: ' ' });
+    });
+    expect(checkbox.checked).toEqual(true);
+    await act(async () => {
+      fireEvent.keyDown(first, { key: ' ' });
+    });
+    expect(checkbox.checked).toEqual(false);
+    expect(onClick).toHaveBeenCalledTimes(1);
+
+    // Unrelated keys keep their default; handled keys do not
+    let letterDefaultAllowed = false;
+    let arrowDefaultAllowed = true;
+    await act(async () => {
+      letterDefaultAllowed = fireEvent.keyDown(first, { key: 'a' });
+      arrowDefaultAllowed = fireEvent.keyDown(first, { key: 'ArrowDown' });
+    });
+    expect(letterDefaultAllowed).toEqual(true);
+    expect(arrowDefaultAllowed).toEqual(false);
+
+    // Keys from a control inside the row are not handled
+    const cell = first.querySelector('td') as HTMLElement;
+    await act(async () => {
+      first.focus();
+      fireEvent.keyDown(cell, { key: 'ArrowDown' });
+      fireEvent.keyDown(cell, { key: 'Enter' });
+    });
+    expect(first).toHaveFocus();
+    expect(onClick).toHaveBeenCalledTimes(1);
+  });
+
   describe('Pagination', () => {
-    const onLoad = jest.fn();
+    const onLoad = vi.fn();
     const search: SearchRequest = {
       resourceType: 'Patient',
       count: 20,

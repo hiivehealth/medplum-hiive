@@ -1,17 +1,20 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { ContentType, EMPTY } from '@medplum/core';
-import type { CodeSystem } from '@medplum/fhirtypes';
+import type { CodeSystem, ParametersParameter, ValueSet } from '@medplum/fhirtypes';
+import { randomUUID } from 'crypto';
 import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
 import { DatabaseMode, getDatabasePool } from '../../database';
-import { createTestProject, initTestAuth } from '../../test.setup';
+import { createTestProject, getSuperAdminAccessToken, initTestAuth } from '../../test.setup';
+import { normalizeShardId, TODO_SHARD_ID } from '../sharding';
 import { Column, Condition, SelectQuery } from '../sql';
 import { selectCoding } from './utils/terminology';
 
 const app = express();
+let shardId: string;
 
 export const snomedJSON: CodeSystem = {
   resourceType: 'CodeSystem',
@@ -30,6 +33,10 @@ export const snomedJSON: CodeSystem = {
       description: 'A SNOMED CT concept id that has the target of a direct is-a relationship from the concept',
       type: 'code',
     },
+    {
+      code: 'active',
+      type: 'boolean',
+    },
   ],
 };
 
@@ -43,21 +50,21 @@ describe('CodeSystem $import', () => {
   });
 
   beforeEach(async () => {
-    accessToken = await initTestAuth({ superAdmin: true });
-    expect(accessToken).toBeDefined();
+    accessToken = await getSuperAdminAccessToken();
+    shardId = normalizeShardId(TODO_SHARD_ID); // get via getSuperAdminTestProject
 
     const resS = await request(app)
       .get(`/fhir/R4/CodeSystem?url=${snomedJSON.url}`)
       .set('Authorization', 'Bearer ' + accessToken)
       .send();
-    expect(resS.status).toStrictEqual(200);
+    expect(resS).toHaveStatus(200);
 
     for (const entry of resS.body.entry ?? EMPTY) {
       const resD = await request(app)
         .delete(`/fhir/R4/CodeSystem/${entry.resource.id}`)
         .set('Authorization', 'Bearer ' + accessToken)
         .send();
-      expect(resD.status).toStrictEqual(200);
+      expect(resD).toHaveStatus(200);
     }
 
     const res = await request(app)
@@ -65,7 +72,7 @@ describe('CodeSystem $import', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON)
       .send(snomedJSON);
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     snomed = res.body as CodeSystem;
   });
 
@@ -86,7 +93,7 @@ describe('CodeSystem $import', () => {
           { name: 'concept', valueCoding: { code: '315306007', display: 'Examination by method (procedure)' } },
         ],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
 
     const res2 = await request(app)
       .post(`/fhir/R4/CodeSystem/$import`)
@@ -106,7 +113,7 @@ describe('CodeSystem $import', () => {
           },
         ],
       });
-    expect(res2.status).toStrictEqual(200);
+    expect(res2).toHaveStatus(200);
 
     const coding = await assertCodeExists(snomed.id, '37931006');
     expect(coding.isSynonym).toBe(false);
@@ -153,7 +160,7 @@ describe('CodeSystem $import', () => {
           },
         ],
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     await assertCodeExists(snomed.id, '702707005');
     const target = await assertCodeExists(snomed.id, '118690002');
@@ -173,7 +180,7 @@ describe('CodeSystem $import', () => {
           { name: 'concept', valueCoding: { code: '1', display: 'Aspirin' } },
         ],
       });
-    expect(res.status).toStrictEqual(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].code).toStrictEqual('invalid');
   });
 
@@ -196,7 +203,7 @@ describe('CodeSystem $import', () => {
           },
         ],
       });
-    expect(res2.status).toStrictEqual(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue[0].code).toStrictEqual('invalid');
   });
 
@@ -220,7 +227,7 @@ describe('CodeSystem $import', () => {
           },
         ],
       });
-    expect(res2.status).toStrictEqual(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue[0].code).toStrictEqual('invalid');
   });
 
@@ -237,7 +244,7 @@ describe('CodeSystem $import', () => {
           { name: 'concept', valueCoding: { code: '184598004', display: 'Needle biopsy of brain (procedure)' } },
         ],
       });
-    expect(res2.status).toStrictEqual(403);
+    expect(res2).toHaveStatus(403);
     expect(res2.body.issue[0].code).toStrictEqual('forbidden');
   });
 
@@ -254,7 +261,7 @@ describe('CodeSystem $import', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON)
       .send(snomedJSON);
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
 
     const res2 = await request(app)
       .post(`/fhir/R4/CodeSystem/$import`)
@@ -267,7 +274,7 @@ describe('CodeSystem $import', () => {
           { name: 'concept', valueCoding: { code: '184598004', display: 'Needle biopsy of brain (procedure)' } },
         ],
       });
-    expect(res2.status).toStrictEqual(200);
+    expect(res2).toHaveStatus(200);
     await assertCodeExists(res.body.id, '184598004');
   });
 
@@ -289,7 +296,114 @@ describe('CodeSystem $import', () => {
           { name: 'concept', valueCoding: { code: 'NIBL', display: 'nibling' } },
         ],
       });
-    expect(res2.status).toStrictEqual(400);
+    expect(res2).toHaveStatus(400);
+  });
+
+  test('Allows Super Admin to import into base CodeSystem by ID', async () => {
+    // `accessToken` is a Super Admin; base terminology maintenance must remain possible
+    const res = await request(app)
+      .get('/fhir/R4/CodeSystem?url=http://terminology.hl7.org/CodeSystem/v3-RoleCode')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send();
+    expect(res).toHaveStatus(200);
+    const baseCodeSystem = res.body.entry?.[0]?.resource as CodeSystem;
+    expect(baseCodeSystem?.id).toBeDefined();
+
+    const code = 'ZZ' + randomUUID();
+    const res2 = await request(app)
+      .post(`/fhir/R4/CodeSystem/${baseCodeSystem.id}/$import`)
+      .set('X-Medplum', 'extended')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [{ name: 'concept', valueCoding: { code, display: 'Super Admin concept' } }],
+      });
+    expect(res2).toHaveStatus(200);
+    await assertCodeExists(baseCodeSystem.id, code);
+  });
+
+  test('Prevents writes by Project admin to base CodeSystem by ID', async () => {
+    // Base R4 CodeSystems are readable from every Project, but the Coding table they write into is
+    // shared server-wide; importing into one by ID must not bypass the `ownProjectOnly` check.
+    const { accessToken } = await createTestProject({
+      project: { superAdmin: false },
+      membership: { admin: true },
+      withAccessToken: true,
+    });
+
+    const res = await request(app)
+      .get('/fhir/R4/CodeSystem?url=http://terminology.hl7.org/CodeSystem/v3-RoleCode')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send();
+    expect(res).toHaveStatus(200);
+    const baseCodeSystem = res.body.entry?.[0]?.resource as CodeSystem;
+    expect(baseCodeSystem?.id).toBeDefined();
+
+    const code = 'ZZ' + randomUUID();
+    const res2 = await request(app)
+      .post(`/fhir/R4/CodeSystem/${baseCodeSystem.id}/$import`)
+      .set('X-Medplum', 'extended')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [{ name: 'concept', valueCoding: { code, display: 'Injected concept' } }],
+      });
+    expect(res2).toHaveStatus(403);
+    await assertCodeMissing(baseCodeSystem.id, code);
+  });
+
+  test('Imports into own Project CodeSystem by ID', async () => {
+    const { accessToken, repo } = await createTestProject({
+      withAccessToken: true,
+      withRepo: true,
+      membership: { admin: true },
+    });
+    const codeSystem = await repo.createResource<CodeSystem>({
+      ...snomedJSON,
+      url: 'http://example.com/CodeSystem/' + randomUUID(),
+    });
+
+    const code = 'ZZ' + randomUUID();
+    const res = await request(app)
+      .post(`/fhir/R4/CodeSystem/${codeSystem.id}/$import`)
+      .set('X-Medplum', 'extended')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [{ name: 'concept', valueCoding: { code, display: 'Own project concept' } }],
+      });
+    expect(res).toHaveStatus(200);
+    await assertCodeExists(codeSystem.id, code);
+  });
+
+  test('Requires update permission on own Project CodeSystem', async () => {
+    // Writing a CodeSystem's contents requires permission to update the CodeSystem itself
+    const { accessToken, repo } = await createTestProject({
+      withAccessToken: true,
+      withRepo: true,
+      membership: { admin: true },
+      accessPolicy: { resource: [{ resourceType: 'CodeSystem', interaction: ['create', 'read'] }] },
+    });
+    const codeSystem = await repo.createResource<CodeSystem>({
+      ...snomedJSON,
+      url: 'http://example.com/CodeSystem/' + randomUUID(),
+    });
+
+    const code = 'ZZ' + randomUUID();
+    const res = await request(app)
+      .post(`/fhir/R4/CodeSystem/${codeSystem.id}/$import`)
+      .set('X-Medplum', 'extended')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [{ name: 'concept', valueCoding: { code, display: 'Read-only policy' } }],
+      });
+    expect(res).toHaveStatus(403);
+    await assertCodeMissing(codeSystem.id, code);
   });
 
   test('Imports concepts and synonym designations', async () => {
@@ -319,15 +433,156 @@ describe('CodeSystem $import', () => {
           },
         ],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
 
     const coding = await assertCodeExists(snomed.id, '37931006');
     expect(coding.isSynonym).toBe(false);
   });
+
+  test('Attaches imported properties to primary coding instead of synonym', async () => {
+    const resCreate = await request(app)
+      .post(`/fhir/R4/CodeSystem/$import`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [
+          { name: 'system', valueUri: snomed.url },
+          { name: 'concept', valueCoding: { code: '12345', display: 'Test code' } },
+          {
+            name: 'designation',
+            part: [
+              { name: 'code', valueCode: '12345' },
+              { name: 'value', valueString: 'Test designation' },
+            ],
+          },
+        ],
+      });
+    expect(resCreate).toHaveStatus(200);
+
+    const resUpsert = await request(app)
+      .post(`/fhir/R4/CodeSystem/$import`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [
+          { name: 'system', valueUri: snomed.url },
+          { name: 'concept', valueCoding: { code: '12345', display: 'Test code' } },
+        ],
+      });
+    expect(resUpsert).toHaveStatus(200);
+
+    const resProperty = await request(app)
+      .post(`/fhir/R4/CodeSystem/$import`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter: [
+          { name: 'system', valueUri: snomed.url },
+          {
+            name: 'property',
+            part: [
+              { name: 'code', valueCode: '12345' },
+              { name: 'property', valueCode: 'parent' },
+              { name: 'value', valueString: '98765' },
+            ],
+          },
+        ],
+      });
+    expect(resProperty).toHaveStatus(200);
+
+    const coding = await assertCodeExists(snomed.id, '12345');
+    const result = await assertPropertyExists(snomed.id, '12345', 'parent', '98765');
+    expect(result.codingId).toStrictEqual(coding.id); // Property should be attached to primary coding row
+
+    const resValueSet = await request(app)
+      .post(`/fhir/R4/ValueSet`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'ValueSet',
+        url: 'http://example.com/ValueSet/' + randomUUID(),
+        status: 'active',
+        compose: {
+          include: [
+            {
+              system: snomed.url,
+              filter: [{ property: 'parent', op: '=', value: '98765' }],
+            },
+          ],
+        },
+      });
+    expect(resValueSet).toHaveStatus(201);
+    const valueSet = resValueSet.body as ValueSet;
+
+    const resExpand = await request(app)
+      .get(`/fhir/R4/ValueSet/$expand?url=${valueSet.url}`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send();
+    expect(resExpand).toHaveStatus(200);
+    const expanded = resExpand.body as ValueSet;
+    expect(expanded.expansion?.contains).toHaveLength(1);
+  });
+
+  test('Rejects excessively large batches', async () => {
+    const parameter: ParametersParameter[] = [{ name: 'system', valueUri: snomed.url }];
+    for (let i = 0; i < 1001; i++) {
+      parameter.push({ name: 'concept', valueCoding: { code: i.toString() } });
+    }
+    const res = await request(app)
+      .post(`/fhir/R4/CodeSystem/$import`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter,
+      });
+    expect(res.status).toBe(400);
+    expect(res.body.issue?.[0]).toStrictEqual({
+      code: 'invalid',
+      details: { text: 'Expected 0..1000 value(s) for input parameter concept, but 1001 provided' },
+      severity: 'error',
+    });
+  });
+
+  test('Accepts batch of max size', async () => {
+    const parameter: ParametersParameter[] = [{ name: 'system', valueUri: snomed.url }];
+    for (let i = 0; i < 1000; i++) {
+      parameter.push({ name: 'concept', valueCoding: { code: i.toString() } });
+      parameter.push({
+        name: 'property',
+        part: [
+          { name: 'code', valueCode: i.toString() },
+          { name: 'property', valueCode: 'active' },
+          { name: 'value', valueString: '1' },
+        ],
+      });
+      parameter.push({
+        name: 'designation',
+        part: [
+          { name: 'code', valueCode: i.toString() },
+          { name: 'language', valueCode: 'en-GB' },
+          { name: 'value', valueString: i.toLocaleString('en-GB') },
+        ],
+      });
+    }
+    const res = await request(app)
+      .post(`/fhir/R4/CodeSystem/$import`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send({
+        resourceType: 'Parameters',
+        parameter,
+      });
+    expect(res.status).toBe(200);
+  });
 });
 
 async function assertCodeExists(system: string | undefined, code: string): Promise<any> {
-  const db = getDatabasePool(DatabaseMode.READER);
+  const db = getDatabasePool(DatabaseMode.READER, shardId);
   const coding = await selectCoding(system as string, code)
     .column('isSynonym')
     .where('synonymOf', '=', null)
@@ -336,13 +591,19 @@ async function assertCodeExists(system: string | undefined, code: string): Promi
   return coding[0];
 }
 
+async function assertCodeMissing(system: string | undefined, code: string): Promise<void> {
+  const db = getDatabasePool(DatabaseMode.READER, shardId);
+  const coding = await selectCoding(system as string, code).execute(db);
+  expect(coding).toHaveLength(0);
+}
+
 async function assertPropertyExists(
   system: string | undefined,
   code: string,
   property: string,
   value: string
 ): Promise<any> {
-  const db = getDatabasePool(DatabaseMode.READER);
+  const db = getDatabasePool(DatabaseMode.READER, shardId);
   const query = new SelectQuery('Coding_Property');
   const codingTable = query.getNextJoinAlias();
   query.join(
@@ -360,6 +621,7 @@ async function assertPropertyExists(
   );
 
   const results = await query
+    .column(new Column(codingTable, 'id', undefined, 'codingId'))
     .column('value')
     .column('target')
     .where(new Column(codingTable, 'system'), '=', system)

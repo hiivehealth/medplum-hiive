@@ -16,54 +16,53 @@ import {
   parseSearchRequest,
 } from '@medplum/core';
 import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
-import type { OperationDefinition, Parameters, Reference, Resource, ResourceType } from '@medplum/fhirtypes';
+import type { AsyncJob, Parameters, Reference, Resource, ResourceType } from '@medplum/fhirtypes';
 import { getConfig } from '../../config/loader';
 import { getAuthenticatedContext } from '../../context';
+import { getAsyncJobTracking } from '../../workers/base';
 import { addSetAccountsJobData } from '../../workers/set-accounts';
+import { CancelledError } from '../../workers/utils';
 import type { Repository, SystemRepository } from '../repo';
+import { makeOperationDefinition } from './definitions';
 import { searchPatientCompartment } from './patienteverything';
 import { AsyncJobExecutor } from './utils/asyncjobexecutor';
 import { buildOutputParameters, parseInputParameters } from './utils/parameters';
 
-const operation: OperationDefinition = {
-  resourceType: 'OperationDefinition',
-  id: 'set-accounts',
-  name: 'SetAccounts',
-  status: 'active',
-  kind: 'operation',
-  code: 'set-accounts',
-  description: `Updates account references for the target resource, and optionally any resources in the target's FHIR compartment`,
-  resource: ['Resource' as ResourceType],
-  system: false,
-  type: false,
-  instance: true,
-  parameter: [
-    {
-      use: 'in',
-      name: 'accounts',
-      documentation: 'List of account references to set',
-      type: 'Reference',
-      min: 0,
-      max: '*',
-    },
-    {
-      use: 'in',
-      name: 'propagate',
-      documentation: 'If set, also push changes to other resources in the compartment of the target resource',
-      type: 'boolean',
-      min: 0,
-      max: '1',
-    },
-    {
-      use: 'out',
-      name: 'resourcesUpdated',
-      documentation: 'Number of resources that were updated',
-      type: 'integer',
-      min: 1,
-      max: '1',
-    },
-  ],
-};
+const operation = makeOperationDefinition(
+  { scope: 'instance', resource: 'Resource' as ResourceType },
+  {
+    id: 'set-accounts',
+    name: 'SetAccounts',
+    code: 'set-accounts',
+    description: `Updates account references for the target resource, and optionally any resources in the target's FHIR compartment`,
+    parameter: [
+      {
+        use: 'in',
+        name: 'accounts',
+        documentation: 'List of account references to set',
+        type: 'Reference',
+        min: 0,
+        max: '*',
+      },
+      {
+        use: 'in',
+        name: 'propagate',
+        documentation: 'If set, also push changes to other resources in the compartment of the target resource',
+        type: 'boolean',
+        min: 0,
+        max: '1',
+      },
+      {
+        use: 'out',
+        name: 'resourcesUpdated',
+        documentation: 'Number of resources that were updated',
+        type: 'integer',
+        min: 1,
+        max: '1',
+      },
+    ],
+  }
+);
 
 export interface SetAccountsParameters {
   accounts: Reference[];
@@ -91,18 +90,18 @@ export async function setAccountsHandler(req: FhirRequest): Promise<FhirResponse
 
   const params = parseInputParameters<SetAccountsParameters>(operation, req);
 
-  const { repo } = getAuthenticatedContext();
+  const { repo, authState } = getAuthenticatedContext();
   if (req.headers?.['prefer'] === 'respond-async' && params.propagate) {
     const { baseUrl } = getConfig();
     const exec = new AsyncJobExecutor(repo);
     const asyncJob = await exec.init(concatUrls(baseUrl, `${resourceType}/${id}/$set-accounts`));
     await exec.run(async () => {
       await addSetAccountsJobData({
-        asyncJob,
+        tracking: getAsyncJobTracking(asyncJob),
         resourceType,
         id,
         accounts: params.accounts,
-        authState: getAuthenticatedContext().authState,
+        authState,
       });
     });
 
@@ -113,30 +112,47 @@ export async function setAccountsHandler(req: FhirRequest): Promise<FhirResponse
   }
 }
 
+export async function setResourceAccounts(
+  repo: Repository,
+  resourceType: ResourceType,
+  id: string,
+  params: SetAccountsParameters
+): Promise<Parameters>;
+export async function setResourceAccounts(
+  repo: Repository,
+  resourceType: ResourceType,
+  id: string,
+  params: SetAccountsParameters,
+  asyncJobId: string
+): Promise<Parameters | undefined>;
 /**
  * Sets the `meta.accounts` array for the given resource, and optionally all resources in its compartment.
  * @param repo - The FHIR repository of the user.
  * @param resourceType - The type of the target resource.
  * @param id - The ID of the target resource.
  * @param params - Operation parameters.
- * @returns The number of resources updated.
+ * @param asyncJobId - (Optional) ID to use to track the status of the parent job.
+ * @returns The number of resources updated, or undefined if the operation could not finish.
  */
 export async function setResourceAccounts(
   repo: Repository,
   resourceType: ResourceType,
   id: string,
-  params: SetAccountsParameters
-): Promise<Parameters> {
+  params: SetAccountsParameters,
+  asyncJobId?: string
+): Promise<Parameters | undefined> {
   const isSuperAdmin = repo.isSuperAdmin();
   if (!repo.isProjectAdmin() && !isSuperAdmin) {
     throw new OperationOutcomeError(forbidden);
   }
 
-  // Use system repo to read the resource, ensuring we get access to the full `meta.accounts`
+  // Use extended mode to read the resource, ensuring we get access to the full `meta.accounts`
   const systemRepo = repo.getSystemRepo();
+  const userRepo = repo.withOverrideConfig({ extendedMode: true });
+
   const target = await systemRepo.readResource(resourceType, id);
   // Ensure user's repo can read this resource as well
-  if (!repo.canPerformInteraction(AccessPolicyInteraction.READ, target)) {
+  if (!userRepo.canPerformInteraction(AccessPolicyInteraction.READ, target)) {
     throw new OperationOutcomeError(notFound);
   }
   const accounts = params.accounts;
@@ -148,7 +164,7 @@ export async function setResourceAccounts(
     accounts: accounts,
     account: accounts?.[0],
   };
-  if (!repo.canPerformInteraction(AccessPolicyInteraction.UPDATE, target)) {
+  if (!userRepo.canPerformInteraction(AccessPolicyInteraction.UPDATE, target)) {
     throw new OperationOutcomeError(forbidden);
   }
   await getAuthenticatedContext().fhirRateLimiter?.recordWrite();
@@ -165,7 +181,14 @@ export async function setResourceAccounts(
     const search: Partial<SearchRequest> = { offset: 0, count: 1000 };
     const maxSearchOffset = getConfig().maxSearchOffset ?? Number.POSITIVE_INFINITY;
     while ((search.offset ?? 0) <= maxSearchOffset) {
-      const bundle = await searchPatientCompartment(repo, target, search);
+      if (asyncJobId) {
+        const shouldContinue = await shouldJobContinue(systemRepo, asyncJobId);
+        if (!shouldContinue) {
+          throw new CancelledError('Job cancelled');
+        }
+      }
+
+      const bundle = await searchPatientCompartment(userRepo, target, search);
       for (const entry of bundle.entry ?? EMPTY) {
         const resource = entry.resource;
         if (resource && resource.resourceType !== 'Patient') {
@@ -175,8 +198,10 @@ export async function setResourceAccounts(
       }
       const nextLink = bundle.link?.find((l) => l.relation === 'next');
       if (nextLink?.url) {
+        // Update search pagination to next page
         const nextSearch = parseSearchRequest(nextLink.url);
         search.offset = nextSearch.offset;
+        search.cursor = nextSearch.cursor;
       } else {
         break;
       }
@@ -213,4 +238,10 @@ async function updateCompartmentResource<T extends Resource>(
   // Use system repo to force update meta.accounts
   await getAuthenticatedContext().fhirRateLimiter?.recordWrite();
   return systemRepo.updateResource(resource);
+}
+
+const healthyJobStatuses: AsyncJob['status'][] = ['accepted', 'active'];
+async function shouldJobContinue(systemRepo: SystemRepository, asyncJobId: string): Promise<boolean> {
+  const asyncJob = await systemRepo.readResource<AsyncJob>('AsyncJob', asyncJobId);
+  return healthyJobStatuses.includes(asyncJob.status);
 }

@@ -1,7 +1,9 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
+import { useDisclosure } from '@mantine/hooks';
 import { getReferenceString } from '@medplum/core';
 import { useDoseSpotNotifications } from '@medplum/dosespot-react';
+import type { SpotlightLinkAction } from '@medplum/react';
 import { AppShell, Loading, Logo, useMedplum, useMedplumProfile } from '@medplum/react';
 import {
   IconApps,
@@ -11,6 +13,7 @@ import {
   IconMail,
   IconPill,
   IconPrinter,
+  IconReceipt2,
   IconSettingsAutomation,
   IconUserPlus,
   IconUsers,
@@ -18,15 +21,15 @@ import {
 import type { JSX } from 'react';
 import { Suspense, useState } from 'react';
 import { Navigate, Route, Routes, useLocation, useSearchParams } from 'react-router';
-import { TaskDetailsModal } from './components/tasks/TaskDetailsModal';
 import { hasScriptSureIdentifier } from './components/utils';
 import { useDoseSpotAccess } from './hooks/useDoseSpotAccess';
 import './index.css';
+import { ScriptSurePracticeProvider } from './scriptsure/ScriptSurePractice';
 
 const SETUP_DISMISSED_KEY = 'medplum-provider-setup-completed';
+const PROVIDER_HIDE_GET_STARTED_SETTING = 'hideGetStarted';
 
-import { EncounterChartPage } from './pages/encounter/EncounterChartPage';
-import { EncounterModal } from './pages/encounter/EncounterModal';
+import { EncountersPage } from './pages/encounter/EncountersPage';
 import { FaxPage } from './pages/fax/FaxPage';
 import { GetStartedPage } from './pages/getstarted/GetStartedPage';
 import { DoseSpotFavoritesPage } from './pages/integrations/DoseSpotFavoritesPage';
@@ -36,6 +39,7 @@ import { ScriptSurePage } from './pages/integrations/ScriptSurePage';
 import { MessagesPage } from './pages/messages/MessagesPage';
 import { CommunicationTab } from './pages/patient/CommunicationTab';
 import { CoveragePage } from './pages/patient/CoveragePage';
+import { DocumentsPage } from './pages/patient/DocumentsPage';
 import { DoseSpotTab } from './pages/patient/DoseSpotTab';
 import { EditTab } from './pages/patient/EditTab';
 import { ExportTab } from './pages/patient/ExportTab';
@@ -47,15 +51,23 @@ import { PatientSearchPage } from './pages/patient/PatientSearchPage';
 import { ScriptSureTab } from './pages/patient/ScriptSureTab';
 import { TasksTab } from './pages/patient/TasksTab';
 import { TimelineTab } from './pages/patient/TimelineTab';
+import { RegisterPage } from './pages/RegisterPage';
 import { ResourceCreatePage } from './pages/resource/ResourceCreatePage';
 import { ResourceDetailPage } from './pages/resource/ResourceDetailPage';
 import { ResourceEditPage } from './pages/resource/ResourceEditPage';
 import { ResourceHistoryPage } from './pages/resource/ResourceHistoryPage';
 import { ResourcePage } from './pages/resource/ResourcePage';
+import { ResourceSchedulingPage } from './pages/resource/ResourceSchedulingPage';
 import { SchedulePage } from './pages/schedule/SchedulePage';
 import { ScheduleSettingsPage } from './pages/schedule/ScheduleSettingsPage';
+import { InternalSchedulingConfigWorkspacePage } from './pages/scheduling/InternalSchedulingConfigWorkspacePage';
+import { InternalSchedulingWorkspacePage } from './pages/scheduling/InternalSchedulingWorkspacePage';
 import { SearchPage } from './pages/SearchPage';
+import { BillingSetupPage } from './pages/settings/BillingSetupPage';
 import { SignInPage } from './pages/SignInPage';
+import { SmartHealthLinkImportModal } from './pages/smart/SmartHealthLinkImportModal';
+import { SmartHealthLinkImportPage } from './pages/smart/SmartHealthLinkImportPage';
+import { SmartLogo } from './pages/smart/SmartLogo';
 import { SpacesPage } from './pages/spaces/SpacesPage';
 import { TasksPage } from './pages/tasks/TasksPage';
 
@@ -65,21 +77,66 @@ export function App(): JSX.Element | null {
   const doseSpotCount = useDoseSpotNotifications();
   const location = useLocation();
   const [searchParams] = useSearchParams();
-  const [setupDismissed, setSetupDismissed] = useState(() => localStorage.getItem(SETUP_DISMISSED_KEY) === 'true');
+  const project = medplum.getProject();
+  const setupDisabledByProject =
+    project?.setting?.find((s) => s.name === PROVIDER_HIDE_GET_STARTED_SETTING)?.valueBoolean === true;
+  const [setupDismissedByUser, setSetupDismissedByUser] = useState(
+    () => localStorage.getItem(SETUP_DISMISSED_KEY) === 'true'
+  );
+  const setupDismissed = setupDisabledByProject || setupDismissedByUser;
   const { hasAccess: hasDoseSpot } = useDoseSpotAccess();
   const membership = medplum.getProjectMembership();
   const hasScriptSure = hasScriptSureIdentifier(membership);
+  const hasBilling = project?.features?.includes('billing') ?? false;
+
+  const [shlOpened, shlHandlers] = useDisclosure(false);
 
   const handleDismissSetup = (): void => {
     localStorage.setItem(SETUP_DISMISSED_KEY, 'true');
-    setSetupDismissed(true);
+    setSetupDismissedByUser(true);
   };
+
+  // Actions with an `href` point at a `/new` route; the destination page opens its own modal from
+  // the URL. `href` both routes the click and makes them real links, so they can be opened in a new
+  // tab. Actions without one open a modal in place via `onClick`.
+  const spotlightActions: SpotlightLinkAction[] = [
+    {
+      id: 'action-import-shl',
+      label: 'Import from SMART Health Link or Card',
+      leftSection: <SmartLogo size={16} color="var(--mantine-color-dimmed)" />,
+      onClick: shlHandlers.open,
+    },
+    {
+      id: 'action-new-patient-intake',
+      href: '/onboarding',
+      label: 'New Patient Intake',
+      leftSection: <IconUserPlus size={16} color="var(--mantine-color-dimmed)" />,
+    },
+    {
+      id: 'action-new-message',
+      href: '/Communication/new',
+      label: 'New Message',
+      leftSection: <IconMail size={16} color="var(--mantine-color-dimmed)" />,
+    },
+    {
+      id: 'action-new-task',
+      href: '/Task/new',
+      label: 'New Task',
+      leftSection: <IconClipboardCheck size={16} color="var(--mantine-color-dimmed)" />,
+    },
+    {
+      id: 'action-send-fax',
+      href: '/Fax/Communication/new',
+      label: 'Send a Fax',
+      leftSection: <IconPrinter size={16} color="var(--mantine-color-dimmed)" />,
+    },
+  ];
 
   if (medplum.isLoading()) {
     return null;
   }
 
-  return (
+  const appShellContent = (
     <AppShell
       logo={<Logo size={24} />}
       pathname={location.pathname}
@@ -137,6 +194,9 @@ export function App(): JSX.Element | null {
                     : []),
                   { icon: <IconUserPlus />, label: 'New Patient', href: '/onboarding' },
                   { icon: <IconApps />, label: 'Integrations', href: '/integrations' },
+                  ...(hasBilling
+                    ? [{ icon: <IconReceipt2 />, label: 'Billing Settings', href: '/Settings/Billing' }]
+                    : []),
                   ...(hasDoseSpot
                     ? [
                         {
@@ -164,6 +224,7 @@ export function App(): JSX.Element | null {
       }
       resourceTypeSearchDisabled={true}
       spotlightPatientsOnly={true}
+      spotlightActions={spotlightActions}
     >
       <Suspense fallback={<Loading />}>
         <Routes>
@@ -189,22 +250,27 @@ export function App(): JSX.Element | null {
               />
               <Route path="/Patient/new" element={<ResourceCreatePage />} />
               <Route path="/Patient/:patientId" element={<PatientPage />}>
-                <Route path="Encounter/new" element={<EncounterModal />} />
-                <Route path="Encounter/:encounterId" element={<EncounterChartPage />}>
-                  <Route path="Task/:taskId" element={<TaskDetailsModal />} />
-                </Route>
+                <Route path="Encounter" element={<EncountersPage />} />
+                <Route path="Encounter/:encounterId/Task?/:taskId?" element={<EncountersPage />} />
                 <Route path="edit" element={<EditTab />} />
                 <Route path="Communication" element={<CommunicationTab />} />
                 <Route path="Communication/:messageId" element={<CommunicationTab />} />
                 <Route path="Task" element={<TasksTab />} />
+                <Route path="Task/new" element={<TasksTab />} />
                 <Route path="Task/:taskId" element={<TasksTab />} />
+                <Route path="Task/:taskId/new" element={<TasksTab />} />
                 {hasDoseSpot && <Route path="dosespot" element={<DoseSpotTab />} />}
                 {hasScriptSure && <Route path="scriptsure" element={<ScriptSureTab />} />}
                 <Route path="timeline" element={<TimelineTab />} />
                 <Route path="export" element={<ExportTab />} />
-                <Route path="ServiceRequest" element={<LabsPage />} />
-                <Route path="ServiceRequest/:serviceRequestId" element={<LabsPage />} />
+                <Route path="ServiceRequest" element={<LabsPage tab="open" />} />
+                <Route path="ServiceRequest/:serviceRequestId" element={<LabsPage tab="open" />} />
+                <Route path="DiagnosticReport" element={<LabsPage tab="completed" />} />
+                <Route path="DiagnosticReport/:diagnosticReportId" element={<LabsPage tab="completed" />} />
                 <Route path="MedicationRequest" element={<MedicationsPage />} />
+                <Route path="MedicationRequest/:medicationRequestId" element={<MedicationsPage />} />
+                <Route path="DocumentReference" element={<DocumentsPage />} />
+                <Route path="DocumentReference/:documentId" element={<DocumentsPage />} />
                 <Route path=":resourceType" element={<PatientSearchPage />} />
                 <Route path="Coverage" element={<CoveragePage />} />
                 <Route path="Coverage/:coverageId" element={<CoveragePage />} />
@@ -219,32 +285,49 @@ export function App(): JSX.Element | null {
               </Route>
               <Route path="/Communication" element={<MessagesPage />}>
                 <Route index element={<MessagesPage />} />
+                <Route path="new" element={<MessagesPage />} />
                 <Route path=":messageId" element={<MessagesPage />} />
+                <Route path=":messageId/new" element={<MessagesPage />} />
               </Route>
               <Route path="/Task" element={<TasksPage />} />
+              <Route path="/Task/new" element={<TasksPage />} />
               <Route path="/Task/:taskId" element={<TasksPage />} />
+              <Route path="/Task/:taskId/new" element={<TasksPage />} />
               <Route path="/Fax/Communication" element={<FaxPage />} />
+              <Route path="/Fax/Communication/new" element={<FaxPage />} />
               <Route path="/Fax/Communication/:faxId" element={<FaxPage />} />
+              <Route path="/Fax/Communication/:faxId/new" element={<FaxPage />} />
               <Route path="/onboarding" element={<IntakeFormPage />} />
               <Route path="/Calendar/Schedule" element={<SchedulePage />} />
               <Route path="/Calendar/Schedule/:id" element={<SchedulePage />} />
               <Route path="/Calendar/Schedule/:id/settings" element={<ScheduleSettingsPage />} />
+              {/* Internal-only test harness for `SchedulingWorkspace` — intentionally not in `menus` above */}
+              <Route path="/internal-scheduling-workspace" element={<InternalSchedulingWorkspacePage />} />
+              {/* Internal-only test harness for `SchedulingConfigWorkspace` — intentionally not in `menus` above */}
+              <Route path="/internal-scheduling-config" element={<InternalSchedulingConfigWorkspacePage />} />
               <Route path="/signin" element={<SignInPage />} />
+              <Route path="/register" element={<RegisterPage />} />
               {hasDoseSpot && <Route path="/dosespot" element={<DoseSpotNotificationsPage />} />}
               {hasScriptSure && <Route path="/scriptsure" element={<ScriptSurePage />} />}
               <Route path="/integrations" element={<IntegrationsPage />} />
+              {/* Must precede the /:resourceType catch-alls below */}
+              {hasBilling && <Route path="/Settings/Billing/*" element={<BillingSetupPage />} />}
+              <Route path="/smart-health-link" element={<SmartHealthLinkImportPage />} />
               <Route path="/:resourceType" element={<SearchPage />} />
               <Route path="/:resourceType/new" element={<ResourceCreatePage />} />
               <Route path="/:resourceType/:id" element={<ResourcePage />}>
                 <Route path="" element={<ResourceDetailPage />} />
+                <Route path="details" element={<ResourceDetailPage />} />
                 <Route path="edit" element={<ResourceEditPage />} />
                 <Route path="history" element={<ResourceHistoryPage />} />
+                <Route path="scheduling" element={<ResourceSchedulingPage />} />
               </Route>
               {hasDoseSpot && <Route path="/integrations/dosespot" element={<DoseSpotFavoritesPage />} />}
             </>
           ) : (
             <>
               <Route path="/signin" element={<SignInPage />} />
+              <Route path="/register" element={<RegisterPage />} />
               <Route path="*" element={<Navigate to="/signin" replace />} />
             </>
           )}
@@ -252,4 +335,13 @@ export function App(): JSX.Element | null {
       </Suspense>
     </AppShell>
   );
+
+  const content = (
+    <>
+      {appShellContent}
+      <SmartHealthLinkImportModal opened={shlOpened} onClose={shlHandlers.close} />
+    </>
+  );
+
+  return hasScriptSure ? <ScriptSurePracticeProvider>{content}</ScriptSurePracticeProvider> : content;
 }

@@ -1,11 +1,13 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
+import type { Operation } from '@medplum/core';
 import {
   EventTarget,
   OperationOutcomeError,
   allOk,
   badRequest,
   created,
+  isResource,
   normalizeOperationOutcome,
   notFound,
   parseSearchRequest,
@@ -15,11 +17,11 @@ import type {
   CapabilityStatementRestInteraction,
   CapabilityStatementRestResourceInteraction,
   OperationOutcome,
+  Parameters,
   Resource,
   ResourceType,
 } from '@medplum/fhirtypes';
 import type { IncomingHttpHeaders } from 'node:http';
-import type { Operation } from 'rfc6902';
 import type { LogEvent } from './batch';
 import { processBatch } from './batch';
 import { graphqlHandler } from './graphql';
@@ -53,9 +55,7 @@ export type FhirResponseOptions = {
 };
 
 export type FhirResponse =
-  | [OperationOutcome]
-  | [OperationOutcome, Resource]
-  | [OperationOutcome, Resource, FhirResponseOptions];
+  [OperationOutcome] | [OperationOutcome, Resource] | [OperationOutcome, Resource, FhirResponseOptions];
 
 export type FhirRouteOptions = {
   batch?: boolean;
@@ -244,14 +244,19 @@ async function conditionalUpdate(
   const resource = req.body;
 
   const search = parseSearchRequest(resourceType as ResourceType, req.query);
-  const result = await repo.conditionalUpdate(resource, search, { assignedId: options?.batch });
+  const result = await repo.conditionalUpdate(resource, search, {
+    assignedId: options?.batch,
+    ifMatch: parseIfMatchHeader(req.headers?.['if-match']),
+  });
   return [result.outcome, result.resource];
 }
 
 // Delete resource
 async function deleteResource(req: FhirRequest, repo: FhirRepository): Promise<FhirResponse> {
   const { resourceType, id } = req.params;
-  await repo.deleteResource(resourceType, id);
+  await repo.deleteResource(resourceType, id, {
+    ifMatch: parseIfMatchHeader(req.headers?.['if-match']),
+  });
   return [allOk];
 }
 
@@ -267,14 +272,16 @@ async function conditionalDelete(req: FhirRequest, repo: FhirRepository): Promis
 // Patch resource
 async function patchResource(req: FhirRequest, repo: FhirRepository): Promise<FhirResponse> {
   const { resourceType, id } = req.params;
-  const patch = req.body as Operation[];
+  const patch = req.body as Operation[] | Parameters;
   if (!patch) {
     return [badRequest('Empty patch body')];
   }
-  if (!Array.isArray(patch)) {
-    return [badRequest('Patch body must be an array')];
+  if (!Array.isArray(patch) && !isResource(patch, 'Parameters')) {
+    return [badRequest('Invalid patch body')];
   }
-  const resource = await repo.patchResource(resourceType as ResourceType, id, patch);
+  const resource = await repo.patchResource(resourceType as ResourceType, id, patch, {
+    ifMatch: parseIfMatchHeader(req.headers?.['if-match']),
+  });
   return [allOk, resource];
 }
 
@@ -290,15 +297,15 @@ async function conditionalPatch(req: FhirRequest, repo: FhirRepository): Promise
   }
 
   const search = parseSearchRequest(resourceType as ResourceType, req.query);
-  const resource = await repo.conditionalPatch(search, patch);
+  const resource = await repo.conditionalPatch(search, patch, {
+    ifMatch: parseIfMatchHeader(req.headers?.['if-match']),
+  });
   return [allOk, resource];
 }
 
 /** @see http://hl7.org/fhir/R4/codesystem-restful-interaction.html */
 export type RestInteraction =
-  | CapabilityStatementRestInteraction['code']
-  | CapabilityStatementRestResourceInteraction['code']
-  | 'operation';
+  CapabilityStatementRestInteraction['code'] | CapabilityStatementRestResourceInteraction['code'] | 'operation';
 
 export type FhirRouteMetadata = {
   interaction: RestInteraction;
@@ -343,7 +350,12 @@ export class FhirRouter extends EventTarget {
     if (req.pathname) {
       throw new OperationOutcomeError(badRequest('FhirRequest must specify url instead of pathname'));
     }
-    const result = this.find(req.method, url);
+    let result: ReturnType<typeof this.find>;
+    try {
+      result = this.find(req.method, url);
+    } catch (err) {
+      return [normalizeOperationOutcome(err)];
+    }
     if (!result) {
       return [notFound];
     }

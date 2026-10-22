@@ -1,23 +1,25 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { WithId } from '@medplum/core';
-import { OAuthTokenAuthMethod } from '@medplum/core';
+import { ContentType, OAuthTokenAuthMethod } from '@medplum/core';
 import type { ClientApplication, DomainConfiguration, Project, ProjectMembership, User } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import express from 'express';
-import fetch from 'node-fetch';
+import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { createClient } from '../admin/client';
 import { inviteUser } from '../admin/invite';
 import { initApp, shutdownApp } from '../app';
-import { loadTestConfig } from '../config/loader';
+import { getConfig, loadTestConfig } from '../config/loader';
 import type { SystemRepository } from '../fhir/repo';
 import { getProjectSystemRepo } from '../fhir/repo';
+import { getUserByEmailWithoutProject } from '../oauth/utils';
 import { withTestContext } from '../test.setup';
+import { mockFetchJson, mockFetchText } from '../test.setup.fetch';
 import { registerNew } from './register';
 
-jest.mock('node-fetch');
-
+const fetchMock = vi.spyOn(globalThis, 'fetch');
 const app = express();
 const domain = randomUUID() + '.example.com';
 const email = `text@${domain}`;
@@ -81,7 +83,11 @@ describe('External', () => {
       // Update client application with external auth
       await systemRepo.updateResource<ClientApplication>({
         ...externalAuthClient,
-        identityProvider,
+        identityProvider: {
+          ...identityProvider,
+          identitySource: 'email',
+          identityMappingMode: 'user-email',
+        },
       });
 
       // Invite user with external ID
@@ -101,19 +107,19 @@ describe('External', () => {
 
   test('Missing code', async () => {
     const res = await request(app).get('/auth/external?code=&state=xyz');
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Missing code');
   });
 
   test('Missing state', async () => {
     const res = await request(app).get('/auth/external?code=xyz&state=');
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Missing state');
   });
 
   test('Invalid JSON state', async () => {
     const res = await request(app).get('/auth/external?code=xyz&state=xyz');
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Invalid state');
   });
 
@@ -125,7 +131,7 @@ describe('External', () => {
     });
 
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Identity provider not found');
   });
 
@@ -137,7 +143,7 @@ describe('External', () => {
     });
 
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Identity provider not found');
   });
 
@@ -149,15 +155,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens('not-found@' + domain),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens('not-found@' + domain)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('User not found');
   });
 
@@ -169,15 +171,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(undefined),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(undefined)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('External token does not contain email address');
   });
 
@@ -189,15 +187,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens('admin@medplum.com'),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens('admin@medplum.com')));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Email address does not match domain');
   });
 
@@ -212,20 +206,109 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.host).toStrictEqual('localhost:3000');
     expect(redirect.pathname).toStrictEqual('/signin');
     expect(redirect.searchParams.get('login')).toBeTruthy();
+  });
+
+  test('Marks the user email verified', async () => {
+    // Invited users start unverified, and external auth is the only login they have
+    const verifiedEmail = `verify-${randomUUID()}@${domain}`;
+    const { user } = await withTestContext(() =>
+      inviteUser({
+        project,
+        email: verifiedEmail,
+        resourceType: 'Practitioner',
+        firstName: 'Verify',
+        lastName: 'User',
+        sendEmail: false,
+      })
+    );
+    expect(user.emailVerified).toBeFalsy();
+
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ domain }),
+    });
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(verifiedEmail)));
+
+    const res = await request(app).get(url);
+    expect(res).toHaveStatus(302);
+
+    // The identity provider vouched for the account, so no separate proof is required
+    const updated = await systemRepo.readResource<User>('User', user.id);
+    expect(updated.emailVerified).toBe(true);
+  });
+
+  test('Does not rewrite an already verified user', async () => {
+    const verifiedEmail = `verify-${randomUUID()}@${domain}`;
+    const { user } = await withTestContext(() =>
+      inviteUser({
+        project,
+        email: verifiedEmail,
+        resourceType: 'Practitioner',
+        firstName: 'Verify',
+        lastName: 'User',
+        sendEmail: false,
+      })
+    );
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(verifiedEmail)));
+
+    const signIn = async (): Promise<void> => {
+      const url = appendQueryParams('/auth/external', {
+        code: randomUUID(),
+        state: JSON.stringify({ domain }),
+      });
+      const res = await request(app).get(url);
+      expect(res).toHaveStatus(302);
+    };
+
+    // The first login verifies the user, which is a real write
+    await signIn();
+    const afterFirst = await systemRepo.readResource<User>('User', user.id);
+    expect(afterFirst.emailVerified).toBe(true);
+
+    // The second applies the same patch, but it changes nothing, so isNotModified
+    // short-circuits before writing and no new version is created
+    await signIn();
+    const afterSecond = await systemRepo.readResource<User>('User', user.id);
+    expect(afterSecond.emailVerified).toBe(true);
+    expect(afterSecond.meta?.versionId).toStrictEqual(afterFirst.meta?.versionId);
+  });
+
+  test('Server config identity provider success', async () => {
+    const issuer = `https://${randomUUID()}.example.com`;
+    const config = getConfig();
+    const externalAuthProviders = config.externalAuthProviders;
+    config.externalAuthProviders = [{ issuer, identityProvider }];
+
+    try {
+      const url = appendQueryParams('/auth/external', {
+        code: randomUUID(),
+        state: JSON.stringify({ issuer }),
+      });
+
+      // Mock the external identity provider
+      fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
+
+      // Simulate the external identity provider callback
+      const res = await request(app).get(url);
+      expect(res).toHaveStatus(302);
+
+      const redirect = new URL(res.header.location);
+      expect(redirect.host).toStrictEqual('localhost:3000');
+      expect(redirect.pathname).toStrictEqual('/signin');
+      expect(redirect.searchParams.get('login')).toBeTruthy();
+    } finally {
+      config.externalAuthProviders = externalAuthProviders;
+    }
   });
 
   test('ClientApplication success', async () => {
@@ -235,15 +318,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.host).toStrictEqual(domain);
@@ -258,20 +337,152 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.host).toStrictEqual(domain);
     expect(redirect.pathname).toStrictEqual('/auth/callback');
     expect(redirect.searchParams.get('code')).toBeTruthy();
+  });
+
+  test('Login is scoped to the client project across tenants', async () => {
+    // A user who belongs only to a different project is not logged in through a
+    // ClientApplication in another project. External login resolves the user by email
+    // (including server-scoped users via getUserByEmailWithoutProject), but membership is
+    // scoped to the client's project, so a user with no membership there results in
+    // "User not found" and no authorization code is issued.
+    const otherEmail = `other-${randomUUID()}@example.com`;
+    await withTestContext(() =>
+      registerNew({
+        firstName: 'Other',
+        lastName: 'User',
+        projectName: 'Other Project ' + randomUUID(),
+        email: otherEmail,
+        password: 'password!@#',
+        remoteAddress: '6.6.6.6',
+        userAgent: 'Mozilla/5.0',
+      })
+    );
+
+    // The user is server-scoped, and so is resolvable by email with no project.
+    const otherUser = await withTestContext(() => getUserByEmailWithoutProject(otherEmail));
+    expect(otherUser).toBeDefined();
+
+    // Drive the callback with a client from a different project and a token asserting the
+    // other user's email.
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: externalAuthClient.id }),
+    });
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(otherEmail)));
+
+    const res = await request(app).get(url);
+    expect(res).toHaveStatus(400);
+    expect(res.body.issue[0].details.text).toBe('User not found');
+  });
+
+  test('id_token verification rejects invalid tokens', async () => {
+    // Missing id_token in the token endpoint response.
+    const noJwksUrl = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: externalAuthClient.id }),
+    });
+    fetchMock.mockImplementation(() => mockFetchJson({}));
+    let res = await request(app).get(noJwksUrl);
+    expect(res).toHaveStatus(400);
+    expect(res.body.issue[0].details.text).toBe('Missing id_token in external identity provider response');
+
+    const jwksClient = await withTestContext(() =>
+      createClient(systemRepo, { project, name: 'JWKS Client', redirectUri })
+    );
+    const idp = {
+      ...identityProvider,
+      jwksUrl: 'https://issuer.example.com/.well-known/jwks.json',
+      identitySource: 'email' as const,
+      identityMappingMode: 'user-email' as const,
+    };
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: jwksClient.id }),
+    });
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
+
+    // JWKS configured without an issuer.
+    await withTestContext(() => systemRepo.updateResource<ClientApplication>({ ...jwksClient, identityProvider: idp }));
+    res = await request(app).get(url);
+    expect(res).toHaveStatus(400);
+    expect(res.body.issue[0].details.text).toBe('Missing issuer for external identity provider');
+
+    // Issuer configured, but the (unsigned) token does not verify against the JWKS.
+    await withTestContext(() =>
+      systemRepo.updateResource<ClientApplication>({
+        ...jwksClient,
+        identityProvider: { ...idp, issuer: 'https://issuer.example.com' },
+      })
+    );
+    res = await request(app).get(url);
+    expect(res).toHaveStatus(400);
+    expect(res.body.issue[0].details.text).toBe('Failed to verify code - check your identity provider configuration');
+  });
+
+  test('id_token that verifies against the JWKS is accepted', async () => {
+    const issuer = 'https://issuer.example.com';
+    const jwksUrl = 'https://issuer.example.com/.well-known/verified-jwks.json';
+    const keyPair = await generateKeyPair('ES256');
+    const publicJwk = await exportJWK(keyPair.publicKey);
+
+    const jwksClient = await withTestContext(() =>
+      createClient(systemRepo, { project, name: 'JWKS Verified Client', redirectUri })
+    );
+    await withTestContext(() =>
+      systemRepo.updateResource<ClientApplication>({
+        ...jwksClient,
+        identityProvider: {
+          ...identityProvider,
+          issuer,
+          jwksUrl,
+          identitySource: 'email',
+          identityMappingMode: 'user-email',
+        },
+      })
+    );
+
+    const signIdToken = (audience: string): Promise<string> =>
+      new SignJWT({ email })
+        .setProtectedHeader({ alg: 'ES256' })
+        .setIssuer(issuer)
+        .setAudience(audience)
+        .setExpirationTime('2h')
+        .sign(keyPair.privateKey);
+
+    // The token endpoint returns the signed token; the JWKS endpoint returns the public key.
+    const mockIdToken = (jwt: string): void => {
+      fetchMock.mockImplementation((input: any) =>
+        String(input).includes('verified-jwks')
+          ? mockFetchJson({ keys: [publicJwk] })
+          : mockFetchJson({ id_token: jwt })
+      );
+    };
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: jwksClient.id }),
+    });
+
+    // Audience defaults to the IdP client ID, so a token audienced to it is accepted.
+    mockIdToken(await signIdToken(identityProvider.clientId));
+    let res = await request(app).get(url);
+    expect(res).toHaveStatus(302);
+    expect(new URL(res.header.location).searchParams.get('code')).toBeTruthy();
+
+    // A token audienced to a different relying party is rejected.
+    mockIdToken(await signIdToken('some-other-client'));
+    res = await request(app).get(url);
+    expect(res).toHaveStatus(400);
+    expect(res.body.issue[0].details.text).toBe('Failed to verify code - check your identity provider configuration');
   });
 
   test('Invalid client', async () => {
@@ -281,16 +492,54 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Identity provider not found');
+  });
+
+  test('Missing token URL', async () => {
+    const client = await createClient(systemRepo, {
+      project,
+      name: 'Missing Token URL',
+      redirectUri,
+      identityProvider: {
+        ...identityProvider,
+        tokenUrl: undefined,
+      },
+    });
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: client.id }),
+    });
+
+    const res = await request(app).get(url);
+    expect(res).toHaveStatus(400);
+    expect(res.body.issue[0].details.text).toBe('Missing token URL for external identity provider');
+  });
+
+  test('Client secret post requires client credentials', async () => {
+    const client = await createClient(systemRepo, {
+      project,
+      name: 'Missing Client Credentials',
+      redirectUri,
+      identityProvider: {
+        ...identityProvider,
+        tokenAuthMethod: OAuthTokenAuthMethod.ClientSecretPost,
+        clientId: undefined,
+        clientSecret: undefined,
+      },
+    });
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: client.id }),
+    });
+
+    const res = await request(app).get(url);
+    expect(res).toHaveStatus(400);
+    expect(res.body.issue[0].details.text).toBe('Missing client ID or client secret for external identity provider');
   });
 
   test('Invalid project', async () => {
@@ -300,15 +549,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Invalid project');
   });
 
@@ -319,15 +564,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Invalid redirect URI');
   });
 
@@ -338,18 +579,64 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => {
-        throw new Error('Invalid JSON');
-      },
-    }));
+    fetchMock.mockImplementation(() => mockFetchText('invalid', { contentType: ContentType.JSON }));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Failed to verify code - check your identity provider configuration');
+  });
+
+  test('Token request includes Accept-Encoding: identity', async () => {
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: externalAuthClient.id }),
+    });
+
+    // Mock the external identity provider
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
+
+    // Simulate the external identity provider callback
+    await request(app).get(url);
+
+    // Verify fetch was called with Accept-Encoding: identity to prevent gzip responses
+    expect(fetch).toHaveBeenCalledWith(
+      expect.any(String),
+      expect.objectContaining({
+        headers: expect.objectContaining({
+          'Accept-Encoding': 'identity',
+        }),
+      })
+    );
+  });
+
+  test('Insecure token URL is passed to fetch', async () => {
+    const insecureAuthClient = await withTestContext(async () => {
+      const client = await createClient(systemRepo, {
+        project,
+        name: 'Insecure External Auth Client',
+        redirectUri,
+      });
+      return systemRepo.updateResource<ClientApplication>({
+        ...client,
+        identityProvider: {
+          ...identityProvider,
+          tokenUrl: 'http://localhost:8080/oauth2/token',
+        },
+      });
+    });
+    const url = appendQueryParams('/auth/external', {
+      code: randomUUID(),
+      state: JSON.stringify({ redirectUri, clientId: insecureAuthClient.id }),
+    });
+
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens('test@' + domain)));
+    fetchMock.mockClear();
+    await request(app).get(url);
+    expect(fetch).toHaveBeenCalledWith(
+      'http://localhost:8080/oauth2/token',
+      expect.objectContaining({ method: 'POST' })
+    );
   });
 
   test('Subject auth success', async () => {
@@ -366,7 +653,8 @@ describe('External', () => {
         ...client,
         identityProvider: {
           ...identityProvider,
-          useSubject: true,
+          identitySource: 'subject',
+          identityMappingMode: 'project-membership-external-id',
         },
       });
 
@@ -384,15 +672,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens('', externalId),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens('', externalId)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.host).toStrictEqual(domain);
@@ -440,15 +724,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens('', externalId),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens('', externalId)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Invalid redirect URI');
   });
 
@@ -484,15 +764,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens('', externalId),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens('', externalId)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('Invalid redirect URI');
   });
 
@@ -528,15 +804,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(undefined, ''),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(undefined, '')));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toBe('External token does not contain subject');
   });
 
@@ -573,15 +845,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.host).toStrictEqual(domain);
@@ -628,14 +896,10 @@ describe('External', () => {
       state: JSON.stringify({ domain: testDomain, returnTo: allowedReturnTo + '/dashboard' }),
     });
 
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(testEmail),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(testEmail)));
 
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.hostname).toStrictEqual('myapp.example.com');
@@ -651,14 +915,10 @@ describe('External', () => {
       state: JSON.stringify({ domain, returnTo: 'https://evil.example.com/steal' }),
     });
 
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(email),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(email)));
 
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.host).toStrictEqual('localhost:3000');
@@ -700,14 +960,10 @@ describe('External', () => {
       }),
     });
 
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens(testEmail),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens(testEmail)));
 
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     // Should fall back to default signin, NOT redirect to evil.com
     const redirect = new URL(res.header.location);
@@ -772,15 +1028,11 @@ describe('External', () => {
     });
 
     // Mock the external identity provider
-    (fetch as unknown as jest.Mock).mockImplementation(() => ({
-      ok: true,
-      status: 200,
-      json: () => buildTokens('', externalId),
-    }));
+    fetchMock.mockImplementation(() => mockFetchJson(buildTokens('', externalId)));
 
     // Simulate the external identity provider callback
     const res = await request(app).get(url);
-    expect(res.status).toBe(302);
+    expect(res).toHaveStatus(302);
 
     const redirect = new URL(res.header.location);
     expect(redirect.host).toStrictEqual(domain);

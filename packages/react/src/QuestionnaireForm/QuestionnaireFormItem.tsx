@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { ComboboxItem } from '@mantine/core';
-import { Checkbox, Group, MultiSelect, NativeSelect, Radio, Text, Textarea, TextInput } from '@mantine/core';
+import { Box, Checkbox, Group, MultiSelect, NativeSelect, Radio, Text, Textarea, TextInput } from '@mantine/core';
 import type { TypedValue } from '@medplum/core';
 import {
   capitalize,
@@ -30,6 +30,7 @@ import {
   getNewMultiSelectValues,
   getQuestionnaireItemReferenceFilter,
   getQuestionnaireItemReferenceTargetTypes,
+  isValueSetUnavailableError,
   QUESTIONNAIRE_ITEM_CONTROL_URL,
   QuestionnaireItemType,
   useMedplum,
@@ -42,6 +43,7 @@ import { DateTimeInput } from '../DateTimeInput/DateTimeInput';
 import { QuantityInput } from '../QuantityInput/QuantityInput';
 import { ReferenceInput } from '../ReferenceInput/ReferenceInput';
 import { ResourcePropertyDisplay } from '../ResourcePropertyDisplay/ResourcePropertyDisplay';
+import { UnavailableNote } from '../UnavailableNote/UnavailableNote';
 import { ValueSetAutocomplete } from '../ValueSetAutocomplete/ValueSetAutocomplete';
 
 const MAX_DISPLAYED_CHECKBOX_RADIO_VALUE_SET_OPTIONS = 30;
@@ -361,7 +363,7 @@ function QuestionnaireDropdownInput(props: QuestionnaireChoiceInputProps): JSX.E
         data={data}
         placeholder="Select items"
         searchable
-        defaultValue={currentAnswer || [typedValueToString(initialValue)]}
+        value={currentAnswer}
         required={required}
         onChange={(selected) => {
           if (selected.length === 0) {
@@ -420,23 +422,38 @@ function getValueSetOptions(
     .then((valueSet: ValueSet) => valueSet.expansion?.contains ?? []);
 }
 
-function useValueSetOptions(valueSetUrl: string | undefined): [ValueSetExpansionContains[], boolean] {
+interface ValueSetOptionsState {
+  readonly options: ValueSetExpansionContains[];
+  readonly loading: boolean;
+  readonly available: boolean | undefined;
+}
+
+function useValueSetOptions(valueSetUrl: string | undefined): ValueSetOptionsState {
   const medplum = useMedplum();
   const [valueSetOptions, setValueSetOptions] = useState<ValueSetExpansionContains[]>([]);
   const [isLoading, setIsLoading] = useState(false);
+  const [isAvailable, setIsAvailable] = useState<boolean | undefined>(() => (valueSetUrl ? undefined : true));
 
   useEffect(() => {
     async function loadValueSet(): Promise<void> {
       if (!valueSetUrl) {
+        setIsAvailable(true);
         return;
       }
 
       setIsLoading(true);
+      setIsAvailable(undefined);
       try {
         const options = await getValueSetOptions(valueSetUrl, medplum);
         setValueSetOptions(options);
+        setIsAvailable(true);
       } catch (err) {
-        console.error('Error loading value set:', err);
+        // A permanent 400/404 marks it unavailable; a transient failure keeps the field usable
+        const unavailable = isValueSetUnavailableError(err);
+        setIsAvailable(!unavailable);
+        if (!unavailable) {
+          console.error('Error loading value set:', err);
+        }
       } finally {
         setIsLoading(false);
       }
@@ -445,7 +462,21 @@ function useValueSetOptions(valueSetUrl: string | undefined): [ValueSetExpansion
     loadValueSet().catch(console.error);
   }, [valueSetUrl, medplum]);
 
-  return [valueSetOptions, isLoading];
+  return { options: valueSetOptions, loading: isLoading, available: isAvailable };
+}
+
+// Radio and checkbox items can only offer the answers their value set provides, so an unavailable
+// value set leaves nothing to pick and the question cannot be answered at all.
+function ValueSetUnavailableDisplay({ valueSetUrl }: { readonly valueSetUrl: string | undefined }): JSX.Element {
+  return (
+    <Box>
+      <UnavailableNote
+        text="This question is unavailable."
+        severity="error"
+        message={`Value set ${valueSetUrl} is unavailable`}
+      />
+    </Box>
+  );
 }
 
 function getOptionsFromValueSet(valueSetOptions: ValueSetExpansionContains[], name: string): [string, TypedValue][] {
@@ -467,7 +498,11 @@ function QuestionnaireRadioButtonInput(props: QuestionnaireChoiceInputProps): JS
   const { name, item, required, initial, onChangeAnswer, response } = props;
   const valueElementDefinition = getElementDefinition('QuestionnaireItemAnswerOption', 'value[x]');
   const initialValue = getItemInitialValue(initial);
-  const [valueSetOptions, isLoading] = useValueSetOptions(item.answerValueSet);
+  const {
+    options: valueSetOptions,
+    loading: isLoading,
+    available: isValueSetAvailable,
+  } = useValueSetOptions(item.answerValueSet);
 
   const options: [string, TypedValue][] = [];
   let defaultValue = undefined;
@@ -501,7 +536,11 @@ function QuestionnaireRadioButtonInput(props: QuestionnaireChoiceInputProps): JS
   }
 
   if (options.length === 0) {
-    return <NoAnswerDisplay />;
+    return isValueSetAvailable === false ? (
+      <ValueSetUnavailableDisplay valueSetUrl={item.answerValueSet} />
+    ) : (
+      <NoAnswerDisplay />
+    );
   }
 
   const limitedOptions = options.slice(0, MAX_DISPLAYED_CHECKBOX_RADIO_VALUE_SET_OPTIONS);
@@ -551,14 +590,17 @@ function QuestionnaireRadioButtonInput(props: QuestionnaireChoiceInputProps): JS
 function QuestionnaireCheckboxInput(props: QuestionnaireChoiceInputProps): JSX.Element {
   const { name, item, onChangeAnswer, response } = props;
   const valueElementDefinition = getElementDefinition('QuestionnaireItemAnswerOption', 'value[x]');
-  const [valueSetOptions, isLoading] = useValueSetOptions(item.answerValueSet);
+  const {
+    options: valueSetOptions,
+    loading: isLoading,
+    available: isValueSetAvailable,
+  } = useValueSetOptions(item.answerValueSet);
 
-  // Get initial values from response
-  const initialSelectedValues = item.answerValueSet
+  // Derive the selected values from the response rather than local state, so that answers
+  // rewritten by the form state (e.g. optionExclusive) are reflected in the checkboxes.
+  const selectedValues = item.answerValueSet
     ? (response?.answer?.map((a) => a.valueCoding) || []).filter((c): c is Coding => c !== undefined)
     : getCurrentMultiSelectAnswer(response);
-
-  const [selectedValues, setSelectedValues] = useState(initialSelectedValues);
 
   const options: [string, TypedValue][] = [];
 
@@ -582,7 +624,11 @@ function QuestionnaireCheckboxInput(props: QuestionnaireChoiceInputProps): JSX.E
   }
 
   if (options.length === 0) {
-    return <NoAnswerDisplay />;
+    return isValueSetAvailable === false ? (
+      <ValueSetUnavailableDisplay valueSetUrl={item.answerValueSet} />
+    ) : (
+      <NoAnswerDisplay />
+    );
   }
 
   const limitedOptions = options.slice(0, MAX_DISPLAYED_CHECKBOX_RADIO_VALUE_SET_OPTIONS);
@@ -598,7 +644,6 @@ function QuestionnaireCheckboxInput(props: QuestionnaireChoiceInputProps): JSX.E
         newCodings = currentCodings.filter((c) => !deepEquals(c, optionValue.value));
       }
 
-      setSelectedValues(newCodings);
       if (newCodings.length === 0) {
         onChangeAnswer([{}]);
       } else {
@@ -615,7 +660,6 @@ function QuestionnaireCheckboxInput(props: QuestionnaireChoiceInputProps): JSX.E
         newValues = currentValues.filter((v) => v !== optionValueStr);
       }
 
-      setSelectedValues(newValues);
       if (newValues.length === 0) {
         onChangeAnswer([{}]);
       } else {

@@ -2,9 +2,11 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   Badge,
+  Button,
   Divider,
   Group,
   Loader,
+  Menu,
   Paper,
   ScrollArea,
   Stack,
@@ -13,6 +15,7 @@ import {
   ThemeIcon,
   Timeline,
 } from '@mantine/core';
+import type { WithId } from '@medplum/core';
 import { formatDate, formatHumanName } from '@medplum/core';
 import type {
   CarePlan,
@@ -23,15 +26,18 @@ import type {
   Reference,
   ServiceRequest,
 } from '@medplum/fhirtypes';
-import { AttachmentDisplay, DiagnosticReportDisplay, useMedplum, useResource } from '@medplum/react';
-import { IconCheck, IconClipboardCheck, IconFlask, IconSend } from '@tabler/icons-react';
+import { AttachmentDisplay, useMedplum, useResource } from '@medplum/react';
+import { IconCheck, IconChevronDown, IconClipboardCheck, IconFlask, IconSend } from '@tabler/icons-react';
 import type { JSX } from 'react';
-import { useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 import { fetchLabOrderRequisitionDocuments, getHealthGorillaRequisitionId } from '../../utils/documentReference';
 import { showErrorNotification } from '../../utils/notifications';
+import { LabReportContent } from './LabReportContent';
 
 interface LabOrderDetailsProps {
   order: ServiceRequest;
+  onChange?: (order: WithId<ServiceRequest>) => void;
+  onResume?: () => void;
 }
 
 interface ProgressStep {
@@ -44,7 +50,7 @@ interface ProgressStep {
 }
 
 export function LabOrderDetails(props: LabOrderDetailsProps): JSX.Element {
-  const { order } = props;
+  const { order, onChange, onResume } = props;
   const medplum = useMedplum();
   const patient = useResource(order.subject);
   const requester = useResource(order.requester);
@@ -58,6 +64,22 @@ export function LabOrderDetails(props: LabOrderDetailsProps): JSX.Element {
   const [activeDetailTab, setActiveDetailTab] = useState<'report' | 'progress' | 'order'>(
     order.status !== 'completed' ? 'progress' : 'report'
   );
+
+  const canRevoke = order.status === 'draft' || order.status === 'active' || order.status === 'on-hold';
+  const isDraft = order.status === 'draft';
+  const hideProgress = isDraft || order.status === 'revoked';
+  const detailTab = hideProgress ? 'order' : activeDetailTab;
+
+  const handleRevoke = useCallback(async (): Promise<void> => {
+    try {
+      const updated = await medplum.patchResource('ServiceRequest', order.id as string, [
+        { op: 'replace', path: '/status', value: 'revoked' },
+      ]);
+      onChange?.(updated);
+    } catch (err) {
+      showErrorNotification(err);
+    }
+  }, [medplum, order.id, onChange]);
 
   // Filter DiagnosticReports for this specific order
   useEffect(() => {
@@ -355,55 +377,71 @@ export function LabOrderDetails(props: LabOrderDetailsProps): JSX.Element {
       <Paper h="100%">
         <Stack gap="0">
           <Stack gap="md" p="md">
-            <Stack gap="md">
-              <Stack gap="0">
-                <Text size="xl" fw={800}>
-                  {(() => {
-                    // If there are multiple codes (2 or more), show them separated by commas
-                    if (order.code?.coding && order.code.coding.length >= 2) {
-                      return order.code.coding.map((coding) => coding.display).join(', ');
-                    }
+            <Stack gap="0">
+              <Text size="xl" fw={800}>
+                {(() => {
+                  // If there are multiple codes (2 or more), show them separated by commas
+                  if (order.code?.coding && order.code.coding.length >= 2) {
+                    return order.code.coding.map((coding) => coding.display).join(', ');
+                  }
 
-                    // If there's a text field and only one code, use the text field
-                    if (order.code?.text) {
-                      return order.code.text;
-                    }
+                  // If there's a text field and only one code, use the text field
+                  if (order.code?.text) {
+                    return order.code.text;
+                  }
 
-                    // Otherwise, show the first code or fallback
-                    return order.code?.coding?.[0]?.display || 'Lab Order';
-                  })()}
-                </Text>
-                <Text size="sm" c="gray.7">
-                  {order.status === 'completed' && order.meta?.lastUpdated
-                    ? `Completed ${formatDate(order.meta.lastUpdated)} • Ordered ${formatDate(order.authoredOn || order.meta?.lastUpdated)}`
-                    : `Ordered ${formatDate(order.authoredOn || order.meta?.lastUpdated)}`}
-                </Text>
-              </Stack>
-              <Divider />
-              <Group justify="space-between" align="center">
-                <Tabs
-                  value={activeDetailTab}
-                  onChange={(value) => setActiveDetailTab(value as 'report' | 'progress' | 'order')}
-                  variant="unstyled"
-                  className="pill-tabs"
-                >
-                  <Tabs.List>
+                  // Otherwise, show the first code or fallback
+                  return order.code?.coding?.[0]?.display || 'Lab Order';
+                })()}
+              </Text>
+              <Text size="sm" c="gray.7">
+                {order.status === 'completed' && order.meta?.lastUpdated
+                  ? `Completed ${formatDate(order.meta.lastUpdated)} • Ordered ${formatDate(order.authoredOn || order.meta?.lastUpdated)}`
+                  : `Ordered ${formatDate(order.authoredOn || order.meta?.lastUpdated)}`}
+              </Text>
+            </Stack>
+            <Divider />
+            <Group justify="space-between" align="center">
+              <Tabs
+                value={detailTab}
+                onChange={(value) => setActiveDetailTab(value as 'report' | 'progress' | 'order')}
+                variant="unstyled"
+                className="pill-tabs"
+              >
+                <Tabs.List>
+                  {!hideProgress && (
                     <Tabs.Tab value={order.status !== 'completed' ? 'progress' : 'report'}>
                       {order.status !== 'completed' ? 'Progress Tracker' : 'Report'}
                     </Tabs.Tab>
-                    <Tabs.Tab value="order">Order Details</Tabs.Tab>
-                  </Tabs.List>
-                </Tabs>
-                <Badge size="lg" color={getStatusColor(order.status)} variant="light">
-                  {getStatusDisplayText(order.status)}
-                </Badge>
-              </Group>
-            </Stack>
+                  )}
+                  <Tabs.Tab value="order">Order Details</Tabs.Tab>
+                </Tabs.List>
+              </Tabs>
+              <Menu position="bottom-end" shadow="md">
+                <Menu.Target>
+                  <Button
+                    variant="light"
+                    color={getStatusColor(order.status)}
+                    rightSection={canRevoke ? <IconChevronDown size={16} /> : undefined}
+                    radius="xl"
+                    size="sm"
+                  >
+                    {getStatusDisplayText(order.status)}
+                  </Button>
+                </Menu.Target>
+                {canRevoke && (
+                  <Menu.Dropdown>
+                    {isDraft && onResume && <Menu.Item onClick={onResume}>Active</Menu.Item>}
+                    <Menu.Item onClick={() => handleRevoke().catch(console.error)}>Revoked</Menu.Item>
+                  </Menu.Dropdown>
+                )}
+              </Menu>
+            </Group>
           </Stack>
 
           <Stack gap="xs" p="md">
             {/* Order Details Tab Content */}
-            {activeDetailTab === 'order' && (
+            {detailTab === 'order' && (
               <Stack gap="md">
                 <Stack gap="sm" mb="xl">
                   <Group align="flex-start" gap="lg">
@@ -737,7 +775,7 @@ export function LabOrderDetails(props: LabOrderDetailsProps): JSX.Element {
             )}
 
             {/* Progress Tracker Tab Content - for open items */}
-            {activeDetailTab === 'progress' && (
+            {detailTab === 'progress' && (
               <Stack gap="md">
                 <Stack p="xl" align="center">
                   <Timeline
@@ -802,52 +840,7 @@ export function LabOrderDetails(props: LabOrderDetailsProps): JSX.Element {
             )}
 
             {/* Report Tab Content - for completed items */}
-            {activeDetailTab === 'report' && primaryReport && (
-              <Stack gap="sm" mb="xl">
-                {/* Results PDF */}
-                {primaryReport?.presentedForm && primaryReport.presentedForm.length > 0 && (
-                  <>
-                    <Stack gap="lg" mb="xl">
-                      <Text fw={800} size="md" pb="0">
-                        Lab Document
-                      </Text>
-                      <Stack gap="md">
-                        {primaryReport.presentedForm.map((form, index) => (
-                          <Stack key={index} gap="xs">
-                            <div
-                              style={{
-                                height: '600px',
-                                borderRadius: '4px',
-                                overflow: 'hidden',
-                                border: '1px solid #3C3C3C',
-                              }}
-                            >
-                              <style>
-                                {`
-                              div[data-testid="attachment-iframe"] {
-                                height: 600px !important;
-                              }
-                              div[data-testid="attachment-iframe"] iframe {
-                                height: 600px !important;
-                              }
-                            `}
-                              </style>
-                              <AttachmentDisplay value={form} />
-                            </div>
-                          </Stack>
-                        ))}
-                      </Stack>
-                    </Stack>
-                  </>
-                )}
-
-                {primaryReport.result && primaryReport.result.length > 0 && (
-                  <Stack pt="md">
-                    <DiagnosticReportDisplay value={primaryReport} />
-                  </Stack>
-                )}
-              </Stack>
-            )}
+            {detailTab === 'report' && primaryReport && <LabReportContent report={primaryReport} />}
           </Stack>
         </Stack>
       </Paper>

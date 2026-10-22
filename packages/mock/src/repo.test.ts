@@ -52,7 +52,7 @@ describe('Mock Repo', () => {
     const client = new MockClient();
     const id = randomUUID();
     const versionId = randomUUID();
-    const result = await client.withSeeding(() =>
+    const result = await client.mock.withSeeding(() =>
       client.createResource({
         resourceType: 'Patient',
         id,
@@ -109,7 +109,7 @@ describe('Mock Repo', () => {
 
     try {
       await client.readResource('Patient', resource1.id);
-      fail('Should have thrown');
+      expect.fail('Should have thrown');
     } catch (err) {
       const outcome = (err as OperationOutcomeError).outcome;
       expect(outcome.id).toStrictEqual('not-found');

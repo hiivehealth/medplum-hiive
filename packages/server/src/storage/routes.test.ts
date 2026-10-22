@@ -4,24 +4,38 @@ import { ContentType } from '@medplum/core';
 import type { Binary } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import express from 'express';
+import type { Server } from 'http';
+import type { AddressInfo } from 'net';
 import { Readable } from 'stream';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../app';
 import { loadTestConfig } from '../config/loader';
-import type { MedplumServerConfig } from '../config/types';
-import { getGlobalSystemRepo } from '../fhir/repo';
-import { createTestProject, withTestContext } from '../test.setup';
+import type { ServerConfig } from '../config/utils';
+import { getTestProjectSystemRepo } from '../fhir/repository/test-utils';
+import { createTestProject, streamToString, withTestContext } from '../test.setup';
 import { getBinaryStorage } from './loader';
 
 const app = express();
-let config: MedplumServerConfig;
+let config: ServerConfig;
+let server: Server;
 let binary: Binary;
 
+// Signature verification covers the full URL including host, so requests must go to the
+// address that storageBaseUrl points at. Strip the origin and let supertest supply it.
+function toPath(url: string): string {
+  const parsed = new URL(url);
+  return parsed.pathname + parsed.search;
+}
+
 describe('Storage Routes', () => {
-  const systemRepo = getGlobalSystemRepo();
+  const systemRepo = getTestProjectSystemRepo();
   beforeAll(async () => {
     config = await loadTestConfig();
-    await initApp(app, config);
+    server = await initApp(app, config);
+    await new Promise<void>((resolve) => {
+      server.listen(0, '127.0.0.1', resolve);
+    });
+    config.storageBaseUrl = `http://127.0.0.1:${(server.address() as AddressInfo).port}/storage/`;
 
     binary = await withTestContext(async () => {
       const result = await systemRepo.createResource<Binary>({
@@ -44,50 +58,35 @@ describe('Storage Routes', () => {
 
   test('Missing signature', async () => {
     const res = await request(app).get(`/storage/${binary.id}?Expires=123`);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Missing expires', async () => {
     const res = await request(app).get(`/storage/${binary.id}?Signature=xyz`);
-    expect(res.status).toBe(410);
+    expect(res).toHaveStatus(410);
   });
 
   test('Invalid signature', async () => {
     const dateLessThan = new Date();
     dateLessThan.setHours(dateLessThan.getHours() + 1);
     const res = await request(app).get(`/storage/${binary.id}?Signature=xyz&Expires=${dateLessThan.getTime()}`);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Success', async () => {
-    // For signature verification, we need to use the same URL as the client would use
-    // So we need to start the request without executing it yet
-    const req = request(app).get('/');
-
-    // Get the base URL from the request (i.e., "http://127.0.0.1:57516/")
-    const baseUrl = req.url;
-
-    // Now we need to update our server config to use that as the storage base URL
-    config.storageBaseUrl = baseUrl + 'storage/';
-
-    // Now we can generate the presigned URL with a proper signature
-    req.url = await getBinaryStorage().getPresignedUrl(binary);
-
-    // And finally, we can execute the request
-    const res = await req;
-    expect(res.status).toBe(200);
+    const url = await getBinaryStorage().getPresignedUrl(binary);
+    const res = await request(server).get(toPath(url));
+    expect(res).toHaveStatus(200);
   });
 
   test('Binary not found', async () => {
-    const req = request(app).get('/');
-    config.storageBaseUrl = req.url + 'storage/';
-    req.url = await getBinaryStorage().getPresignedUrl({
+    const url = await getBinaryStorage().getPresignedUrl({
       resourceType: 'Binary',
       id: randomUUID(),
       contentType: ContentType.TEXT,
     });
-    const res = await req;
-    expect(res.status).toBe(404);
+    const res = await request(server).get(toPath(url));
+    expect(res).toHaveStatus(404);
   });
 
   test('File not found', async () => {
@@ -100,66 +99,44 @@ describe('Storage Routes', () => {
       return result;
     });
 
-    const req = request(app).get('/');
-    config.storageBaseUrl = req.url + 'storage/';
-    req.url = await getBinaryStorage().getPresignedUrl(resource);
-    const res = await req;
-    expect(res.status).toBe(404);
+    const url = await getBinaryStorage().getPresignedUrl(resource);
+    const res = await request(server).get(toPath(url));
+    expect(res).toHaveStatus(404);
   });
 
   test('Write success', async () => {
-    // For signature verification, we need to use the same URL as the client would use
-    // So we need to start the request without executing it yet
-    const req = request(app).put('/').set('Content-Type', 'text/plain');
-
-    // Get the base URL from the request (i.e., "http://127.0.0.1:57516/")
-    const baseUrl = req.url;
-
-    // Now we need to update our server config to use that as the storage base URL
-    config.storageBaseUrl = baseUrl + 'storage/';
-
-    // Now we can generate the presigned upload URL with a proper signature
-    req.url = await getBinaryStorage().getPresignedUrl(binary, { upload: true });
-
-    // And finally, we can execute the request
-    const res = await req.send('foo bar baz quux');
-    expect(res.status).toBe(200);
+    const url = await getBinaryStorage().getPresignedUrl(binary, { upload: true });
+    const res = await request(server).put(toPath(url)).set('Content-Type', 'text/plain').send('foo bar baz quux');
+    expect(res).toHaveStatus(200);
+    // text/plain is also handled by a global body parser, which must not consume the upload
+    expect(await streamToString(await getBinaryStorage().readBinary(binary))).toBe('foo bar baz quux');
   });
 
   test('Write mismatched content type', async () => {
-    // For signature verification, we need to use the same URL as the client would use
-    // So we need to start the request without executing it yet
-    const req = request(app).put('/').set('Content-Type', 'text/plain');
-
-    // Get the base URL from the request (i.e., "http://127.0.0.1:57516/")
-    const baseUrl = req.url;
-
-    // Now we need to update our server config to use that as the storage base URL
-    config.storageBaseUrl = baseUrl + 'storage/';
-
-    // Now we can generate the presigned upload URL with a proper signature
-    req.url = await getBinaryStorage().getPresignedUrl(binary, { upload: true });
-
-    // And finally, we can execute the request
-    const res = await req.set('content-type', 'application/json').send('{}');
-    expect(res.status).toBe(400);
+    const url = await getBinaryStorage().getPresignedUrl(binary, { upload: true });
+    const res = await request(server)
+      .put(toPath(url))
+      .set('Content-Type', 'text/plain')
+      .set('content-type', 'application/json')
+      .send('{}');
+    expect(res).toHaveStatus(400);
   });
 
   test('Write missing signature', async () => {
     const res = await request(app).put(`/storage/${binary.id}?Expires=123`);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Write missing expires', async () => {
     const res = await request(app).put(`/storage/${binary.id}?Signature=xyz`);
-    expect(res.status).toBe(410);
+    expect(res).toHaveStatus(410);
   });
 
   test('Write invalid signature', async () => {
     const dateLessThan = new Date();
     dateLessThan.setHours(dateLessThan.getHours() + 1);
     const res = await request(app).put(`/storage/${binary.id}?Signature=xyz&Expires=${dateLessThan.getTime()}`);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   describe('Project query param', () => {
@@ -167,10 +144,10 @@ describe('Storage Routes', () => {
     let projectBinary: Binary;
 
     beforeAll(async () => {
-      const { project } = await createTestProject();
+      const { project, repo } = await createTestProject({ withRepo: true });
       projectId = project.id;
       projectBinary = await withTestContext(async () => {
-        return systemRepo.createResource<Binary>({
+        return repo.createResource<Binary>({
           resourceType: 'Binary',
           contentType: ContentType.TEXT,
           meta: { project: projectId },
@@ -202,37 +179,33 @@ describe('Storage Routes', () => {
     });
 
     test('GET success with Project param', async () => {
-      const req = request(app).get('/');
-      config.storageBaseUrl = req.url + 'storage/';
-      req.url = await getBinaryStorage().getPresignedUrl(projectBinary);
-      const res = await req;
-      expect(res.status).toBe(200);
+      const url = await getBinaryStorage().getPresignedUrl(projectBinary);
+      const res = await request(server).get(toPath(url));
+      expect(res).toHaveStatus(200);
     });
 
     test('GET tampered Project fails signature', async () => {
-      const req = request(app).get('/');
-      config.storageBaseUrl = req.url + 'storage/';
       const url = await getBinaryStorage().getPresignedUrl(projectBinary);
-      req.url = url.replace(`Project=${projectId}`, `Project=${randomUUID()}`);
-      const res = await req;
-      expect(res.status).toBe(401);
+      const res = await request(server).get(toPath(url.replace(`Project=${projectId}`, `Project=${randomUUID()}`)));
+      expect(res).toHaveStatus(401);
     });
 
     test('PUT success with Project param', async () => {
-      const req = request(app).put('/').set('Content-Type', 'text/plain');
-      config.storageBaseUrl = req.url + 'storage/';
-      req.url = await getBinaryStorage().getPresignedUrl(projectBinary, { upload: true });
-      const res = await req.send('project upload content');
-      expect(res.status).toBe(200);
+      const url = await getBinaryStorage().getPresignedUrl(projectBinary, { upload: true });
+      const res = await request(server)
+        .put(toPath(url))
+        .set('Content-Type', 'text/plain')
+        .send('project upload content');
+      expect(res).toHaveStatus(200);
     });
 
     test('PUT tampered Project fails signature', async () => {
-      const req = request(app).put('/').set('Content-Type', 'text/plain');
-      config.storageBaseUrl = req.url + 'storage/';
       const url = await getBinaryStorage().getPresignedUrl(projectBinary, { upload: true });
-      req.url = url.replace(`Project=${projectId}`, `Project=${randomUUID()}`);
-      const res = await req.send('tampered');
-      expect(res.status).toBe(401);
+      const res = await request(server)
+        .put(toPath(url.replace(`Project=${projectId}`, `Project=${randomUUID()}`)))
+        .set('Content-Type', 'text/plain')
+        .send('tampered');
+      expect(res).toHaveStatus(401);
     });
   });
 });

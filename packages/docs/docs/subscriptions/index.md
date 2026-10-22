@@ -12,9 +12,16 @@ Subscriptions are event-driven notifications, like webhooks, and are commonly us
 - [AuditEvents](https://app.medplum.com/AuditEvent) can be used to see a history of Subscription triggers and are useful in troubleshooting.
 - [Subscription features and fixes](https://github.com/medplum/medplum/pulls?q=is%3Apr+label%3Asubscriptions) can be seen in detail on Github.
 
+:::warning[Limit of 1,000 active Subscriptions per project]
+
+When a resource changes, the server evaluates at most 1,000 active Subscriptions in the project.
+
+:::
+
 **Additional Documentation**
 
 - Use the [subscription](/docs/tags/subscription) tag to quickly find all documentation related to Subscriptions
 - [Resending Webhooks](/docs/api/fhir/operations/resend) describes the `$resend` operation for manually triggering webhooks
 - [Subscription Extensions](/docs/subscriptions/subscription-extensions) describes advanced subscription features that allow more fine-grained control and security
 - [WebSocket Subscriptions](/docs/react/use-subscription) describes WebSocket subscriptions and usage of them via the React `useSubscription` hook
+- [Server-Scoped Subscriptions](/docs/subscriptions/server-scoped-subscriptions) describes the self-hosted feature that lets a super admin create a single Subscription that fires across every project on the server

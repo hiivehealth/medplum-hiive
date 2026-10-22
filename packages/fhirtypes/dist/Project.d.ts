@@ -102,6 +102,14 @@ export interface Project {
   identifier?: Identifier[];
 
   /**
+   * Whether this project is in active use. When a project is inactive, no
+   * one can log in to the project, existing sessions in the project stop
+   * working, and its subscriptions, cron bots, and async jobs do not run.
+   * Can only be set by a super admin.
+   */
+  active?: boolean;
+
+  /**
    * A name associated with the Project.
    */
   name?: string;
@@ -138,11 +146,13 @@ export interface Project {
   /**
    * A list of optional features that are enabled for the project.
    */
-  features?: ('ai' | 'aws-comprehend' | 'aws-textract' | 'bots' | 'cron' | 'email' | 'google-auth-required' |
-      'graphql-introspection' | 'websocket-subscriptions' | 'transaction-bundles' | 'validate-terminology')[];
+  features?: ('ai' | 'ai-realtime' | 'aws-comprehend' | 'aws-textract' | 'billing' | 'bots' | 'cron' | 'email' |
+      'google-auth-required' | 'graphql-introspection' | 'scheduling' | 'websocket-subscriptions' | 'transaction-bundles' |
+      'validate-terminology' | 'range-search' | 'log-streaming' | 'async-batch' | 'archive')[];
 
   /**
-   * The default access policy for patients using open registration.
+   * @deprecated Use defaultAccessPolicies instead. The default access
+   * policy for patients using open registration.
    */
   defaultPatientAccessPolicy?: Reference<AccessPolicy>;
 
@@ -187,9 +197,32 @@ export interface Project {
   defaultProfile?: ProjectDefaultProfile[];
 
   /**
+   * Default access policies to apply to project members by role when no
+   * explicit policy is provided.
+   */
+  defaultAccessPolicies?: ProjectDefaultAccessPolicies[];
+
+  /**
    * The resource types exported by the project when linked
    */
   exportedResourceType?: ResourceType[];
+}
+
+/**
+ * Default access policies to apply to project members by role when no
+ * explicit policy is provided.
+ */
+export interface ProjectDefaultAccessPolicies {
+
+  /**
+   * The member role this policy applies to.
+   */
+  profileType: 'Patient' | 'Practitioner' | 'RelatedPerson' | 'Admin';
+
+  /**
+   * The access policy to apply to members of this role.
+   */
+  accessPolicy: Reference<AccessPolicy>;
 }
 
 /**

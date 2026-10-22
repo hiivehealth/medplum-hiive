@@ -15,7 +15,7 @@ permissions:
 jobs:
   build:
     name: Deploy
-    runs-on: ubuntu-latest
+    runs-on: medplum-build-16core
     timeout-minutes: 45
     if: github.repository == 'medplum/medplum'
     permissions:
@@ -26,10 +26,10 @@ jobs:
       TURBO_TEAM: ${{ secrets.TURBO_TEAM }}
       TURBO_CACHE: 'remote:rw'
     steps:
-      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
-      - uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -37,7 +37,7 @@ jobs:
           # See: https://github.com/actions/setup-node/issues/328
           package-manager-cache: false
       - name: Cache node modules
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         env:
           cache-name: cache-node-modules
         with:
@@ -50,32 +50,44 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Build
-        run: npm run build:fast
+        run: npm run build:fast -- --force
+        env: # Set placeholder env vars for build
+          MEDPLUM_BASE_URL: '__MEDPLUM_BASE_URL__'
+          MEDPLUM_CLIENT_ID: '__MEDPLUM_CLIENT_ID__'
+          MEDPLUM_REGISTER_ENABLED: '__MEDPLUM_REGISTER_ENABLED__'
+          MEDPLUM_AWS_TEXTRACT_ENABLED: '__MEDPLUM_AWS_TEXTRACT_ENABLED__'
+          GOOGLE_CLIENT_ID: '__GOOGLE_CLIENT_ID__'
+          RECAPTCHA_SITE_KEY: '__RECAPTCHA_SITE_KEY__'
       - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@acca2b1b2070338fb9fd1ca27ecee81d687e58e5 # v6.1.2
+        uses: aws-actions/configure-aws-credentials@e1253824e5c10ff9df46874f81ed3ec929e19cfd # v6.3.0
         with:
           role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
           aws-region: ${{ secrets.AWS_REGION }}
       - name: Login to Docker Hub
-        uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
       - name: Login to Docker Hub Hardened Images
-        uses: docker/login-action@465a07811f14bebb1938fbed4728c6a1ff8901fc # v2.2.0
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: dhi.io
           username: ${{ secrets.STAGING_DOCKERHUB_USERNAME }}
           password: ${{ secrets.STAGING_DOCKERHUB_TOKEN }}
       - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@885d1462b80bc1c1c7f0b00334ad271f09369c55 # v2.10.0
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - name: Deploy
         run: ${{ github.event_name == 'workflow_dispatch' && (github.ref == 'refs/heads/main' && './scripts/cicd-deploy.sh --force') || './scripts/cicd-deploy.sh' }}
         env:
           GITHUB_BEFORE: ${{ github.event.before }}
           APP_BUCKET: ${{ secrets.APP_BUCKET }}
+          DOCS_DESTINATION: www.medplum.com
+          FOOMEDICAL_BUCKET: foomedical.com
+          FOOMEDICAL_GOOGLE_CLIENT_ID: 679052511930-8dqur4mmg8egbttgos5pmr4ljtf3etbb.apps.googleusercontent.com
+          FOOMEDICAL_RECAPTCHA_SITE_KEY: 6LfFd_8gAAAAAOCVrZQ_aF2CN5b7s91NEYIu5GxL
           GRAPHIQL_BUCKET: graphiql.medplum.com
           GRAPHIQL_AWS_REGION: us-east-1
+          PROVIDER_APP_BUCKET: provider.medplum.com
           AWS_REGION: ${{ secrets.AWS_REGION }}
           SERVER_DOCKERHUB_REPOSITORY: ${{ secrets.DOCKERHUB_REPOSITORY }}
           APP_DOCKERHUB_REPOSITORY: ${{ secrets.APP_DOCKERHUB_REPOSITORY }}
@@ -87,5 +99,7 @@ jobs:
           MEDPLUM_BASE_URL: ${{ secrets.MEDPLUM_BASE_URL }}
           MEDPLUM_INTROSPECTION_URL: ${{ secrets.MEDPLUM_INTROSPECTION_URL }}
           MEDPLUM_AWS_TEXTRACT_ENABLED: 'true'
+          MEDPLUM_REGISTER_ENABLED: ${{ vars.MEDPLUM_REGISTER_ENABLED }}
           RECAPTCHA_SITE_KEY: ${{ secrets.RECAPTCHA_SITE_KEY }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          STORYBOOK_BUCKET: ${{ vars.STORYBOOK_BUCKET }}

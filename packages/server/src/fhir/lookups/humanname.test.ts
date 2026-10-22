@@ -4,16 +4,19 @@ import type { WithId } from '@medplum/core';
 import { formatFamilyName, formatGivenName, formatHumanName, Operator } from '@medplum/core';
 import type { HumanName, Patient, Practitioner, ResourceType, SearchParameter } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
-import type { PoolClient } from 'pg';
+import { vi } from 'vitest';
 import { initAppServices, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { bundleContains, withTestContext } from '../../test.setup';
-import { getGlobalSystemRepo } from '../repo';
+import { systemResourceProjectId } from '../../constants';
+import { DatabaseMode, getDatabasePool } from '../../database';
+import { bundleContains, createTestProject, withTestContext } from '../../test.setup';
+import { getTestProjectSystemRepo } from '../repository/test-utils';
+import type { PgQueryable } from '../sql';
 import type { HumanNameTableRow } from './humanname';
 import { getHumanNameSortValue, HumanNameTable } from './humanname';
 
 describe('HumanName Lookup Table', () => {
-  const systemRepo = getGlobalSystemRepo();
+  const systemRepo = getTestProjectSystemRepo();
 
   beforeAll(async () => {
     const config = await loadTestConfig();
@@ -45,6 +48,19 @@ describe('HumanName Lookup Table', () => {
       });
       expect(searchResult.entry?.length).toStrictEqual(1);
       expect(searchResult.entry?.[0]?.resource?.id).toStrictEqual(patient.id);
+    }));
+
+  test('Writes projectId to HumanName rows', () =>
+    withTestContext(async () => {
+      const { project, repo } = await createTestProject({ withRepo: true });
+      const patient = await repo.createResource<Patient>({
+        resourceType: 'Patient',
+        name: [{ given: ['Alice'], family: randomUUID() }],
+      });
+
+      const db = getDatabasePool(DatabaseMode.WRITER, repo.shardId);
+      const rows = await db.query('SELECT "projectId" FROM "HumanName" WHERE "resourceId" = $1', [patient.id]);
+      expect(rows.rows).toStrictEqual([{ projectId: project.id }]);
     }));
 
   test('Long given name exceeding btree index limit', () =>
@@ -307,7 +323,7 @@ describe('HumanName Lookup Table', () => {
       expect(descending.entry?.map((e) => e.resource?.id)).toStrictEqual([p3.id, p2.id, p1.id]);
     }));
 
-  test.failing('FAILING Sort by name multi-type', () =>
+  test.fails('FAILING Sort by name multi-type', () =>
     withTestContext(async () => {
       const name = randomUUID();
       const identifier = randomUUID();
@@ -336,7 +352,7 @@ describe('HumanName Lookup Table', () => {
   );
 
   test('Purges related resource type', async () => {
-    const db = { query: jest.fn().mockReturnValue({ rowCount: 0, rows: [] }) } as unknown as PoolClient;
+    const db = { query: vi.fn().mockReturnValue({ rowCount: 0, rows: [] }) } as unknown as PgQueryable;
 
     const table = new HumanNameTable();
     await table.purgeValuesBefore(db, 'Patient', '2024-01-01T00:00:00Z');
@@ -345,7 +361,7 @@ describe('HumanName Lookup Table', () => {
   });
 
   test('Does not purge unrelated resource type', async () => {
-    const db = { query: jest.fn() } as unknown as PoolClient;
+    const db = { query: vi.fn() } as unknown as PgQueryable;
 
     const table = new HumanNameTable();
     await table.purgeValuesBefore(db, 'AuditEvent', '2024-01-01T00:00:00Z');
@@ -375,6 +391,7 @@ describe('HumanName Lookup Table', () => {
     expect(result).toStrictEqual([
       {
         resourceId: '2',
+        projectId: systemResourceProjectId,
         name: 'Family',
         given: undefined,
         family: 'Family',
@@ -404,16 +421,35 @@ describe('HumanName Lookup Table', () => {
     expect(result).toStrictEqual([
       {
         resourceId: '1',
+        projectId: systemResourceProjectId,
         name: 'Ms Alice Smith',
         given: 'Alice',
         family: 'Smith',
       },
       {
         resourceId: '2',
+        projectId: systemResourceProjectId,
         name: 'Ms Alice Smith',
         given: 'Alice',
         family: 'Smith',
       },
+    ]);
+  });
+
+  test('extractValues uses resource project', () => {
+    const table = new HumanNameTable();
+    const projectId = randomUUID();
+    const patient: WithId<Patient> = {
+      resourceType: 'Patient',
+      id: '1',
+      meta: { project: projectId },
+      name: [{ given: ['Alice'], family: 'Smith' }],
+    };
+
+    const result: HumanNameTableRow[] = [];
+    table.extractValues(result, patient);
+    expect(result).toStrictEqual([
+      { resourceId: '1', projectId, name: 'Alice Smith', given: 'Alice', family: 'Smith' },
     ]);
   });
 });

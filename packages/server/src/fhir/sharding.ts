@@ -1,6 +1,13 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 
+import { OperationOutcomeError } from '@medplum/core';
+import type { ResourceType } from '@medplum/fhirtypes';
+import { getConfig } from '../config/loader';
+import type { ShardConfig } from '../config/utils';
+import { unsafeConfigKeys } from '../config/utils';
+import { getLogger } from '../logger';
+
 /**
  * The shard ID for the global database.
  * Also used when sharding is not enabled.
@@ -11,13 +18,271 @@ export const GLOBAL_SHARD_ID = 'global';
  * Transitory shard ID to use during the future-proofing phase when it is clear
  * how an actual shard ID should be determined but that logic has not yet been implemented.
  * Allows the rest of the sharding logic to be implemented and tested before
- * sharding is fully functional.
+ * sharding is fully functional. Resolves to {@link GLOBAL_SHARD_ID} via {@link normalizeShardId}.
  */
 export const PLACEHOLDER_SHARD_ID = 'placeholder';
 
 /**
  * Transitory shard ID to use during the future-proofing phase when support for project-based
  * sharding still needs to be determined. Allows the rest of the sharding logic to be implemented
- * and tested before sharding is fully functional.
+ * and tested before sharding is fully functional. Resolves to {@link GLOBAL_SHARD_ID} via
+ * {@link normalizeShardId}.
  */
 export const TODO_SHARD_ID = 'todo';
+
+export function isReservedShardId(shardId: string): boolean {
+  return shardId === GLOBAL_SHARD_ID || shardId === PLACEHOLDER_SHARD_ID || shardId === TODO_SHARD_ID;
+}
+
+/**
+ * Lowercase letter first, then lowercase letters, digits, and hyphens. Rules out `.` (config keys are
+ * dot-split), `__proto__`, and integer-like keys (which JS orders before all others).
+ */
+const SHARD_ID_PATTERN = /^[a-z][a-z0-9-]*$/;
+
+export function isValidShardId(shardId: string): boolean {
+  return SHARD_ID_PATTERN.test(shardId) && !unsafeConfigKeys.has(shardId);
+}
+
+export function isShardingEnabled(): boolean {
+  return getConfig().shards !== undefined;
+}
+
+export function getGlobalShardConfig(): ShardConfig {
+  const config = getConfig();
+  return { id: GLOBAL_SHARD_ID, database: config.database, readonlyDatabase: config.readonlyDatabase };
+}
+
+/**
+ * @param shardId - The shard ID to look up.
+ * @returns The shard config, or undefined if no shard has this ID. Throws if config is not loaded.
+ */
+function tryGetShardConfig(shardId: string): ShardConfig | undefined {
+  if (shardId === GLOBAL_SHARD_ID) {
+    return getGlobalShardConfig();
+  }
+  const config = getConfig();
+  if (config.shards && Object.hasOwn(config.shards, shardId)) {
+    return config.shards[shardId];
+  }
+  return undefined;
+}
+
+export function getShardConfig(shardId: string): ShardConfig {
+  const shardConfig = tryGetShardConfig(shardId);
+  if (!shardConfig) {
+    throw new Error(`Shard config not found for shard ID: ${shardId}`);
+  }
+  return shardConfig;
+}
+
+/**
+ * @param shardId - The shard ID to check.
+ * @returns True if the shard ID is the global shard or a shard in the loaded config. Throws if config is not loaded.
+ */
+export function isConfiguredShardId(shardId: string): boolean {
+  // Read config before the global check so an unloaded config throws for every shard ID
+  const shards = getConfig().shards;
+  return shardId === GLOBAL_SHARD_ID || (shards !== undefined && Object.hasOwn(shards, shardId));
+}
+
+/**
+ * @returns The shard new projects are placed on: the shard that sets `isDefaultShard`, or the global shard.
+ */
+export function getDefaultShardId(): string {
+  for (const shardConfig of Object.values(getConfig().shards ?? {})) {
+    if (shardConfig.isDefaultShard) {
+      return shardConfig.id;
+    }
+  }
+  return GLOBAL_SHARD_ID;
+}
+
+/**
+ * Returns all shard configurations starting with the global shard.
+ * @returns An iterator over the shard configurations.
+ * @yields Each shard configuration.
+ */
+export function* getAllShards(): Generator<ShardConfig> {
+  yield getGlobalShardConfig();
+  yield* getAllShardsExceptGlobal();
+}
+
+/**
+ * Returns all shard configurations except the global shard.
+ * @returns An iterator over the shard configurations.
+ * @yields Each shard configuration.
+ */
+export function* getAllShardsExceptGlobal(): Generator<ShardConfig> {
+  const shards = getConfig().shards;
+  if (shards) {
+    for (const config of Object.values(shards)) {
+      yield config;
+    }
+  }
+}
+
+export type ShardRouting = { kind: 'global-only' } | { kind: 'project-shard'; shardId: string };
+
+let strictShardingEnforcement = process.env.NODE_ENV === 'test';
+
+export function resetStrictShardingEnforcement(): void {
+  strictShardingEnforcement = process.env.NODE_ENV === 'test';
+}
+
+export function setStrictShardingEnforcement(value: boolean): void {
+  strictShardingEnforcement = value;
+}
+
+/**
+ * Resource types that always live on the global shard, regardless of the project they belong to.
+ *
+ * These must be co-located because they have to be searchable before the current project — and
+ * therefore the project's shard — is known, i.e. before authentication completes. Every other
+ * resource type is project-scoped and lives on the shard of the project that owns it.
+ *
+ * The criterion for adding a type is "must be readable before the shard ID is knowable", which is
+ * not the same as "not project-scoped": some of these tables hold rows carrying `meta.project`.
+ */
+export const globalShardResourceTypes: ReadonlySet<ResourceType> = new Set([
+  'Project', // inherently global since a Project's shard is stored in the Project itself
+  'ProjectMembership', // server-scoped User login flow
+  'User', // read by email for server-scoped login flow
+  'UserSecurityRequest', // read by id for verifyemail and setpassword
+  'ClientApplication', // read by id
+  'JsonWebKey', // used for signing and verifying JWTs, which is part of the login flow
+  'Login', // read by id in auth flow
+  'SmartHealthLink', // currently read by id, TODO add projectId to URLs and throw if not available so this line can be removed
+  'SmartAppLaunch', // read by id during login
+  'DomainConfiguration', // read by domain for external auth flow
+  'UserConfiguration', // TODO confirm this makes sense
+]);
+
+/**
+ * Collapses the transitory shard IDs onto the global shard so that shard-based routing can be
+ * exercised before real shard IDs exist. Also maps an unset shard ID to the global shard.
+ * @param shardId - The shard ID to normalize, if any.
+ * @returns The shard ID to route by.
+ */
+export function normalizeShardId(shardId: string | undefined): string {
+  if (!shardId || shardId === PLACEHOLDER_SHARD_ID || shardId === TODO_SHARD_ID) {
+    return GLOBAL_SHARD_ID;
+  }
+  return shardId;
+}
+
+/**
+ * Returns the shard that an operation over the given resource types belongs to.
+ *
+ * Types in {@link globalShardResourceTypes} resolve to the global shard and everything else to the
+ * project's shard ID. Operations that mix the two have no single database that can serve
+ * it — unless the repository's shard IS the global shard, in which case both halves land in the same
+ * shard and the operation is fine. That is the case until projects are migrated to non-global shards,
+ * which is why mixing is not an error on its own. `RepositoryAccessTracker` logs operations spanning
+ * logical shards but not physical ones, to inventory what must be split up before a project can move
+ * off the global shard. This function itself is pure; it should not log.
+ *
+ * An empty set is not allowed: "touches no resources" does not identify a destination. A default
+ * could silently misroute under-specified requests.
+ *
+ * @param routing - The context indicating whether the operation is global-only or tied to a project shard.
+ * @param resourceTypes - The resource types the operation touches. Must not be empty.
+ * @param source - Optional label for the call site, reported in the diagnostics when this throws.
+ * @returns The shard ID to route the operation to.
+ * @throws {OperationOutcomeError} When the operation spans multiple shards or names no resource types.
+ */
+export function resolveShardId(
+  routing: ShardRouting,
+  resourceTypes: ReadonlySet<ResourceType>,
+  source?: string
+): string {
+  let globalTypes: ResourceType[] | undefined;
+  let projectTypes: ResourceType[] | undefined;
+  for (const resourceType of resourceTypes) {
+    if (globalShardResourceTypes.has(resourceType)) {
+      globalTypes ??= [];
+      globalTypes.push(resourceType);
+    } else {
+      projectTypes ??= [];
+      projectTypes.push(resourceType);
+    }
+  }
+
+  if (!globalTypes && !projectTypes) {
+    throw shardRoutingError(
+      'Cannot route an operation that specifies no resource types',
+      `source: ${source || 'unknown'}`
+    );
+  }
+
+  if (!projectTypes) {
+    // only globalTypes, either routing.kind is acceptable
+    return GLOBAL_SHARD_ID;
+  }
+  // projectTypes are present below here
+
+  if (routing.kind === 'global-only') {
+    if (strictShardingEnforcement) {
+      throw shardRoutingError(
+        'Operation cannot be routed to a project shard from global-only routing',
+        `projectTypes: ${projectTypes.join(', ')}, source: ${source || 'unknown'}`
+      );
+    } else {
+      getLogger().warn('Operation cannot be routed to a project shard from global-only routing', {
+        projectTypes: projectTypes.join(', '),
+        source: source || 'unknown',
+      });
+    }
+  }
+
+  // fallback to GLOBAL_SHARD_ID MUST go away when global-only routing touching
+  // project-scoped resources always throws
+  // no need to gate the fallback on strictShardingEnforcement; it throws early before reaching this point.
+  const routingShardId = routing.kind === 'project-shard' ? routing.shardId : GLOBAL_SHARD_ID;
+
+  const normalizedShardId = normalizeShardId(routingShardId);
+  if (!globalTypes) {
+    return normalizedShardId;
+  }
+
+  // Mixed, but both halves land in the same database, so the operation runs.
+  if (normalizedShardId === GLOBAL_SHARD_ID) {
+    return GLOBAL_SHARD_ID;
+  }
+
+  throw shardRoutingError(
+    `Operation cannot span shards`,
+    `global: ${globalTypes.join(', ')}, ${routingShardId}: ${projectTypes.join(', ')}, source: ${source || 'unknown'}`
+  );
+}
+
+/**
+ * Same result as `resolveShardId` for a single type with no consideration for routing constraints.
+ * @param projectShardId - The shard ID for project resources.
+ * @param resourceType - The resource type.
+ * @returns The shard this repository reads and writes resources of the given type on.
+ */
+export function getResourceTypeShardId(projectShardId: string, resourceType: ResourceType): string {
+  return globalShardResourceTypes.has(resourceType) ? GLOBAL_SHARD_ID : normalizeShardId(projectShardId);
+}
+
+/**
+ * Returns the error thrown when an operation cannot be routed to a single shard.
+ *
+ * Modeled as an `exception` outcome and results in a 500 HTTP status code because a violation
+ * reaching this point is a server bug: an operation that cannot be atomic across databases
+ * should have been rejected, or split up, before it was attempted.
+ *
+ * Requests a client can make unsatisfiable, e.g. a transaction bundle mixing global and project-scoped
+ * resource types like should be rejected as 400 by a preflight in `BatchProcessor` before they
+ * reach shard routing.
+ * @param message - Description of the operation that could not be routed.
+ * @param diagnostics - Additional diagnostic information about the routing error.
+ * @returns The error to throw.
+ */
+export function shardRoutingError(message: string, diagnostics: string | undefined): OperationOutcomeError {
+  return new OperationOutcomeError({
+    resourceType: 'OperationOutcome',
+    issue: [{ severity: 'error', code: 'exception', details: { text: message }, diagnostics }],
+  });
+}

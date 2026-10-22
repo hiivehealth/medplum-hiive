@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: Apache-2.0
 import { concatUrls, isString, MEDPLUM_VERSION, MedplumClient } from '@medplum/core';
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import fetch from 'node-fetch';
 import { z } from 'zod';
 import { getConfig } from '../config/loader';
 import { getAuthenticatedContext } from '../context';
@@ -62,8 +61,18 @@ export function getMcpServer(): McpServer {
       const baseUrl = getConfig().baseUrl;
       const baseFhirUrl = concatUrls(baseUrl, 'fhir/R4');
       const fhirUrl = concatUrls(baseFhirUrl, path);
+
+      // SSRF / token-exfiltration guard (GHSA-fjgc-c3pj-xx2c).
+      // concatUrls() is new URL(path, base); an absolute or protocol-absolute `path`
+      // discards the base and points the proxy at an attacker-controlled URL. Because
+      // the proxy request carries the caller's bearer token, an off-origin URL both
+      // performs SSRF and leaks the token. Pin the resolved URL to the server origin.
+      if (new URL(fhirUrl).origin !== new URL(baseUrl).origin) {
+        throw new Error('Invalid path: must be relative to the FHIR base URL');
+      }
+
       const accessToken = ctx.authState.accessToken;
-      const proxy = new MedplumClient({ baseUrl, accessToken, fetch });
+      const proxy = new MedplumClient({ baseUrl, accessToken, fetch: globalThis.fetch });
 
       // MCP allows sending JSON, but some clients (like Claude) send the body as a string
       if (isString(body)) {

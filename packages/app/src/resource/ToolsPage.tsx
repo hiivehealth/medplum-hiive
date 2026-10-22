@@ -15,27 +15,46 @@ import {
 } from '@mantine/core';
 import { useDisclosure } from '@mantine/hooks';
 import { showNotification } from '@mantine/notifications';
-import { ContentType, fetchLatestVersionString, formatDateTime, normalizeErrorString } from '@medplum/core';
+import type { AgentChannelStats, AgentStats, MedplumSemver } from '@medplum/core';
+import {
+  ContentType,
+  compareVersions,
+  fetchAllVersionStrings,
+  fetchLatestVersionString,
+  formatDateTime,
+  isValidMedplumSemver,
+  normalizeErrorString,
+} from '@medplum/core';
 import type { Agent, Bundle, Parameters, Reference } from '@medplum/fhirtypes';
-import { Document, Form, Loading, ResourceName, StatusBadge, useMedplum } from '@medplum/react';
+import type { AsyncAutocompleteOption } from '@medplum/react';
+import { AsyncAutocomplete, Document, Form, Loading, ResourceName, StatusBadge, useMedplum } from '@medplum/react';
 import { IconCheck, IconRouter } from '@tabler/icons-react';
 import type { JSX } from 'react';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { useParams } from 'react-router';
 
+// Number of older, and separately newer, versions to offer alongside the current and latest versions.
+const VERSION_HISTORY_LENGTH = 5;
+
+const DOWNGRADE_WARNING =
+  'The Medplum Agent is frequently patched with new features and bugfixes. Downgrading your agent can result in ' +
+  'picking up old bugs or losing features you may be relying on. Are you sure you want to downgrade?';
+
 type UpgradeConfirmContentProps = {
   readonly opened: boolean;
   readonly close: () => void;
-  readonly version: string | undefined;
+  readonly version: MedplumSemver | 'unknown' | undefined;
   readonly loadingStatus: boolean;
   readonly handleStatus: () => void;
-  readonly handleUpgrade: (force: boolean) => void;
+  readonly handleUpgrade: (force: boolean, version: string) => void;
 };
 
 function UpgradeConfirmContent(props: UpgradeConfirmContentProps): JSX.Element {
   const { opened, close, version, loadingStatus, handleStatus, handleUpgrade } = props;
 
-  const [latestVersionString, setLatestVersionString] = useState<string>();
+  const [latestVersionString, setLatestVersionString] = useState<MedplumSemver>();
+  const [availableVersions, setAvailableVersions] = useState<MedplumSemver[]>();
+  const [selectedVersion, setSelectedVersion] = useState<MedplumSemver>();
   const [shouldForceUpgrade, setShouldForceUpgrade] = useState(false);
 
   useEffect(() => {
@@ -43,15 +62,20 @@ function UpgradeConfirmContent(props: UpgradeConfirmContentProps): JSX.Element {
       if (!latestVersionString) {
         fetchLatestVersionString('app-tools-page').then(setLatestVersionString).catch(console.error);
       }
+      if (!availableVersions) {
+        fetchAllVersionStrings('app-tools-page')
+          .then(setAvailableVersions)
+          .catch((err) => {
+            console.error(err);
+            setAvailableVersions([]);
+          });
+      }
       handleStatus();
     }
-  }, [opened, latestVersionString, handleStatus]);
+  }, [opened, latestVersionString, availableVersions, handleStatus]);
 
-  // If we don't have the latest version string
-  // The current agent version
-  // Or if we are still loading something
-  // Show loading
-  if (!(latestVersionString && version && !loadingStatus)) {
+  // If we don't yet know the current agent version, or are still loading it, show loading.
+  if (!version || loadingStatus) {
     return <Loading />;
   }
 
@@ -59,27 +83,181 @@ function UpgradeConfirmContent(props: UpgradeConfirmContentProps): JSX.Element {
     return <p>Unable to determine the current version of the agent. Check the network connectivity of the agent.</p>;
   }
 
-  if (version.startsWith(latestVersionString)) {
-    return <p>This agent is already on the latest version ({latestVersionString}).</p>;
+  // Otherwise, wait on the latest version string and the full version list before rendering
+  // the version picker.
+  if (!(latestVersionString && availableVersions)) {
+    return <Loading />;
+  }
+
+  // Defaults to the latest version until the user picks something else.
+  const targetVersion = selectedVersion ?? latestVersionString;
+
+  const newerVersions = availableVersions.filter((v) => compareVersions(v, version) > 0);
+  const olderVersions = availableVersions.filter((v) => compareVersions(v, version) < 0);
+  const upgradeChoices = newerVersions.slice(0, VERSION_HISTORY_LENGTH);
+  const downgradeChoices = olderVersions.slice(0, VERSION_HISTORY_LENGTH);
+  const versionChoices = upgradeChoices.includes(latestVersionString)
+    ? [...upgradeChoices, ...downgradeChoices]
+    : [latestVersionString, ...upgradeChoices, ...downgradeChoices];
+
+  const isDowngrade = compareVersions(targetVersion, version) < 0;
+  const isSameVersion = compareVersions(targetVersion, version) === 0;
+
+  function toVersionOption(v: MedplumSemver): AsyncAutocompleteOption<MedplumSemver> {
+    return { value: v, label: v === latestVersionString ? `${v} (Latest)` : v, resource: v };
+  }
+
+  // With no search input, offer the curated list (latest + nearby versions). Otherwise,
+  // search across every known version, not just the curated list.
+  const allVersions: MedplumSemver[] = availableVersions;
+  async function loadVersionOptions(input: string): Promise<MedplumSemver[]> {
+    if (!input) {
+      return versionChoices;
+    }
+    const query = input.toLowerCase();
+    return allVersions.filter((v) => v.toLowerCase().includes(query));
+  }
+
+  function onConfirmClick(): void {
+    if (isDowngrade && !window.confirm(DOWNGRADE_WARNING)) {
+      return;
+    }
+    handleUpgrade(shouldForceUpgrade, targetVersion);
+    close();
   }
 
   return (
     <>
-      <p>
-        Are you sure you want to upgrade this agent from version {version} to version {latestVersionString}?
-      </p>
+      <AsyncAutocomplete<MedplumSemver>
+        label="Target Version"
+        placeholder="Search versions..."
+        defaultValue={targetVersion}
+        toOption={toVersionOption}
+        loadOptions={loadVersionOptions}
+        onChange={([next]) => {
+          if (next) {
+            setSelectedVersion(next);
+          }
+        }}
+        maxValues={1}
+        clearable={false}
+      />
+      {isSameVersion ? (
+        <p>This agent is already on version {targetVersion}.</p>
+      ) : (
+        <p>
+          Are you sure you want to {isDowngrade ? 'downgrade' : 'upgrade'} this agent from version {version} to version{' '}
+          {targetVersion}?
+        </p>
+      )}
       <Group>
-        <Button
-          onClick={() => {
-            handleUpgrade(shouldForceUpgrade);
-            close();
-          }}
-          aria-label="Confirm upgrade"
-        >
+        <Button onClick={onConfirmClick} aria-label="Confirm upgrade">
           Confirm Upgrade
         </Button>
         <Checkbox label="Force" onChange={(e) => setShouldForceUpgrade(e.currentTarget.checked)} />
       </Group>
+    </>
+  );
+}
+
+const SUMMARY_STAT_KEYS = [
+  'live',
+  'ping',
+  'hl7ConnectionsOpen',
+  'hl7ClientCount',
+  'hl7QueueDepth',
+  'webSocketQueueDepth',
+  'outstandingHeartbeats',
+] as const satisfies readonly (keyof AgentStats)[];
+
+function formatStatValue(value: Record<string, unknown> | boolean | number | string): string {
+  if (value === null || value === undefined) {
+    return '';
+  }
+  if (typeof value === 'object') {
+    return JSON.stringify(value);
+  }
+  if (typeof value === 'number') {
+    return value.toLocaleString();
+  }
+  return value.toString();
+}
+
+function AgentChannelStatsTable(props: {
+  readonly title: string;
+  readonly entries: Record<string, AgentChannelStats>;
+}): JSX.Element | null {
+  const names = Object.keys(props.entries).filter((name) => props.entries[name]?.rtt);
+  if (!names.length) {
+    return null;
+  }
+  return (
+    <>
+      <Title order={3} mt="md">
+        {props.title}
+      </Title>
+      <Table>
+        <Table.Thead>
+          <Table.Tr>
+            <Table.Th>Name</Table.Th>
+            <Table.Th>Count</Table.Th>
+            <Table.Th>Pending</Table.Th>
+            <Table.Th>Min (ms)</Table.Th>
+            <Table.Th>Avg (ms)</Table.Th>
+            <Table.Th>Max (ms)</Table.Th>
+            <Table.Th>p50 (ms)</Table.Th>
+            <Table.Th>p95 (ms)</Table.Th>
+            <Table.Th>p99 (ms)</Table.Th>
+          </Table.Tr>
+        </Table.Thead>
+        <Table.Tbody>
+          {names.map((name) => {
+            const rtt = props.entries[name].rtt;
+            return (
+              <Table.Tr key={name}>
+                <Table.Td>{name}</Table.Td>
+                <Table.Td>{rtt.count}</Table.Td>
+                <Table.Td>{rtt.pendingCount}</Table.Td>
+                <Table.Td>{rtt.min}</Table.Td>
+                <Table.Td>{rtt.average}</Table.Td>
+                <Table.Td>{rtt.max}</Table.Td>
+                <Table.Td>{rtt.p50}</Table.Td>
+                <Table.Td>{rtt.p95}</Table.Td>
+                <Table.Td>{rtt.p99}</Table.Td>
+              </Table.Tr>
+            );
+          })}
+        </Table.Tbody>
+      </Table>
+    </>
+  );
+}
+
+function AgentStatsTables(props: { readonly stats: AgentStats }): JSX.Element {
+  const { stats } = props;
+  const knownKeys = new Set<string>([...SUMMARY_STAT_KEYS, 'channelStats', 'clientStats']);
+  const extraEntries = Object.entries(stats).filter(([key]) => !knownKeys.has(key));
+
+  return (
+    <>
+      <Table mt="sm">
+        <Table.Tbody>
+          {SUMMARY_STAT_KEYS.map((key) => (
+            <Table.Tr key={key}>
+              <Table.Td>{key}</Table.Td>
+              <Table.Td>{formatStatValue(stats[key])}</Table.Td>
+            </Table.Tr>
+          ))}
+          {extraEntries.map(([key, value]) => (
+            <Table.Tr key={key}>
+              <Table.Td>{key}</Table.Td>
+              <Table.Td>{formatStatValue(value)}</Table.Td>
+            </Table.Tr>
+          ))}
+        </Table.Tbody>
+      </Table>
+      <AgentChannelStatsTable title="Channel Stats" entries={stats.channelStats} />
+      <AgentChannelStatsTable title="Client Stats" entries={stats.clientStats} />
     </>
   );
 }
@@ -92,22 +270,20 @@ export function ToolsPage(): JSX.Element | null {
   const [reloadingConfig, setReloadingConfig] = useState(false);
   const [upgrading, setUpgrading] = useState(false);
   const [fetchingLogs, setFetchingLogs] = useState(false);
+  const [fetchingStats, setFetchingStats] = useState(false);
   const [status, setStatus] = useState<string>();
-  const [version, setVersion] = useState<string>();
+  const [version, setVersion] = useState<MedplumSemver | 'unknown'>();
   const [lastUpdated, setLastUpdated] = useState<string>();
   const [lastPing, setLastPing] = useState<string | undefined>();
   const [pinging, setPinging] = useState(false);
-  const [working, setWorking] = useState(false);
   const [logs, setLogs] = useState<string | undefined>();
+  const [logsHasMore, setLogsHasMore] = useState(false);
+  const [logsNextBefore, setLogsNextBefore] = useState<string | undefined>();
+  const [logLimit, setLogLimit] = useState(20);
+  const [stats, setStats] = useState<AgentStats | undefined>();
   const [modalOpened, { open: openModal, close: closeModal }] = useDisclosure(false);
 
-  useEffect(() => {
-    if (loadingStatus || reloadingConfig || upgrading || pinging) {
-      setWorking(true);
-      return;
-    }
-    setWorking(false);
-  }, [loadingStatus, reloadingConfig, upgrading, pinging]);
+  const working = loadingStatus || reloadingConfig || upgrading || pinging || fetchingLogs || fetchingStats;
 
   const handleStatus = useCallback(() => {
     setLoadingStatus(true);
@@ -115,8 +291,13 @@ export function ToolsPage(): JSX.Element | null {
       .get(medplum.fhirUrl('Agent', id, '$status'), { cache: 'reload' })
       .then((result: Parameters) => {
         setStatus(result.parameter?.find((p) => p.name === 'status')?.valueCode);
-        setVersion(result.parameter?.find((p) => p.name === 'version')?.valueString);
         setLastUpdated(result.parameter?.find((p) => p.name === 'lastUpdated')?.valueInstant);
+        const version = result.parameter?.find((p) => p.name === 'version')?.valueString;
+        if (version === undefined || version === 'unknown' || isValidMedplumSemver(version)) {
+          setVersion(version);
+        } else {
+          showError('Invalid version received from $status operation');
+        }
       })
       .catch((err) => showError(normalizeErrorString(err)))
       .finally(() => setLoadingStatus(false));
@@ -151,10 +332,11 @@ export function ToolsPage(): JSX.Element | null {
   }, [medplum, id]);
 
   const handleUpgrade = useCallback(
-    (force: boolean) => {
+    (force: boolean, targetVersion: string) => {
       setUpgrading(true);
       const upgradeUrl = medplum.fhirUrl('Agent', id, '$upgrade');
       upgradeUrl.searchParams.set('force', String(force));
+      upgradeUrl.searchParams.set('version', targetVersion);
       medplum
         .get(upgradeUrl, { cache: 'reload' })
         .then((_result: Bundle<Parameters>) => {
@@ -166,19 +348,30 @@ export function ToolsPage(): JSX.Element | null {
     [medplum, id]
   );
 
-  const handleFetchLogs = useCallback(
-    (formData: Record<string, string>) => {
+  const fetchLogsPage = useCallback(
+    (limit: number, before?: string): void => {
       setFetchingLogs(true);
-      const limit = formData.logLimit || 20;
+      const url = medplum.fhirUrl('Agent', id, '$fetch-logs');
+      url.searchParams.set('limit', String(limit));
+      if (before) {
+        url.searchParams.set('before', before);
+      }
       medplum
-        .get(medplum.fhirUrl('Agent', id, `$fetch-logs${limit !== undefined ? `?limit=${limit}` : ''}`), {
-          cache: 'reload',
-        })
+        .get(url, { cache: 'reload' })
         .then((result: Parameters) => {
-          const param = result?.parameter?.find((param) => param.name === 'logs');
-          if (param) {
-            setLogs(param?.valueString);
-          }
+          const pageLogs = result?.parameter?.find((param) => param.name === 'logs')?.valueString;
+          const hasMore = result?.parameter?.find((param) => param.name === 'hasMore')?.valueBoolean ?? false;
+          const nextBefore = result?.parameter?.find((param) => param.name === 'nextBefore')?.valueString;
+          // When paging with a cursor, append the older page beneath the existing
+          // logs; otherwise replace with the fresh first page.
+          setLogs((prev) => {
+            if (before && prev) {
+              return pageLogs ? `${prev}\n${pageLogs}` : prev;
+            }
+            return pageLogs;
+          });
+          setLogsHasMore(hasMore);
+          setLogsNextBefore(nextBefore);
         })
         .catch((err) => showError(normalizeErrorString(err)))
         .finally(() => setFetchingLogs(false));
@@ -186,23 +379,36 @@ export function ToolsPage(): JSX.Element | null {
     [medplum, id]
   );
 
-  function showSuccess(message: string): void {
-    showNotification({
-      color: 'green',
-      title: 'Success',
-      icon: <IconCheck size="1rem" />,
-      message,
-    });
-  }
+  const handleFetchLogs = useCallback(
+    (formData: Record<string, string>) => {
+      const limit = Number(formData.logLimit) || 20;
+      setLogLimit(limit);
+      fetchLogsPage(limit);
+    },
+    [fetchLogsPage]
+  );
 
-  function showError(message: string): void {
-    showNotification({
-      color: 'red',
-      title: 'Error',
-      message,
-      autoClose: false,
-    });
-  }
+  const handleLoadMoreLogs = useCallback(() => {
+    fetchLogsPage(logLimit, logsNextBefore);
+  }, [fetchLogsPage, logLimit, logsNextBefore]);
+
+  const handleFetchStats = useCallback(() => {
+    setFetchingStats(true);
+    medplum
+      .get(medplum.fhirUrl('Agent', id, '$stats'), { cache: 'reload' })
+      .then((result: Parameters) => {
+        const valueString = result.parameter?.find((p) => p.name === 'stats')?.valueString;
+        if (valueString) {
+          try {
+            setStats(JSON.parse(valueString) as AgentStats);
+          } catch (err) {
+            showError(normalizeErrorString(err));
+          }
+        }
+      })
+      .catch((err) => showError(normalizeErrorString(err)))
+      .finally(() => setFetchingStats(false));
+  }, [medplum, id]);
 
   return (
     <Document>
@@ -289,8 +495,36 @@ export function ToolsPage(): JSX.Element | null {
           >
             Fetch Logs
           </Button>
+          {logsHasMore ? (
+            <Button
+              mt={22}
+              type="button"
+              variant="default"
+              onClick={handleLoadMoreLogs}
+              loading={fetchingLogs}
+              disabled={working && !fetchingLogs}
+              aria-label="Load more logs"
+            >
+              Load More
+            </Button>
+          ) : null}
         </Group>
       </Form>
+      <Divider my="lg" />
+      <Title order={2}>Agent Stats</Title>
+      <p>
+        Fetch runtime statistics from the agent, including connection counts, queue depths, RTT metrics, and overall
+        agent health.
+      </p>
+      <Button
+        onClick={handleFetchStats}
+        loading={fetchingStats}
+        disabled={working && !fetchingStats}
+        aria-label="Get stats"
+      >
+        Get Stats
+      </Button>
+      {!fetchingStats && stats && <AgentStatsTables stats={stats} />}
       <Divider my="lg" />
       <Title order={2}>Ping from Agent</Title>
       <p>
@@ -331,4 +565,22 @@ export function ToolsPage(): JSX.Element | null {
       )}
     </Document>
   );
+}
+
+function showSuccess(message: string): void {
+  showNotification({
+    color: 'green',
+    title: 'Success',
+    icon: <IconCheck size="1rem" />,
+    message,
+  });
+}
+
+function showError(message: string): void {
+  showNotification({
+    color: 'red',
+    title: 'Error',
+    message,
+    autoClose: false,
+  });
 }

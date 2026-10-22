@@ -12,10 +12,10 @@ import { act, render, screen } from '../test-utils/render';
 describe('DatabaseToolsPage', () => {
   let medplum: MockClient;
 
-  function setup(): void {
+  function setup(path = '/admin/super/db'): void {
     render(
       <MedplumProvider medplum={medplum}>
-        <MemoryRouter initialEntries={['/admin/super/db']} initialIndex={0}>
+        <MemoryRouter initialEntries={[path]} initialIndex={0}>
           <MantineProvider>
             <Notifications />
             <AppRoutes />
@@ -27,21 +27,21 @@ describe('DatabaseToolsPage', () => {
 
   beforeEach(() => {
     medplum = new MockClient();
-    jest.useFakeTimers();
-    jest.spyOn(medplum, 'isSuperAdmin').mockImplementation(() => true);
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    vi.spyOn(medplum, 'isSuperAdmin').mockImplementation(() => true);
   });
 
   afterEach(async () => {
     await act(async () => notifications.clean());
-    jest.clearAllMocks();
+    vi.clearAllMocks();
     await act(async () => {
-      jest.runOnlyPendingTimers();
+      await vi.runOnlyPendingTimersAsync();
     });
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   test('Access denied', async () => {
-    jest.spyOn(medplum, 'isSuperAdmin').mockImplementationOnce(() => false);
+    vi.spyOn(medplum, 'isSuperAdmin').mockImplementationOnce(() => false);
     setup();
     expect(screen.getByText('Forbidden')).toBeInTheDocument();
   });
@@ -54,5 +54,15 @@ describe('DatabaseToolsPage', () => {
   test('Array Column Padding tab exists', async () => {
     setup();
     expect(screen.getByRole('tab', { name: 'Array Column Padding' })).toBeInTheDocument();
+  });
+
+  test('Index Health tab exists', async () => {
+    setup();
+    expect(screen.getByRole('tab', { name: 'Index Health' })).toBeInTheDocument();
+  });
+
+  test('Index Health tab route', async () => {
+    setup();
+    expect(screen.getByRole('link', { name: 'Index Health' })).toHaveAttribute('href', '/admin/super/db/index-health');
   });
 });

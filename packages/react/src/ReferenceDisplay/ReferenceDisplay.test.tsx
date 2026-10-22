@@ -4,18 +4,13 @@ import type { Reference } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { ReactElement } from 'react';
-import { MemoryRouter } from 'react-router';
 import { render, screen } from '../test-utils/render';
 import { ReferenceDisplay } from './ReferenceDisplay';
 
 const medplum = new MockClient();
 
 function setup(ui: ReactElement): void {
-  render(
-    <MemoryRouter>
-      <MedplumProvider medplum={medplum}>{ui}</MedplumProvider>
-    </MemoryRouter>
-  );
+  render(<MedplumProvider medplum={medplum}>{ui}</MedplumProvider>);
 }
 
 describe('ReferenceDisplay', () => {
@@ -24,15 +19,15 @@ describe('ReferenceDisplay', () => {
   });
 
   test('Renders reference', () => {
-    setup(<ReferenceDisplay value={{ reference: 'Organization/123' }} />);
-    expect(screen.getByText('Organization/123')).toBeDefined();
-    expect(screen.getByText<HTMLAnchorElement>('Organization/123').href).toMatch('Organization/123');
+    setup(<ReferenceDisplay value={{ reference: 'Organization/125' }} />);
+    expect(screen.getByText('Organization/125')).toBeDefined();
+    expect(screen.getByText<HTMLAnchorElement>('Organization/125').href).toMatch('Organization/125');
   });
 
   test('Renders reference and display', () => {
-    setup(<ReferenceDisplay value={{ reference: 'Organization/123', display: 'Foo' }} />);
+    setup(<ReferenceDisplay value={{ reference: 'Organization/125', display: 'Foo' }} />);
     expect(screen.getByText('Foo')).toBeDefined();
-    expect(screen.getByText<HTMLAnchorElement>('Foo').href).toMatch('Organization/123');
+    expect(screen.getByText<HTMLAnchorElement>('Foo').href).toMatch('Organization/125');
   });
 
   test('Renders unknown properties', () => {
@@ -41,12 +36,12 @@ describe('ReferenceDisplay', () => {
   });
 
   test('Renders reference no link', () => {
-    setup(<ReferenceDisplay value={{ reference: 'Organization/123' }} link={false} />);
-    expect(screen.getByText('Organization/123')).toBeDefined();
+    setup(<ReferenceDisplay value={{ reference: 'Organization/125' }} link={false} />);
+    expect(screen.getByText('Organization/125')).toBeDefined();
   });
 
   test('Renders reference and display no link', () => {
-    setup(<ReferenceDisplay value={{ reference: 'Organization/123', display: 'Foo' }} link={false} />);
+    setup(<ReferenceDisplay value={{ reference: 'Organization/125', display: 'Foo' }} link={false} />);
     expect(screen.getByText('Foo')).toBeDefined();
   });
 });

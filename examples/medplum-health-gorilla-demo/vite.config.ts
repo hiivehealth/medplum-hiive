@@ -4,30 +4,19 @@ import react from '@vitejs/plugin-react';
 import dns from 'dns';
 import { copyFileSync, existsSync } from 'fs';
 import path from 'path';
-import type { UserConfig } from 'vite';
 import { defineConfig } from 'vite';
 
 dns.setDefaultResultOrder('verbatim');
 
-if (!existsSync(path.join(__dirname, '.env'))) {
-  copyFileSync(path.join(__dirname, '.env.defaults'), path.join(__dirname, '.env'));
+if (!existsSync(path.join(import.meta.dirname, '.env'))) {
+  copyFileSync(path.join(import.meta.dirname, '.env.defaults'), path.join(import.meta.dirname, '.env'));
 }
 
-// Resolve aliases to local packages when working within the monorepo
-const alias: NonNullable<UserConfig['resolve']>['alias'] = Object.fromEntries(
-  Object.entries({
-    '@medplum/health-gorilla-core': path.resolve(__dirname, '../../packages/health-gorilla-core/src'),
-    '@medplum/health-gorilla-react': path.resolve(__dirname, '../../packages/health-gorilla-react/src'),
-  }).filter(([, relPath]) => existsSync(relPath))
-);
 // https://vitejs.dev/config/
 export default defineConfig({
-  envPrefix: ['MEDPLUM_', 'GOOGLE_'],
+  envPrefix: ['MEDPLUM_', 'GOOGLE_', 'RECAPTCHA_'],
   plugins: [react()],
   server: {
     port: 3000,
-  },
-  resolve: {
-    alias,
   },
 });

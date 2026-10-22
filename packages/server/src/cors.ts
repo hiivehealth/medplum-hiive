@@ -3,8 +3,17 @@
 import type cors from 'cors';
 import type { Request } from 'express';
 import { getConfig } from './config/loader';
+import { getNormalizedPath } from './util/url';
 
-const exposedHeaders = ['Content-Location', 'ETag', 'Last-Modified', 'Location'];
+const exposedHeaders = [
+  'Content-Location',
+  'ETag',
+  'Last-Modified',
+  'Location',
+  'RateLimit',
+  'X-Request-Id',
+  'X-Trace-Id',
+];
 
 /**
  * CORS configuration.
@@ -13,9 +22,9 @@ const exposedHeaders = ['Content-Location', 'ETag', 'Last-Modified', 'Location']
  */
 export const corsOptions: cors.CorsOptionsDelegate<Request> = (req, callback) => {
   const origin = req.header('Origin');
-  const allow = isOriginAllowed(origin) && isPathAllowed(req.path);
+  const allow = isOriginAllowed(origin) && isPathAllowed(getNormalizedPath(req.path));
   if (allow) {
-    callback(null, { origin, credentials: true, exposedHeaders });
+    callback(null, { origin, credentials: true, exposedHeaders, maxAge: 600 });
   } else {
     callback(null, { origin: false });
   }
@@ -27,7 +36,7 @@ function isOriginAllowed(origin: string | undefined): boolean {
   }
 
   const config = getConfig();
-  if (config.appBaseUrl.startsWith(origin) || config.allowedOrigins === '*') {
+  if (origin === new URL(config.appBaseUrl).origin || config.allowedOrigins === '*') {
     return true;
   }
 
@@ -44,11 +53,17 @@ const prefixes = [
   '/admin/',
   '/auth/',
   '/cds-services',
+  '/dicomweb/',
   '/email/',
   '/fhir/',
   '/fhircast/',
+  // The `/api` variant is spelled out because subscribers pointed at the FHIRcast alias
+  // send preflights to `/api/hub` rather than the root-mounted `/hub`.
+  '/hub',
+  '/api/hub',
   '/oauth2/',
   '/keyvalue/',
+  '/shl/',
   '/storage/',
 ];
 

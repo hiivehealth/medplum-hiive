@@ -107,13 +107,18 @@ describe('PatientPage.utils', () => {
     });
 
     test('handles complex query string with patient.id placeholder', () => {
-      const tab = PatientPageTabs.find((t) => t.id === 'encounter');
+      const tab = PatientPageTabs.find((t) => t.id === 'meds');
       if (tab) {
         const result = formatPatientPageTabUrl('patient-123', tab);
-        expect(result).toContain('/Patient/patient-123/Encounter');
+        expect(result).toContain('/Patient/patient-123/MedicationRequest');
         expect(result).toContain('patient=patient-123');
         expect(result).not.toContain('%patient.id');
       }
+    });
+
+    test('encounter tab links to the visits board without a query string', () => {
+      const tab = getPatientPageTabOrThrow('encounter');
+      expect(formatPatientPageTabUrl('patient-123', tab)).toBe('/Patient/patient-123/Encounter');
     });
   });
 
@@ -124,10 +129,10 @@ describe('PatientPage.utils', () => {
       expect(timelineTab.url).toBe('');
       expect(timelineTab.label).toBe('Timeline');
 
-      const editTab = getPatientPageTabOrThrow('edit');
-      expect(editTab.id).toBe('edit');
-      expect(editTab.url).toBe('edit');
-      expect(editTab.label).toBe('Edit');
+      const documentsTab = getPatientPageTabOrThrow('documentreference');
+      expect(documentsTab.id).toBe('documentreference');
+      expect(documentsTab.url).toBe('DocumentReference');
+      expect(documentsTab.label).toBe('Documents');
 
       const medsTab = getPatientPageTabOrThrow('meds');
       expect(medsTab.id).toBe('meds');
@@ -146,11 +151,10 @@ describe('PatientPage.utils', () => {
     test('finds all defined tabs', () => {
       const tabIds = [
         'timeline',
-        'edit',
         'encounter',
         'tasks',
         'meds',
-        'labs',
+        'orders',
         'devices',
         'documentreference',
         'careplan',
@@ -177,11 +181,10 @@ describe('PatientPage.utils', () => {
     test('contains expected tabs', () => {
       const tabIds = PatientPageTabs.map((tab) => tab.id);
       expect(tabIds).toContain('timeline');
-      expect(tabIds).toContain('edit');
       expect(tabIds).toContain('encounter');
       expect(tabIds).toContain('tasks');
       expect(tabIds).toContain('meds');
-      expect(tabIds).toContain('labs');
+      expect(tabIds).toContain('orders');
       expect(tabIds).toContain('devices');
       expect(tabIds).toContain('documentreference');
       expect(tabIds).toContain('careplan');

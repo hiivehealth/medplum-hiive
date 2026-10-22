@@ -1,12 +1,12 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { ContentType } from '@medplum/core';
+import { ContentType, EMPTY, SNOMED } from '@medplum/core';
 import type { ConceptMap, OperationOutcome, Parameters, ParametersParameter } from '@medplum/fhirtypes';
 import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { initTestAuth } from '../../test.setup';
+import { createTestProject, initTestAuth } from '../../test.setup';
 
 const app = express();
 
@@ -64,7 +64,7 @@ describe('ConceptMap $translate', () => {
           },
         ],
       });
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     conceptMap = res.body as ConceptMap;
   });
 
@@ -91,7 +91,7 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: params,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     const output = (res.body as Parameters).parameter;
     expect(output?.find((p) => p.name === 'result')?.valueBoolean).toStrictEqual(true);
@@ -146,7 +146,7 @@ describe('ConceptMap $translate', () => {
           { name: 'coding', valueCoding: { system, code } },
         ],
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     const output = (res.body as Parameters).parameter;
     expect(output?.find((p) => p.name === 'result')?.valueBoolean).toStrictEqual(true);
@@ -195,7 +195,7 @@ describe('ConceptMap $translate', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON)
       .send();
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     const output = (res.body as Parameters).parameter;
     expect(output?.find((p) => p.name === 'result')?.valueBoolean).toStrictEqual(true);
@@ -215,7 +215,7 @@ describe('ConceptMap $translate', () => {
           { name: 'coding', valueCoding: { system, code } },
         ],
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     const output = (res.body as Parameters).parameter;
     expect(output?.find((p) => p.name === 'result')?.valueBoolean).toStrictEqual(true);
@@ -271,7 +271,7 @@ describe('ConceptMap $translate', () => {
           { name: 'coding', valueCoding: { system, code } },
         ],
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     const output = (res.body as Parameters).parameter;
     expect(output?.find((p) => p.name === 'result')?.valueBoolean).toStrictEqual(true);
@@ -305,7 +305,7 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system, code: 'BAD' } }],
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     const output = (res.body as Parameters).parameter;
     expect(output).toHaveLength(1);
@@ -324,7 +324,7 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system, code } }],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
 
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
@@ -345,7 +345,7 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'code', valueCode: 'BAD' }],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
 
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
@@ -366,7 +366,7 @@ describe('ConceptMap $translate', () => {
           { name: 'code', valueCode: 'BAD' },
         ],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
 
     expect(res.body).toMatchObject<OperationOutcome>({
       resourceType: 'OperationOutcome',
@@ -388,7 +388,7 @@ describe('ConceptMap $translate', () => {
       .send({
         resourceType: 'Parameters',
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
 
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
@@ -408,7 +408,7 @@ describe('ConceptMap $translate', () => {
           { name: 'coding', valueCoding: { system, code } },
         ],
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
 
     expect(res.body).toMatchObject({
       resourceType: 'OperationOutcome',
@@ -463,7 +463,7 @@ describe('ConceptMap $translate', () => {
           },
         ],
       });
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     conceptMap = res.body as ConceptMap;
 
     const res2 = await request(app)
@@ -474,7 +474,7 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system, code } }],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
 
     const output = (res2.body as Parameters).parameter;
     expect(output?.find((p) => p.name === 'result')?.valueBoolean).toStrictEqual(true);
@@ -521,7 +521,7 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'codeableConcept', valueCodeableConcept: { text: 'Nebulous concept' } }],
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
@@ -562,7 +562,7 @@ describe('ConceptMap $translate', () => {
           },
         ],
       });
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     conceptMap = res.body as ConceptMap;
 
     const res2 = await request(app)
@@ -573,7 +573,7 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'codeableConcept', valueCodeableConcept: { coding: [{ code }] } }],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
 
     const output = (res2.body as Parameters).parameter;
     expect(output?.find((p) => p.name === 'result')?.valueBoolean).toStrictEqual(true);
@@ -610,7 +610,7 @@ describe('ConceptMap $translate', () => {
         sourceCanonical: 'http://example.com/labs',
         targetCanonical: 'http://example.com/loinc',
       });
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     conceptMap = res.body as ConceptMap;
 
     const res2 = await request(app)
@@ -621,10 +621,239 @@ describe('ConceptMap $translate', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system, code } }],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [{ name: 'result', valueBoolean: false }],
     });
   });
+
+  test('Complex SNOMED to ICD mapping', async () => {
+    const { repo, accessToken } = await createTestProject({
+      withRepo: true,
+      withAccessToken: true,
+      membership: { admin: true },
+    });
+    const map: ConceptMap = await repo.createResource({
+      resourceType: 'ConceptMap',
+      status: 'active',
+      url: 'https://www.nlm.nih.gov/research/umls/mapping_projects/snomedct_to_icd10cm',
+      title: 'SNOMED CT to ICD-10-CM Mapping',
+      name: 'snomed-to-icd',
+      description: 'Mapping of clinically relevant SNOMED codes to candidate ICD-10 codes',
+    });
+
+    const icd10 = 'http://hl7.org/fhir/sid/icd-10-cm';
+    const source = { name: 'source', valueCoding: { system: SNOMED, code: '1003408005' } };
+
+    const importRes = await request(app)
+      .post(`/fhir/R4/ConceptMap/${map.id}/$import`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .set('X-Medplum', 'extended')
+      .send({
+        resourceType: 'Parameters',
+        parameter: [
+          {
+            name: 'mapping',
+            part: [
+              source,
+              { name: 'target', valueCoding: { system: icd10, code: 'Q52.71' } },
+              dependsOn('1172594000'),
+              dependsOn('248152002'),
+            ],
+          },
+          {
+            name: 'mapping',
+            part: [
+              source,
+              { name: 'target', valueCoding: { system: icd10, code: 'Q55.29' } },
+              dependsOn('1172594000'),
+              dependsOn('248153007'),
+            ],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'Q87.89' } }, dependsOn('254150007')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'Q87.0' } }, dependsOn('715484003')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'H18.519' } }, dependsOn('720749004')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'Q87.89' } }, dependsOn('723584003')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'H18.559' } }, dependsOn('95488001')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'H18.549' } }, dependsOn('231933003')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'H18.509' } }],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'Q04.9' } }, dependsOn('1172594000')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'H18.599' } }, dependsOn('254150007')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'Q74.8' } }, dependsOn('715484003')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'H90.5' } }, dependsOn('720749004')],
+          },
+          {
+            name: 'mapping',
+            part: [
+              source,
+              { name: 'target', valueCoding: { system: icd10, code: 'H18.509' } },
+              dependsOn('1172594000'),
+            ],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'H18.509' } }, dependsOn('715484003')],
+          },
+          {
+            name: 'mapping',
+            part: [source, { name: 'target', valueCoding: { system: icd10, code: 'Q87.0' } }, dependsOn('1172594000')],
+          },
+        ],
+      } satisfies Parameters);
+    expect(importRes.status).toBe(200);
+
+    const translateRes = await request(app)
+      .get(`/fhir/R4/ConceptMap/${map.id}/$translate?system=${SNOMED}&code=1003408005`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send();
+    expect(translateRes.status).toBe(200);
+    const output = translateRes.body as Parameters;
+
+    expect(output).toMatchObject<Parameters>({
+      resourceType: 'Parameters',
+      parameter: [
+        { name: 'result', valueBoolean: true },
+        matchEquivalent(icd10, 'H18.509'),
+        matchEquivalent(icd10, 'H18.509', '1172594000'),
+        matchEquivalent(icd10, 'Q04.9', '1172594000'),
+        matchEquivalent(icd10, 'Q87.0', '1172594000'),
+        matchEquivalent(icd10, 'Q52.71', '1172594000', '248152002'),
+        matchEquivalent(icd10, 'Q55.29', '1172594000', '248153007'),
+        matchEquivalent(icd10, 'H18.549', '231933003'),
+        matchEquivalent(icd10, 'H18.599', '254150007'),
+        matchEquivalent(icd10, 'Q87.89', '254150007'),
+        matchEquivalent(icd10, 'H18.509', '715484003'),
+        matchEquivalent(icd10, 'Q74.8', '715484003'),
+        matchEquivalent(icd10, 'Q87.0', '715484003'),
+        matchEquivalent(icd10, 'H18.519', '720749004'),
+        matchEquivalent(icd10, 'H90.5', '720749004'),
+        matchEquivalent(icd10, 'Q87.89', '723584003'),
+        matchEquivalent(icd10, 'H18.559', '95488001'),
+      ],
+    });
+  });
+
+  test('Renders mapping comment', async () => {
+    const { repo, accessToken } = await createTestProject({
+      withRepo: true,
+      withAccessToken: true,
+      membership: { admin: true },
+    });
+    const map: ConceptMap = await repo.createResource({
+      resourceType: 'ConceptMap',
+      status: 'active',
+      url: 'http://example.com/ConceptMap/commented',
+    });
+
+    const importRes = await request(app)
+      .post(`/fhir/R4/ConceptMap/${map.id}/$import`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .set('X-Medplum', 'extended')
+      .send({
+        resourceType: 'Parameters',
+        parameter: [
+          {
+            name: 'mapping',
+            part: [
+              { name: 'source', valueCoding: { system: 'A', code: 'foo' } },
+              { name: 'target', valueCoding: { system: 'B', code: 'bar' } },
+              { name: 'comment', valueString: 'Baz, Quux' },
+            ],
+          },
+        ],
+      });
+    expect(importRes.status).toBe(200);
+
+    const translateRes = await request(app)
+      .get(`/fhir/R4/ConceptMap/${map.id}/$translate?system=A&code=foo`)
+      .set('Authorization', 'Bearer ' + accessToken)
+      .set('Content-Type', ContentType.FHIR_JSON)
+      .send();
+    expect(translateRes.status).toBe(200);
+    const output = translateRes.body as Parameters;
+
+    expect(output).toMatchObject<Parameters>({
+      resourceType: 'Parameters',
+      parameter: [
+        { name: 'result', valueBoolean: true },
+        {
+          name: 'match',
+          part: [
+            { name: 'equivalence', valueCode: 'equivalent' },
+            { name: 'concept', valueCoding: { system: 'B', code: 'bar' } },
+            {
+              name: 'property',
+              part: [
+                { name: 'uri', valueUri: 'https://medplum.com/conceptmap-attribute/comment' },
+                { name: 'value', valueString: 'Baz, Quux' },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+  });
 });
+
+function dependsOn(code: string): ParametersParameter {
+  return {
+    name: 'dependsOn',
+    part: [
+      { name: 'code', valueCode: 'context' },
+      { name: 'value', valueCode: code },
+    ],
+  };
+}
+
+function matchEquivalent(system: string, code: string, ...dependsOn: string[]): ParametersParameter {
+  const expectedParts: ParametersParameter[] = [
+    { name: 'equivalence', valueCode: 'equivalent' },
+    { name: 'concept', valueCoding: { system, code } },
+  ];
+  for (const dep of dependsOn ?? EMPTY) {
+    expectedParts.push({
+      name: 'dependsOn',
+      part: [
+        { name: 'attribute', valueUri: 'context' },
+        { name: 'value', valueCode: dep },
+      ],
+    });
+  }
+  return { name: 'match', part: expect.arrayContaining(expectedParts) };
+}

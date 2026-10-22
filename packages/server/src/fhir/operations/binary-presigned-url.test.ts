@@ -1,20 +1,21 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { WithId } from '@medplum/core';
+import { createReference } from '@medplum/core';
 import type { Binary, Parameters } from '@medplum/fhirtypes';
 import express from 'express';
 import type { Server } from 'node:http';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import type { MedplumServerConfig } from '../../config/types';
-import { createTestProject, initTestAuth } from '../../test.setup';
+import type { ServerConfig } from '../../config/utils';
+import { addTestUser, createTestProject, initTestAuth } from '../../test.setup';
 
 const app = express();
 
 describe('Binary/$presigned-url', () => {
   let accessToken: string;
-  let config: MedplumServerConfig;
+  let config: ServerConfig;
   let server: Server;
 
   beforeAll(async () => {
@@ -55,14 +56,14 @@ describe('Binary/$presigned-url', () => {
         resourceType: 'Binary',
         contentType: 'text/plain',
       } satisfies Binary);
-    expect(binRes.status).toBe(201);
+    expect(binRes).toHaveStatus(201);
     const binary = binRes.body as WithId<Binary>;
 
     const writeUrlRes = await testAgent
       .get(`/fhir/R4/Binary/${binary.id}/$presigned-url?upload=true`)
       .auth(accessToken, { type: 'bearer' })
       .send();
-    expect(writeUrlRes.status).toBe(200);
+    expect(writeUrlRes).toHaveStatus(200);
     const writeResult = writeUrlRes.body as Parameters;
     const writeUrl = new URL(writeResult.parameter?.[0]?.valueUri as string);
 
@@ -70,7 +71,7 @@ describe('Binary/$presigned-url', () => {
       .put(writeUrl.pathname + writeUrl.search)
       .set('Content-Type', 'text/plain')
       .send('foo bar baz quux');
-    expect(uploadRes.status).toBe(200);
+    expect(uploadRes).toHaveStatus(200);
   });
 
   test('Requires update permission to generate upload link', async () => {
@@ -88,7 +89,7 @@ describe('Binary/$presigned-url', () => {
         resourceType: 'Binary',
         contentType: 'text/plain',
       } satisfies Binary);
-    expect(binRes.status).toBe(201);
+    expect(binRes).toHaveStatus(201);
     const binary = binRes.body as WithId<Binary>;
 
     // Read URL should still be available
@@ -96,13 +97,118 @@ describe('Binary/$presigned-url', () => {
       .get(`/fhir/R4/Binary/${binary.id}/$presigned-url`)
       .auth(accessToken, { type: 'bearer' })
       .send();
-    expect(readUrlRes.status).toBe(200);
+    expect(readUrlRes).toHaveStatus(200);
 
     // Write URL not permitted
     const writeUrlRes = await request(server)
       .get(`/fhir/R4/Binary/${binary.id}/$presigned-url?upload=true`)
       .auth(accessToken, { type: 'bearer' })
       .send();
-    expect(writeUrlRes.status).toBe(403);
+    expect(writeUrlRes).toHaveStatus(403);
+  });
+
+  test('Linked project cannot generate upload link', async () => {
+    const owner = await createTestProject({ withAccessToken: true });
+    const linked = await createTestProject({
+      withAccessToken: true,
+      project: { link: [{ project: createReference(owner.project) }] },
+    });
+
+    const binRes = await request(server)
+      .post('/fhir/R4/Binary')
+      .auth(owner.accessToken, { type: 'bearer' })
+      .set('Content-Type', 'application/fhir+json')
+      .send({
+        resourceType: 'Binary',
+        contentType: 'text/plain',
+      } satisfies Binary);
+    expect(binRes).toHaveStatus(201);
+    const binary = binRes.body as WithId<Binary>;
+
+    // Owning project can upload
+    const ownerWriteUrlRes = await request(server)
+      .get(`/fhir/R4/Binary/${binary.id}/$presigned-url?upload=true`)
+      .auth(owner.accessToken, { type: 'bearer' })
+      .send();
+    expect(ownerWriteUrlRes).toHaveStatus(200);
+
+    // Linked project can read
+    const linkedReadUrlRes = await request(server)
+      .get(`/fhir/R4/Binary/${binary.id}/$presigned-url`)
+      .auth(linked.accessToken, { type: 'bearer' })
+      .send();
+    expect(linkedReadUrlRes).toHaveStatus(200);
+
+    // Linked project cannot upload
+    const linkedWriteUrlRes = await request(server)
+      .get(`/fhir/R4/Binary/${binary.id}/$presigned-url?upload=true`)
+      .auth(linked.accessToken, { type: 'bearer' })
+      .send();
+    expect(linkedWriteUrlRes).toHaveStatus(403);
+  });
+
+  test('Requires securityContext read access to generate presigned URL', async () => {
+    const testProject = await createTestProject({ withAccessToken: true });
+
+    const patientRes = await request(server)
+      .post('/fhir/R4/Patient')
+      .auth(testProject.accessToken, { type: 'bearer' })
+      .send({ resourceType: 'Patient' });
+    expect(patientRes).toHaveStatus(201);
+
+    const binaryRes = await request(server)
+      .post('/fhir/R4/Binary')
+      .auth(testProject.accessToken, { type: 'bearer' })
+      .set('Content-Type', 'text/plain')
+      .set('X-Security-Context', `Patient/${patientRes.body.id}`)
+      .send('sensitive binary');
+    expect(binaryRes).toHaveStatus(201);
+    const binary = binaryRes.body as WithId<Binary>;
+
+    // Restricted user: can read Binary, but not Patient (the securityContext target)
+    const restrictedUser = await addTestUser(testProject.project, {
+      accessPolicy: {
+        resourceType: 'AccessPolicy',
+        resource: [{ resourceType: 'Binary', interaction: ['read'] }],
+      },
+    });
+
+    // Permitted user: can read Binary and Patient
+    const permittedUser = await addTestUser(testProject.project, {
+      accessPolicy: {
+        resourceType: 'AccessPolicy',
+        resource: [
+          { resourceType: 'Binary', interaction: ['read'] },
+          { resourceType: 'Patient', interaction: ['read'] },
+        ],
+      },
+    });
+
+    // Confirm the restricted user cannot read the Patient
+    const patientReadRes = await request(server)
+      .get(`/fhir/R4/Patient/${patientRes.body.id}`)
+      .auth(restrictedUser.accessToken, { type: 'bearer' });
+    expect(patientReadRes).toHaveStatus(403);
+
+    // Restricted user should be blocked from getting a presigned URL
+    const restrictedPresignRes = await request(server)
+      .get(`/fhir/R4/Binary/${binary.id}/$presigned-url`)
+      .auth(restrictedUser.accessToken, { type: 'bearer' })
+      .send();
+    expect(restrictedPresignRes).toHaveStatus(403);
+
+    // Permitted user with read access should succeed
+    const permittedPresignRes = await request(server)
+      .get(`/fhir/R4/Binary/${binary.id}/$presigned-url`)
+      .auth(permittedUser.accessToken, { type: 'bearer' })
+      .send();
+    expect(permittedPresignRes).toHaveStatus(200);
+
+    // Admin user with full access should succeed
+    const authorizedPresignRes = await request(server)
+      .get(`/fhir/R4/Binary/${binary.id}/$presigned-url`)
+      .auth(testProject.accessToken, { type: 'bearer' })
+      .send();
+    expect(authorizedPresignRes).toHaveStatus(200);
   });
 });

@@ -2,12 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 import { OAuthSigningAlgorithm, Operator } from '@medplum/core';
 import type { JsonWebKey } from '@medplum/fhirtypes';
-import type { JWK, JWSHeaderParameters, JWTPayload, JWTVerifyOptions, KeyLike } from 'jose';
+import type { JWK, JWSHeaderParameters, JWTPayload, JWTVerifyOptions } from 'jose';
 import { exportJWK, generateKeyPair, importJWK, jwtVerify, SignJWT } from 'jose';
 import { randomBytes, randomUUID } from 'node:crypto';
-import type { MedplumServerConfig } from '../config/types';
+import type { ServerConfig } from '../config/utils';
 import { getGlobalSystemRepo } from '../fhir/repo';
 import { globalLogger } from '../logger';
+
+/**
+ * Represents a cryptographic key that can be used for signing or verifying JWTs.
+ * Old versions of jose used to export this type, but now we have to define it ourselves.
+ */
+export type KeyLike = CryptoKey | Uint8Array;
 
 export interface MedplumBaseClaims extends JWTPayload {
   /**
@@ -67,40 +73,53 @@ export interface MedplumRefreshTokenClaims extends MedplumBaseClaims {
 }
 
 /*
- * Signing algorithms.
+ * JWT signing algorithms.
  *
- * For the first 4 years of this project, we only supported RS256:
- * RS256 (RSA Signature with SHA-256): An asymmetric algorithm, which means that there are two keys:
- * one public key and one private key that must be kept secret. The server has the private key used to
- * generate the signature, and the consumer of the JWT retrieves a public key from the metadata
- * endpoints provided by the server and uses it to validate the JWT signature.
+ * For the first 4 years of this project, Medplum only supported RS256:
  *
- * Due to customer requests for FAPI 2 compliance, we are now expanding to support ES256:
- * ES256 (ECDSA using P-256 and SHA-256): An asymmetric algorithm using elliptic curve cryptography.
- * Like RS256, it uses a public/private key pair, but offers better performance characteristics,
- * smaller key sizes, and faster signature generation while providing equivalent security to 2048-bit RSA.
+ *   RS256 (RSA Signature with SHA-256)
  *
- * To support existing customers and deployments, we will continue to support existing keys using RS256.
- * All new keys will use ES256 by default.
+ * This remains one of the most widely deployed JWT algorithms and is used by
+ * providers such as AWS Cognito. It uses an RSA public/private key pair, where
+ * the server signs with the private key and clients verify signatures using the
+ * published public key.
  *
- * Note: AWS Cognito uses RS256. Auth0 supports RS256, HS256, and PS256 options.
+ * In 2025, we added support for elliptic curve algorithms in response to
+ * customer requests for FAPI 2 compliance. New keys defaulted to ES256 because
+ * it provides equivalent security to 2048-bit RSA with significantly smaller
+ * keys and better performance.
+ *
+ * As CMS interoperability programs evolved, some certification profiles began
+ * requiring ES384 (ECDSA using the P-384 curve with SHA-384). New keys now
+ * default to ES384 to satisfy those requirements while remaining compatible
+ * with modern OAuth 2.0 and OpenID Connect ecosystems.
+ *
+ * Existing deployments continue to support previously-generated RS256 and
+ * ES256 keys for backwards compatibility. New keys use ES384 by default.
+ *
+ * Notes:
+ * - AWS Cognito currently issues RS256 tokens.
+ * - Auth0 supports RS256, HS256, PS256, ES256, and ES384.
  */
 
-const PREFERRED_ALG = OAuthSigningAlgorithm.ES256;
+const PREFERRED_ALG = OAuthSigningAlgorithm.ES384;
 const LEGACY_DEFAULT_ALG = OAuthSigningAlgorithm.RS256;
 const DEFAULT_ACCESS_LIFETIME = '1h';
 const DEFAULT_REFRESH_LIFETIME = '2w';
 
 let issuer: string | undefined;
 const publicKeys: Record<string, KeyLike> = {};
+const allSigningKeys: Record<string, KeyLike> = {};
 const jwks: { keys: JWK[] } = { keys: [] };
 let jsonWebKey: JsonWebKey | undefined;
-let signingKey: KeyLike | undefined;
+let jsonWebKeys: JsonWebKey[] = [];
+let defaultSigningKey: KeyLike | undefined;
 
-export async function initKeys(config: MedplumServerConfig): Promise<void> {
+export async function initKeys(config: ServerConfig): Promise<void> {
   issuer = undefined;
   jsonWebKey = undefined;
-  signingKey = undefined;
+  jsonWebKeys = [];
+  defaultSigningKey = undefined;
   jwks.keys = [];
 
   if (!config) {
@@ -118,16 +137,14 @@ export async function initKeys(config: MedplumServerConfig): Promise<void> {
     filters: [{ code: 'active', operator: Operator.EQUALS, value: 'true' }],
   });
 
-  let jsonWebKeys: JsonWebKey[] | undefined;
-
   if (searchResult.length > 0) {
     globalLogger.info(`Loaded ${searchResult.length} key(s) from the database`);
     jsonWebKeys = searchResult;
   } else {
     // Generate a key pair
-    // https://github.com/panva/jose/blob/HEAD/docs/functions/util_generate_key_pair.generatekeypair.md
+    // https://github.com/panva/jose/blob/main/docs/key/generate_key_pair/functions/generateKeyPair.md
     globalLogger.info('No keys found.  Creating new key...');
-    const keyResult = await generateKeyPair(PREFERRED_ALG);
+    const keyResult = await generateKeyPair(PREFERRED_ALG, { extractable: true });
     const jwk = await exportJWK(keyResult.privateKey);
     const createResult = await systemRepo.createResource({
       resourceType: 'JsonWebKey',
@@ -148,7 +165,7 @@ export async function initKeys(config: MedplumServerConfig): Promise<void> {
       kty: jwk.kty,
       use: 'sig',
     };
-    if (jwk.alg === OAuthSigningAlgorithm.ES256) {
+    if (jwk.alg === OAuthSigningAlgorithm.ES256 || jwk.alg === OAuthSigningAlgorithm.ES384) {
       publicKey.x = jwk.x;
       publicKey.y = jwk.y;
       publicKey.crv = jwk.crv;
@@ -162,15 +179,16 @@ export async function initKeys(config: MedplumServerConfig): Promise<void> {
     jwks.keys.push(publicKey);
 
     // Convert from JWK to PKCS and add to the collection of public keys
-    publicKeys[jwk.id as string] = (await importJWK(publicKey)) as KeyLike;
+    publicKeys[jwk.id as string] = await importJWK(publicKey);
+    allSigningKeys[jwk.id as string] = await importJWK({
+      ...(jwk as JWK),
+      use: 'sig',
+    });
   }
 
   // Use the first key as the signing key
   jsonWebKey = jsonWebKeys[0];
-  signingKey = (await importJWK({
-    ...(jsonWebKey as JWK),
-    use: 'sig',
-  })) as KeyLike;
+  defaultSigningKey = allSigningKeys[jsonWebKey.id as string];
 }
 
 /**
@@ -184,10 +202,23 @@ export function getJwks(): { keys: JWK[] } {
 
 /**
  * Returns the current signing key.
+ * @param alg - Optional signing algorithm.  If not provided, the default signing key will be returned.
  * @returns The current signing key.
  */
-export function getSigningKey(): KeyLike {
-  return signingKey as KeyLike;
+export function getSigningKey(alg?: string): KeyLike {
+  if (!alg) {
+    if (!defaultSigningKey) {
+      throw new Error('Signing key not initialized');
+    }
+    return defaultSigningKey;
+  }
+
+  const jwk = jsonWebKeys.find((key) => (key.alg ?? LEGACY_DEFAULT_ALG) === alg);
+  const key = jwk?.id ? allSigningKeys[jwk.id] : undefined;
+  if (!key) {
+    throw new Error(`Signing key not found for alg: ${alg}`);
+  }
+  return key;
 }
 
 /**
@@ -202,10 +233,11 @@ export function generateSecret(size: number): string {
 /**
  * Generates an ID token JWT.
  * @param claims - The ID token claims.
+ * @param tokenIssuer - Optional issuer override.
  * @returns A well-formed JWT that can be used as an ID token.
  */
-export function generateIdToken(claims: MedplumIdTokenClaims): Promise<string> {
-  return generateJwt('1h', claims);
+export function generateIdToken(claims: MedplumIdTokenClaims, tokenIssuer?: string): Promise<string> {
+  return generateJwt('1h', claims, tokenIssuer);
 }
 
 /**
@@ -214,35 +246,46 @@ export function generateIdToken(claims: MedplumIdTokenClaims): Promise<string> {
  * @param options - Optional parameters.
  * @param options.additionalClaims - Any additional custom claims.
  * @param options.lifetime - Access token duration.
+ * @param options.issuer - Optional issuer override.
  * @returns A well-formed JWT that can be used as an access token.
  */
 export function generateAccessToken(
   claims: MedplumAccessTokenClaims,
-  options?: { additionalClaims?: Record<string, string | number>; lifetime?: string }
+  options?: { additionalClaims?: Record<string, string | number>; lifetime?: string; issuer?: string }
 ): Promise<string> {
   const duration = options?.lifetime ?? DEFAULT_ACCESS_LIFETIME;
-  return generateJwt(duration, { aud: issuer, ...claims, ...options?.additionalClaims });
+  return generateJwt(
+    duration,
+    { aud: options?.issuer ?? issuer, ...claims, ...options?.additionalClaims },
+    options?.issuer
+  );
 }
 
 /**
  * Generates a refresh token JWT.
  * @param claims - The refresh token claims.
  * @param lifetime - The refresh token duration.
+ * @param tokenIssuer - Optional issuer override.
  * @returns A well-formed JWT that can be used as a refresh token.
  */
-export function generateRefreshToken(claims: MedplumRefreshTokenClaims, lifetime?: string): Promise<string> {
+export function generateRefreshToken(
+  claims: MedplumRefreshTokenClaims,
+  lifetime?: string,
+  tokenIssuer?: string
+): Promise<string> {
   const duration = lifetime ?? DEFAULT_REFRESH_LIFETIME;
-  return generateJwt(duration, { aud: issuer, ...claims });
+  return generateJwt(duration, { aud: tokenIssuer ?? issuer, ...claims }, tokenIssuer);
 }
 
 /**
  * Generates a JWT.
  * @param exp - Expiration time resolved to a time span.
  * @param claims - The key/value pairs to include in the payload section.
+ * @param tokenIssuer - Issuer for the generated token.
  * @returns Promise to generate and sign the JWT.
  */
-async function generateJwt(exp: string, claims: JWTPayload): Promise<string> {
-  if (!jsonWebKey || !signingKey || !issuer) {
+async function generateJwt(exp: string, claims: JWTPayload, tokenIssuer = issuer): Promise<string> {
+  if (!jsonWebKey || !defaultSigningKey || !tokenIssuer) {
     throw new Error('Signing key not initialized');
   }
 
@@ -251,7 +294,7 @@ async function generateJwt(exp: string, claims: JWTPayload): Promise<string> {
     throw new Error('Invalid token duration');
   }
 
-  return new SignJWT(claims)
+  const signedJwt = new SignJWT(claims)
     .setProtectedHeader({
       alg: jsonWebKey.alg ?? LEGACY_DEFAULT_ALG,
       kid: jsonWebKey.id,
@@ -260,25 +303,31 @@ async function generateJwt(exp: string, claims: JWTPayload): Promise<string> {
     .setJti(randomUUID())
     .setIssuedAt()
     .setNotBefore(new Date())
-    .setIssuer(issuer)
-    .setAudience(claims.aud ?? (claims.client_id as string))
-    .setExpirationTime(exp)
-    .sign(signingKey);
+    .setIssuer(tokenIssuer);
+  const aud = claims.aud ?? (claims.client_id as string | undefined);
+  if (aud) {
+    signedJwt.setAudience(aud);
+  }
+  return signedJwt.setExpirationTime(exp).sign(defaultSigningKey);
 }
 
 /**
  * Decodes and verifies a JWT.
  * @param token - The jwt token / bearer token.
+ * @param expectedIssuer - Issuer expected in the token.
  * @returns Returns the decoded claims on success.
  */
-export async function verifyJwt(token: string): Promise<{ payload: JWTPayload; protectedHeader: JWSHeaderParameters }> {
-  if (!issuer) {
+export async function verifyJwt(
+  token: string,
+  expectedIssuer = issuer
+): Promise<{ payload: JWTPayload; protectedHeader: JWSHeaderParameters }> {
+  if (!expectedIssuer) {
     throw new Error('Signing key not initialized');
   }
 
   const verifyOptions: JWTVerifyOptions = {
-    issuer,
-    algorithms: [OAuthSigningAlgorithm.ES256, OAuthSigningAlgorithm.RS256],
+    issuer: expectedIssuer,
+    algorithms: [OAuthSigningAlgorithm.ES256, OAuthSigningAlgorithm.ES384, OAuthSigningAlgorithm.RS256],
   };
 
   return jwtVerify(token, getKeyForHeader, verifyOptions);

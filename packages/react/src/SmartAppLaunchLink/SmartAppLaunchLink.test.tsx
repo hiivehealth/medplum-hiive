@@ -5,21 +5,16 @@ import type { ClientApplication, Encounter, Patient } from '@medplum/fhirtypes';
 import { HomerEncounter, HomerSimpson, MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { ReactNode } from 'react';
-import { MemoryRouter } from 'react-router';
 import { act, fireEvent, render, screen, waitFor } from '../test-utils/render';
 import { SmartAppLaunchLink } from './SmartAppLaunchLink';
 
 describe('SmartAppLaunchLink', () => {
   function setup(children: ReactNode, medplum: MockClient): void {
-    render(
-      <MemoryRouter>
-        <MedplumProvider medplum={medplum}>{children}</MedplumProvider>
-      </MemoryRouter>
-    );
+    render(<MedplumProvider medplum={medplum}>{children}</MedplumProvider>);
   }
 
   test('Happy path', async () => {
-    const mockOpen = jest.fn();
+    const mockOpen = vi.fn();
     window.open = mockOpen;
 
     const medplum = new MockClient();
@@ -51,7 +46,7 @@ describe('SmartAppLaunchLink', () => {
   });
 
   test('Includes patient identifier in SmartAppLaunch when launchIdentifierSystems is present', async () => {
-    const mockOpen = jest.fn();
+    const mockOpen = vi.fn();
     window.open = mockOpen;
 
     const medplum = new MockClient();
@@ -122,7 +117,7 @@ describe('SmartAppLaunchLink', () => {
   });
 
   test('Does not include identifier in SmartAppLaunch when launchIdentifierSystems is absent', async () => {
-    const mockOpen = jest.fn();
+    const mockOpen = vi.fn();
     window.open = mockOpen;
 
     const medplum = new MockClient();
@@ -173,7 +168,7 @@ describe('SmartAppLaunchLink', () => {
   });
 
   test('Does not include identifier in SmartAppLaunch when identifier not found on patient', async () => {
-    const mockOpen = jest.fn();
+    const mockOpen = vi.fn();
     window.open = mockOpen;
 
     const medplum = new MockClient();
@@ -230,7 +225,7 @@ describe('SmartAppLaunchLink', () => {
   });
 
   test('Includes encounter identifier in SmartAppLaunch when launchIdentifierSystems includes Encounter', async () => {
-    const mockOpen = jest.fn();
+    const mockOpen = vi.fn();
     window.open = mockOpen;
 
     const medplum = new MockClient();
@@ -296,7 +291,7 @@ describe('SmartAppLaunchLink', () => {
   });
 
   test('Includes both patient and encounter identifiers when both are configured', async () => {
-    const mockOpen = jest.fn();
+    const mockOpen = vi.fn();
     window.open = mockOpen;
 
     const medplum = new MockClient();

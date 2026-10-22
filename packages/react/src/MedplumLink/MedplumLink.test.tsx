@@ -3,7 +3,6 @@
 import { locationUtils, MedplumClient } from '@medplum/core';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { ReactElement } from 'react';
-import { MemoryRouter } from 'react-router';
 import { fireEvent, render, screen } from '../test-utils/render';
 import { MedplumLink } from './MedplumLink';
 
@@ -29,17 +28,15 @@ const medplum = new MedplumClient({
 
 function setup(ui: ReactElement): void {
   render(
-    <MemoryRouter>
-      <MedplumProvider medplum={medplum} navigate={jest.fn()}>
-        {ui}
-      </MedplumProvider>
-    </MemoryRouter>
+    <MedplumProvider medplum={medplum} navigate={vi.fn()}>
+      {ui}
+    </MedplumProvider>
   );
 }
 
 describe('MedplumLink', () => {
   beforeEach(() => {
-    locationUtils.assign = jest.fn();
+    locationUtils.assign = vi.fn();
   });
 
   test('Renders', () => {
@@ -83,7 +80,7 @@ describe('MedplumLink', () => {
   });
 
   test('Handles click with onClick', () => {
-    const onClick = jest.fn();
+    const onClick = vi.fn();
     setup(
       <MedplumLink to="xyz" onClick={onClick}>
         test
@@ -104,5 +101,16 @@ describe('MedplumLink', () => {
     setup(<MedplumLink>test</MedplumLink>);
     expect(screen.getByText('test')).toBeDefined();
     fireEvent.click(screen.getByText('test'));
+  });
+
+  test('Passes anchor DOM props through to the underlying element', () => {
+    setup(
+      <MedplumLink to="xyz" tabIndex={-1}>
+        test
+      </MedplumLink>
+    );
+    const node = screen.getByText('test');
+    expect(node).toBeDefined();
+    expect(node).toHaveAttribute('tabIndex', '-1');
   });
 });

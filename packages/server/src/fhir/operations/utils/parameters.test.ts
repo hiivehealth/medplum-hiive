@@ -1,6 +1,6 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { indexStructureDefinitionBundle } from '@medplum/core';
+import { badRequest, indexStructureDefinitionBundle, OperationOutcomeError } from '@medplum/core';
 import { readJson } from '@medplum/definitions';
 import type {
   Observation,
@@ -12,7 +12,10 @@ import type {
 } from '@medplum/fhirtypes';
 import type { Request } from 'express';
 import { parse } from 'qs';
-import { buildOutputParameters, parseInputParameters, parseParameters } from './parameters';
+import { loadTestConfig } from '../../../config/loader';
+import { TEST_SHARD_ID } from '../../../test.setup';
+import { GLOBAL_SHARD_ID } from '../../sharding';
+import { buildOutputParameters, getShardIdParam, parseInputParameters, parseParameters } from './parameters';
 
 describe('FHIR Parameters parsing', () => {
   test('Read Parameters', () => {
@@ -129,6 +132,30 @@ const NestedOutputOperation: OperationDefinition = {
       ],
     },
   ],
+};
+
+const SingleResourceInputOperation: OperationDefinition = {
+  resourceType: 'OperationDefinition',
+  name: 'single-resource-input',
+  status: 'active',
+  kind: 'operation',
+  code: 'single-resource-input',
+  system: true,
+  type: false,
+  instance: false,
+  parameter: [{ name: 'resource', use: 'in', min: 1, max: '1', type: 'Resource' }],
+};
+
+const SingleTypedResourceInputOperation: OperationDefinition = {
+  resourceType: 'OperationDefinition',
+  name: 'single-typed-resource-input',
+  status: 'active',
+  kind: 'operation',
+  code: 'single-typed-resource-input',
+  system: true,
+  type: false,
+  instance: false,
+  parameter: [{ name: 'patient', use: 'in', min: 1, max: '1', type: 'Patient' }],
 };
 
 describe('Operation Input/Output Parameters', () => {
@@ -260,6 +287,35 @@ describe('Operation Input/Output Parameters', () => {
       });
     });
 
+    test('Reads a missing body as no parameters', () => {
+      const optionalOnly: OperationDefinition = {
+        ...opDef,
+        parameter: [{ name: 'optionalIn', use: 'in', min: 0, max: '1', type: 'string' }],
+      };
+      const req: Request = { method: 'POST' } as unknown as Request;
+      expect(parseInputParameters(optionalOnly, req)).toEqual({});
+    });
+
+    test('Reads raw Resource body for single Resource input parameter', () => {
+      const patient: Patient = { resourceType: 'Patient', id: 'test-patient' };
+      const req: Request = { body: patient } as unknown as Request;
+      expect(parseInputParameters(SingleResourceInputOperation, req)).toEqual({ resource: patient });
+    });
+
+    test('Reads raw typed Resource body for single typed Resource input parameter', () => {
+      const patient: Patient = { resourceType: 'Patient', id: 'test-patient' };
+      const req: Request = { body: patient } as unknown as Request;
+      expect(parseInputParameters(SingleTypedResourceInputOperation, req)).toEqual({ patient });
+    });
+
+    test('Rejects raw Resource body that does not match the single typed Resource input parameter', () => {
+      const observation: Observation = { resourceType: 'Observation', status: 'final', code: { text: 'Test' } };
+      const req: Request = { body: observation } as unknown as Request;
+      expect(() => parseInputParameters(SingleTypedResourceInputOperation, req)).toThrow(
+        `Expected at least 1 value(s) for required input parameter 'patient'`
+      );
+    });
+
     test.each<[Parameters | Record<string, any>, string]>([
       [{}, `Expected at least 1 value(s) for required input parameter 'requiredIn'`],
       [
@@ -294,7 +350,7 @@ describe('Operation Input/Output Parameters', () => {
       ],
     ])('Throws error on incorrect argument counts: %j', (body, errorMsg) => {
       const req: Request = { body } as unknown as Request;
-      expect(() => parseInputParameters(opDef, req)).toThrow(new Error(errorMsg));
+      expect(() => parseInputParameters(opDef, req)).toThrow(errorMsg);
     });
 
     test.each<[Parameters, string]>([
@@ -311,7 +367,7 @@ describe('Operation Input/Output Parameters', () => {
       ],
     ])('Throws error on invalid Parameters: %j', (parameters, errorMsg) => {
       const req: Request = { body: parameters } as unknown as Request;
-      expect(() => parseInputParameters(opDef, req)).toThrow(new Error(errorMsg));
+      expect(() => parseInputParameters(opDef, req)).toThrow(errorMsg);
     });
 
     test('Parses query string parameters as correct type', () => {
@@ -340,13 +396,13 @@ describe('Operation Input/Output Parameters', () => {
       ['requiredIn=1', `Invalid value '1' provided for boolean parameter 'requiredIn'`],
     ])('Throws on invalid query string parameters: %s', (query, errorMsg) => {
       const req: Request = { method: 'GET', query: parse(query) } as unknown as Request;
-      expect(() => parseInputParameters(opDef, req)).toThrow(new Error(errorMsg));
+      expect(() => parseInputParameters(opDef, req)).toThrow(errorMsg);
     });
   });
 
   describe('Send Operation output Parameters', () => {
     beforeEach(() => {
-      jest.resetAllMocks();
+      vi.resetAllMocks();
     });
 
     test('Single required parameter', async () => {
@@ -495,5 +551,39 @@ describe('Operation Input/Output Parameters', () => {
         'Invalid additional property "reference" (Parameters.parameter[0].value[x].reference)'
       );
     });
+  });
+});
+
+describe('getShardIdParam', () => {
+  function getShardIdParamError(params: { shardId?: string }): OperationOutcomeError {
+    try {
+      getShardIdParam(params);
+    } catch (err) {
+      return err as OperationOutcomeError;
+    }
+    throw new Error('Expected getShardIdParam to throw');
+  }
+
+  test('Defaults to the global shard when sharding is not configured', async () => {
+    await loadTestConfig();
+    expect(getShardIdParam({})).toStrictEqual(GLOBAL_SHARD_ID);
+    expect(getShardIdParam({ shardId: GLOBAL_SHARD_ID })).toStrictEqual(GLOBAL_SHARD_ID);
+  });
+
+  test('Requires a shardId when sharding is configured', async () => {
+    await loadTestConfig({ sharded: true });
+    expect(getShardIdParam({ shardId: TEST_SHARD_ID })).toStrictEqual(TEST_SHARD_ID);
+
+    const err = getShardIdParamError({});
+    expect(err).toBeInstanceOf(OperationOutcomeError);
+    expect(err.outcome).toMatchObject(badRequest('shardId is required'));
+  });
+
+  test.each([false, true])('Rejects an unknown shardId (sharded: %s)', async (sharded) => {
+    await loadTestConfig({ sharded });
+
+    const err = getShardIdParamError({ shardId: 'unknown-shard' });
+    expect(err).toBeInstanceOf(OperationOutcomeError);
+    expect(err.outcome).toMatchObject(badRequest('Unknown shardId: unknown-shard'));
   });
 });

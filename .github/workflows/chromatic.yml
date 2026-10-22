@@ -9,17 +9,17 @@ jobs:
   chromatic:
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Chromatic authenticates with projectToken, not GITHUB_TOKEN
     permissions:
-      contents: write
-      pull-requests: write
+      contents: read
     steps:
       - name: Checkout code
-        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@395ad3262231945c25e8478fd5baf05154b1d79f # v6.1.0
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
           registry-url: 'https://registry.npmjs.org'
@@ -28,7 +28,7 @@ jobs:
           package-manager-cache: false
 
       - name: Cache node modules
-        uses: actions/cache@cdf6c1fa76f9f475f3d7449005a359c84ca0f306 # v5.0.3
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         env:
           cache-name: cache-node-modules
         with:
@@ -49,16 +49,31 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        run: npm run build -- --filter=@medplum/react
+      - name: Build Storybook dependencies
+        # Chromatic runs build:test itself to inject output and TurboSnap stats options.
+        # Build only dependencies here to avoid building Storybook twice.
+        run: npx turbo run build '--filter=@medplum/storybook^...'
 
       - name: Publish @medplum/react Chromatic
-        uses: chromaui/action@bc2d84ad2b60813a67d995c5582d696104a19383 # v13.3.2
+        uses: chromaui/action@be896f860638c97a2e074931c57a3befd5363b56 # v18.10.0
+        id: publish_chromatic
+        continue-on-error: true
         with:
           projectToken: chpt_429b596edaecafb
-          workingDir: packages/react
-          buildScriptName: storybook
+          workingDir: packages/storybook
+          buildScriptName: build:test
           autoAcceptChanges: 'main'
           exitOnceUploaded: true
           exitZeroOnChanges: true
           onlyChanged: true
+
+      - name: Persist log
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.publish_chromatic.outcome == 'failure'
+        with:
+          path: 'packages/storybook/build-storybook.log'
+          archive: false
+
+      - name: Retain build status
+        if: steps.publish_chromatic.outcome == 'failure'
+        run: exit 1

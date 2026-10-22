@@ -4,6 +4,24 @@ import type * as Preset from '@docusaurus/preset-classic';
 import type { Config } from '@docusaurus/types';
 import { themes as prismThemes } from 'prism-react-renderer';
 
+/**
+ * Algolia DocSearch credentials for the navbar search and /search page. AI chat is served by Kapa.
+ *
+ * appId / apiKey / indexName are public (search-only key; safe to commit).
+ */
+const ALGOLIA = {
+  appId: '6A1DXS603N',
+  // Public search-only API key (safe to commit)
+  apiKey: '06bafd15f5a637275ed20297927355f9',
+  indexName: 'medplum',
+} as const;
+
+/**
+ * Width of the docked Kapa chat panel. The widget bundle and our own layout CSS both need this
+ * value, so it is published as a custom property rather than duplicated in custom.css.
+ */
+const KAPA_SIDEBAR_WIDTH = '400px';
+
 const config: Config = {
   title: 'Medplum',
   tagline: 'Fast and easy healthcare dev',
@@ -23,6 +41,8 @@ const config: Config = {
     v4: true,
     faster: true,
   },
+
+  clientModules: ['./src/clientModules/gtagDevShim.ts'],
 
   // Even if you don't use internationalization, you can use this field to set
   // useful metadata like html lang. For example, if your site is Chinese, you
@@ -49,9 +69,78 @@ const config: Config = {
             from: '/docs/charting/ordering-labs-imaging',
             to: '/docs/labs-imaging/ordering-labs-imaging',
           },
+          {
+            from: '/docs/charting/soap-notes',
+            to: '/docs/charting/visit-templates',
+          },
+          {
+            from: '/docs/charting/capturing-vital-signs',
+            to: '/docs/charting/chart-data-model',
+          },
+          {
+            from: '/docs/charting/representing-diagnoses',
+            to: '/docs/charting/chart-data-model',
+          },
+          {
+            from: '/docs/charting/allergy-intolerances',
+            to: '/docs/charting/chart-data-model',
+          },
+          {
+            from: '/docs/charting/patient-demographics',
+            to: '/docs/charting/chart-data-model',
+          },
+          {
+            from: '/docs/charting/implantable-devices',
+            to: '/docs/charting/chart-data-model',
+          },
+          {
+            from: '/docs/charting/external-documents',
+            to: '/docs/fhir-datastore/external-documents',
+          },
+          {
+            from: '/docs/questionnaires/structured-data-capture',
+            to: '/docs/questionnaires/parsing-questionnaire-responses',
+          },
+          {
+            from: '/docs/integration/stedi/eligibility-checks',
+            to: '/docs/integration/stedi/insurance-eligibility/eligibility-checks',
+          },
+          {
+            from: '/docs/integration/stedi/professional-claims',
+            to: '/docs/integration/stedi/claim-submission/professional-claims',
+          },
+          {
+            from: '/docs/integration/scriptsure/iframe',
+            to: '/docs/integration/scriptsure',
+          },
+          {
+            from: '/docs/integration/scriptsure/order-medication',
+            to: '/docs/integration/scriptsure',
+          },
+          {
+            from: '/docs/integration/scriptsure/drug-interaction',
+            to: '/docs/integration/scriptsure',
+          },
+          {
+            from: '/docs/integration/scriptsure/pharmacy-search',
+            to: '/docs/integration/scriptsure',
+          },
+          {
+            from: '/docs/integration/scriptsure/order-sets',
+            to: '/docs/integration/scriptsure',
+          },
+          {
+            from: '/docs/integration/scriptsure/medication-cart',
+            to: '/docs/integration/scriptsure',
+          },
+          {
+            from: '/docs/integration/dosespot/clinic-favorite-medications',
+            to: '/docs/integration/dosespot',
+          },
         ],
       },
     ],
+    'docusaurus-plugin-llms',
   ],
 
   presets: [
@@ -77,9 +166,15 @@ const config: Config = {
         theme: {
           customCss: './src/css/custom.css',
         },
-        gtag: {
-          trackingID: 'G-SHW0ZNT27G',
-        },
+        // Only enable Google Analytics for production builds. The plugin disables itself outside
+        // production anyway; this keeps the tracking ID out of dev entirely. See
+        // src/clientModules/gtagDevShim.ts for why that is not sufficient on its own.
+        gtag:
+          process.env.NODE_ENV === 'production'
+            ? {
+                trackingID: 'G-SHW0ZNT27G',
+              }
+            : undefined,
       },
     ],
   ],
@@ -99,6 +194,19 @@ const config: Config = {
         rel: 'manifest',
         href: '/manifest.json',
       },
+    },
+    {
+      tagName: 'style',
+      attributes: {},
+      innerHTML: `:root { --kapa-sidebar-width: ${KAPA_SIDEBAR_WIDTH}; }`,
+    },
+    // Queues Kapa JS API calls made before the (async) widget bundle finishes loading. Docusaurus
+    // emits `headTags` before `scripts`, so this always wins the race. See src/theme/Root.tsx for
+    // the handlers that depend on it.
+    {
+      tagName: 'script',
+      attributes: {},
+      innerHTML: `(function(){if(window.Kapa)return;var i=function(){i.c(arguments)};i.q=[];i.c=function(a){i.q.push(a)};window.Kapa=i})();`,
     },
   ],
 
@@ -196,6 +304,10 @@ const config: Config = {
               label: 'Contributing',
               to: '/docs/contributing',
             },
+            {
+              label: 'Events',
+              to: '/blog/events-calendar',
+            },
           ],
         },
         {
@@ -240,24 +352,12 @@ const config: Config = {
     },
     image: 'img/medplum-og-cover-image.png',
     algolia: {
-      // The application ID provided by Algolia
-      appId: '6A1DXS603N',
-
-      // Public API key: it is safe to commit it
-      apiKey: '75b991071ef4ef1145d63c0a4d0d4665',
-
-      indexName: 'medplum',
-
-      // Optional: see doc section below
+      appId: ALGOLIA.appId,
+      apiKey: ALGOLIA.apiKey,
+      indexName: ALGOLIA.indexName,
       contextualSearch: true,
-
-      // Optional: Algolia search parameters
       searchParameters: {},
-
-      // Optional: path for search page that enabled by default (`false` to disable it)
       searchPagePath: 'search',
-
-      //... other Algolia params
     },
   } satisfies Preset.ThemeConfig,
   markdown: {
@@ -267,6 +367,44 @@ const config: Config = {
     },
   },
   themes: ['@docusaurus/theme-mermaid'],
+  scripts: [
+    {
+      src: 'https://cdn-cookieyes.com/client_data/11362a9d5311bc6aa21c5f47d05599c6/script.js',
+    },
+    {
+      src: 'https://ddwl4m2hdecbv.cloudfront.net/b/LNKLDHEYLZOJ/LNKLDHEYLZOJ.js.gz',
+      async: true,
+    },
+    {
+      src: 'https://widget.kapa.ai/kapa-widget.bundle.js',
+      'data-website-id': '5cda65f5-5f1d-4b8c-846d-1fe83121c171',
+      'data-project-name': 'Medplum',
+      // Open Color grape-8 / grape-5, matching --ifm-color-primary in custom.css.
+      'data-project-color': '#9c36b5',
+      'data-project-color-dark': '#cc5de8',
+      'data-project-logo': '/img/logo.svg',
+      // The mark is the same grape as the launcher, so it vanishes on the button.
+      // Keep the colored logo in the panel header and use a white one here.
+      'data-launcher-button-image': '/img/logo-white.svg',
+      'data-launcher-button-image-height': '28',
+      'data-launcher-button-image-width': '28',
+      // Kapa fixes the launcher at 4.5rem wide, which clips anything longer than "Ask AI".
+      'data-launcher-button-width': 'auto',
+      'data-launcher-button-padding-x': '14px',
+      'data-launcher-button-label-font-size': '14px',
+      'data-launcher-button-border': 'none',
+      'data-launcher-button-border-radius': '16px',
+      'data-launcher-button-hover-background-color': '#862e9c',
+      'data-launcher-button-text': 'Ask Us',
+      'data-modal-title': 'Ask Medplum AI',
+      'data-font-family': "'Poppins', sans-serif",
+      'data-color-scheme-selector': "[data-theme='dark']",
+      // Docked right-hand panel instead of a centered modal.
+      'data-view-mode': 'sidebar',
+      'data-modal-size': KAPA_SIDEBAR_WIDTH,
+      async: true,
+    },
+  ],
 };
 
 export default config;

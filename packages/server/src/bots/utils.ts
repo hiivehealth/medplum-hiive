@@ -8,10 +8,14 @@ import {
   createReference,
   getStatus,
   Hl7Message,
+  isGone,
+  isNotFound,
   isOk,
   isOperationOutcome,
   isResource,
+  LRUCache,
   normalizeErrorString,
+  normalizeOperationOutcome,
   OperationOutcomeError,
   resolveId,
   serverError,
@@ -32,13 +36,13 @@ import { randomUUID } from 'node:crypto';
 import { extname } from 'node:path';
 import type { AuthenticatedRequestContext } from '../context';
 import { sendOutcome } from '../fhir/outcomes';
+import { findProjectMembership } from '../fhir/projectmembership';
 import type { SystemRepository } from '../fhir/repo';
 import { getGlobalSystemRepo } from '../fhir/repo';
 import { sendFhirResponse } from '../fhir/response';
 import { getLogger } from '../logger';
 import { generateAccessToken } from '../oauth/keys';
 import { getBinaryStorage } from '../storage/loader';
-import { findProjectMembership } from '../workers/utils';
 import type { BotExecutionRequest, BotExecutionResult } from './types';
 
 /**
@@ -131,13 +135,29 @@ export function getOutParametersFromResult(result: OperationOutcome | BotExecuti
 }
 
 /**
- * Returns true if the bot is enabled and bots are enabled for the project.
- * @param bot - The bot resource.
- * @returns True if the bot is enabled.
+ * Normalizes the BotExecutionResult success flag based on structured FHIR outcomes.
+ * Runtime adapters should call this before returning so all bot execution surfaces
+ * agree on the meaning of a returned non-OK OperationOutcome.
+ * @param result - The bot execution result.
+ * @returns The normalized bot execution result.
  */
-export async function isBotEnabled(bot: Bot): Promise<boolean> {
-  const systemRepo = getGlobalSystemRepo();
-  const project = await systemRepo.readResource<Project>('Project', bot.meta?.project as string);
+export function normalizeBotExecutionResult(result: BotExecutionResult): BotExecutionResult {
+  if (isOperationOutcome(result.returnValue) && !isOk(result.returnValue)) {
+    return { ...result, success: false };
+  }
+  return result;
+}
+
+/**
+ * Returns whether bots are enabled for a project.
+ *
+ * Takes the project rather than the bot, because the two differ: a bot shared from a linked project
+ * runs in the caller's project, and it is the caller who has to be entitled to run bots. Deploying
+ * that same bot is a write to the project that owns it, so callers name the project they mean.
+ * @param project - The project to check.
+ * @returns True if the project has the `bots` feature.
+ */
+export function isBotEnabledForProject(project: Project): boolean {
   return !!project.features?.includes('bots');
 }
 
@@ -157,16 +177,24 @@ export async function isBotEnabled(bot: Bot): Promise<boolean> {
  * @param request - The bot request.
  */
 export async function writeBotInputToStorage(request: BotExecutionRequest): Promise<void> {
-  const { bot, contentType, input } = request;
+  const { bot, contentType, input, runAs } = request;
   const now = new Date();
   const today = now.toISOString().substring(0, 10).replaceAll('-', '/');
-  const key = `bot/${bot.meta?.project}/${today}/${now.getTime()}-${randomUUID()}.json`;
+  // Partition by the project the run executed in, not the one that owns the bot: the input is the
+  // caller's data, so a bot shared from a linked project must not deposit it in the publisher's
+  // partition. Its account compartments stay behind for the same reason -- they name another project.
+  const projectId = resolveId(runAs.project) as string;
+  const sameProject = bot.meta?.project === projectId;
+  // The `bot/` prefix is also the scope of the storageBotInputExpirationDays lifecycle rules in packages/cdk/src/storage.ts
+  // If the prefix changes, the corresponding lifecycle rules in packages/cdk/src/storage.ts must be updated accordingly.
+  const key = `bot/${projectId}/${today}/${now.getTime()}-${randomUUID()}.json`;
   const row: Record<string, unknown> = {
     contentType,
     input,
     botId: bot.id,
-    projectId: bot.meta?.project,
-    accountId: bot.meta?.account,
+    projectId,
+    botProjectId: sameProject ? undefined : bot.meta?.project,
+    accountId: sameProject ? bot.meta?.account : undefined,
     subscriptionId: request.subscription?.id,
     agentId: request.agent?.id,
     deviceId: request.device?.id,
@@ -210,8 +238,46 @@ export async function writeBotInputToStorage(request: BotExecutionRequest): Prom
   await getBinaryStorage().writeFile(key, ContentType.JSON, JSON.stringify(row));
 }
 
-export async function getBotAccessToken(runAs: ProjectMembership): Promise<string> {
+// Bot access tokens are valid for 1 hour; reusing each for only 30 minutes guarantees
+// every bot execution receives a token with at least 30 minutes of remaining lifetime
+const BOT_ACCESS_TOKEN_CACHE_MS = 30 * 60 * 1000;
+
+const botAccessTokenCache = new LRUCache<{ accessToken: string; loginId: string; expiresAt: number }>(1000);
+
+// Cache for concurrent requests for the same Bot and ProjectMembership
+const botAccessTokenInFlight = new Map<string, Promise<string>>();
+
+export function clearBotAccessTokenCache(): void {
+  botAccessTokenCache.clear();
+  botAccessTokenInFlight.clear();
+}
+
+export function getBotAccessToken(bot: WithId<Bot>, runAs: WithId<ProjectMembership>): Promise<string> {
+  const versionId = runAs.meta?.versionId;
+  if (!versionId) {
+    // Without a versionId, changes to the membership can't be detected, so the token is never cached
+    return ensureBotAccessToken(runAs, undefined);
+  }
+
+  const cacheKey = `${bot.id}:${runAs.id}:${versionId}`;
+  let pending = botAccessTokenInFlight.get(cacheKey);
+  if (!pending) {
+    pending = ensureBotAccessToken(runAs, cacheKey).finally(() => botAccessTokenInFlight.delete(cacheKey));
+    botAccessTokenInFlight.set(cacheKey, pending);
+  }
+  return pending;
+}
+
+async function ensureBotAccessToken(runAs: WithId<ProjectMembership>, cacheKey: string | undefined): Promise<string> {
   const systemRepo = getGlobalSystemRepo();
+  if (cacheKey) {
+    const cached = botAccessTokenCache.get(cacheKey);
+    if (cached && Date.now() < cached.expiresAt && (await isLoginValid(systemRepo, cached.loginId))) {
+      return cached.accessToken;
+    } else {
+      botAccessTokenCache.delete(cacheKey);
+    }
+  }
 
   // Create the Login resource
   const login = await systemRepo.createResource<Login>({
@@ -233,7 +299,27 @@ export async function getBotAccessToken(runAs: ProjectMembership): Promise<strin
     scope: 'openid',
   });
 
+  if (cacheKey) {
+    botAccessTokenCache.set(cacheKey, {
+      accessToken,
+      loginId: login.id,
+      expiresAt: Date.now() + BOT_ACCESS_TOKEN_CACHE_MS,
+    });
+  }
   return accessToken;
+}
+
+async function isLoginValid(systemRepo: SystemRepository, loginId: string): Promise<boolean> {
+  try {
+    const login = await systemRepo.readResource<Login>('Login', loginId, { checkCacheOnly: true });
+    return !login.revoked;
+  } catch (err) {
+    const outcome = normalizeOperationOutcome(err);
+    if (!isNotFound(outcome) && !isGone(outcome)) {
+      getLogger().warn('Failed to read cached bot Login', { loginId, err: normalizeErrorString(err) });
+    }
+    return false;
+  }
 }
 
 /**

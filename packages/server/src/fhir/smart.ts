@@ -7,21 +7,39 @@
  */
 
 import {
+  badRequest,
   ContentType,
   deepClone,
   EMPTY,
   OAuthGrantType,
   OAuthSigningAlgorithm,
   OAuthTokenAuthMethod,
+  OperationOutcomeError,
+  readInteractions,
   splitN,
 } from '@medplum/core';
-import type { AccessPolicy, AccessPolicyResource } from '@medplum/fhirtypes';
+import type { AccessPolicy, AccessPolicyResource, Patient, Reference } from '@medplum/fhirtypes';
 import type { Request, Response } from 'express';
 import qs from 'node:querystring';
 import { getConfig } from '../config/loader';
+import type { AuthState } from '../oauth/middleware';
+import { getProjectScopedUrl } from '../util/url';
 import type { PopulatedAccessPolicy } from './accesspolicy';
 
+export const SMART_SCOPES_SUPPORTED = [
+  'patient/*.rs',
+  'user/*.cruds',
+  'openid',
+  'fhirUser',
+  'launch',
+  'launch/patient',
+  'offline_access',
+  'online_access',
+];
+
 const smartScopeFormat = /^(patient|user|system)\/(\w+|\*)\.(read|write|c?r?u?d?s?|\*)$/;
+
+const missingPatientContext = 'Missing patient context for patient/ scope';
 
 export interface SmartScope {
   readonly permissionType: 'patient' | 'user' | 'system';
@@ -34,25 +52,25 @@ export interface SmartScope {
  * Handles requests for the SMART configuration.
  * See: https://build.fhir.org/ig/HL7/smart-app-launch/conformance.html
  * See: https://build.fhir.org/ig/HL7/smart-app-launch/scopes-and-launch-context.html
- * @param _req - The HTTP request.
+ * @param req - The HTTP request.
  * @param res - The HTTP response.
  */
-export function smartConfigurationHandler(_req: Request, res: Response): void {
+export function smartConfigurationHandler(req: Request, res: Response): void {
   const config = getConfig();
   res
     .status(200)
     .contentType(ContentType.JSON)
     .json({
-      issuer: config.issuer,
-      jwks_uri: config.jwksUrl,
-      authorization_endpoint: config.authorizeUrl,
+      issuer: getProjectScopedUrl(req.originalUrl, config.issuer),
+      jwks_uri: getProjectScopedUrl(req.originalUrl, config.baseUrl, config.jwksUrl),
+      authorization_endpoint: getProjectScopedUrl(req.originalUrl, config.baseUrl, config.authorizeUrl),
       grant_types_supported: [
         OAuthGrantType.ClientCredentials,
         OAuthGrantType.AuthorizationCode,
         OAuthGrantType.RefreshToken,
         OAuthGrantType.TokenExchange,
       ],
-      token_endpoint: config.tokenUrl,
+      token_endpoint: getProjectScopedUrl(req.originalUrl, config.baseUrl, config.tokenUrl),
       token_endpoint_auth_methods_supported: [
         OAuthTokenAuthMethod.ClientSecretBasic,
         OAuthTokenAuthMethod.ClientSecretPost,
@@ -63,18 +81,9 @@ export function smartConfigurationHandler(_req: Request, res: Response): void {
         OAuthSigningAlgorithm.RS384,
         OAuthSigningAlgorithm.ES384,
       ],
-      scopes_supported: [
-        'patient/*.rs',
-        'user/*.cruds',
-        'openid',
-        'fhirUser',
-        'launch',
-        'launch/patient',
-        'offline_access',
-        'online_access',
-      ],
+      scopes_supported: SMART_SCOPES_SUPPORTED,
       response_types_supported: ['code'],
-      introspection_endpoint: config.introspectUrl,
+      introspection_endpoint: getProjectScopedUrl(req.originalUrl, config.baseUrl, config.introspectUrl),
       capabilities: [
         'authorize-post',
         'permission-v1',
@@ -181,41 +190,64 @@ function normalizeV2ScopeString(str: string): string {
  * If there is no access policy, a new one is created.
  * Otherwise, the AccessPolicy is modified to only include the SMART scopes.
  * @param accessPolicy - The original access policy.
- * @param scope - The OAuth scope string.
- * @returns Updated access policy with the OAuth scope applied.
+ * @param authState - The user's authentication state.
+ * @returns Updated access policy with the OAuth scope(s) applied.
  */
-export function applySmartScopes(
-  accessPolicy: PopulatedAccessPolicy,
-  scope: string | undefined
-): PopulatedAccessPolicy {
+export function applySmartScopes(accessPolicy: PopulatedAccessPolicy, authState: AuthState): PopulatedAccessPolicy {
+  const scope = authState.login.scope;
   const smartScopes = parseSmartScopes(scope);
   if (smartScopes.length === 0) {
     // No SMART scopes, so no changes to the access policy
     return accessPolicy;
   }
-
-  // Build an access policy that is the intersection of the existing access policy and the SMART scopes
-  return intersectSmartScopes(accessPolicy, smartScopes);
-}
-
-function intersectSmartScopes(accessPolicy: AccessPolicy, smartScope: SmartScope[]): PopulatedAccessPolicy {
-  // Build list of AccessPolicy entries
-  if (!accessPolicy.resource) {
-    // If none specified, generate an AccessPolicy from scratch
-    return generateSmartScopesPolicy(smartScope);
+  const context = getPatientContext(authState);
+  if (!context && smartScopes.some((scope) => scope.permissionType === 'patient')) {
+    // `patient/` scopes are scoped to a single patient compartment, which cannot be resolved without a context
+    throw new OperationOutcomeError(badRequest(missingPatientContext));
   }
 
+  // Build an access policy that is the intersection of the existing access policy and the SMART scopes
+  return intersectSmartScopes(accessPolicy, smartScopes, context);
+}
+
+/**
+ * Resolves the Patient context for the login, from the SMART App Launch context or the user's own profile.
+ * @param authState - The user's authentication state.
+ * @returns The Patient context reference, if a valid one is available.
+ */
+function getPatientContext(authState: AuthState): Reference<Patient> | undefined {
+  const membership = authState.onBehalfOfMembership ?? authState.membership;
+  for (const candidate of [authState.smartAppLaunch?.patient, membership.profile]) {
+    const [resourceType, id] = splitN(candidate?.reference ?? '', '/', 2);
+    if (resourceType === 'Patient' && id) {
+      return candidate as Reference<Patient>;
+    }
+  }
+  return undefined;
+}
+
+function intersectSmartScopes(
+  accessPolicy: AccessPolicy,
+  smartScope: SmartScope[],
+  context?: Reference<Patient>
+): PopulatedAccessPolicy {
   const result: PopulatedAccessPolicy = { ...accessPolicy, resource: [] };
-  for (const policy of accessPolicy.resource) {
-    const scope = getScopeForResourceType(smartScope, policy.resourceType);
-    if (scope) {
-      const merged = mergeAccessPolicyWithScope(policy, scope);
-      result.resource.push(merged);
-    } else if (policy.resourceType === '*') {
+  for (const policy of accessPolicy.resource ?? EMPTY) {
+    if (policy.resourceType === '*') {
       for (const scope of smartScope) {
-        const merged = mergeAccessPolicyWithScope(policy, scope);
-        merged.resourceType = scope.resourceType;
-        result.resource.push(merged);
+        // Expand the wildcard policy before merging, so that any criteria added by the scope
+        // is prefixed with the resource type the policy will be applied to
+        const merged = mergeAccessPolicyWithScope({ ...policy, resourceType: scope.resourceType }, scope, context);
+        if (merged) {
+          result.resource.push(merged);
+        }
+      }
+    } else {
+      for (const scope of getScopesForResourceType(smartScope, policy.resourceType)) {
+        const merged = mergeAccessPolicyWithScope(policy, scope, context);
+        if (merged) {
+          result.resource.push(merged);
+        }
       }
     }
   }
@@ -223,7 +255,11 @@ function intersectSmartScopes(accessPolicy: AccessPolicy, smartScope: SmartScope
 }
 
 const readOnlyScope = /^[rs]+$/;
-function mergeAccessPolicyWithScope(policy: AccessPolicyResource, scope: SmartScope): AccessPolicyResource {
+function mergeAccessPolicyWithScope(
+  policy: AccessPolicyResource,
+  scope: SmartScope,
+  context?: Reference<Patient>
+): AccessPolicyResource | undefined {
   const result = deepClone(policy);
   if (result.criteria?.startsWith('*') && scope.resourceType !== '*') {
     result.criteria = result.criteria.replace('*', scope.resourceType);
@@ -231,28 +267,34 @@ function mergeAccessPolicyWithScope(policy: AccessPolicyResource, scope: SmartSc
 
   if (readOnlyScope.exec(scope.scope)) {
     result.readonly = true;
+    result.interaction = result.interaction?.filter((interaction) => readInteractions.includes(interaction));
+    if (result.interaction?.length === 0) {
+      return undefined;
+    }
   }
   if (scope.criteria) {
-    result.criteria = `${result.criteria ?? scope.resourceType + '?'}${result.criteria && !result.criteria?.endsWith('&') ? '&' : ''}${scope.criteria}`;
+    appendCriteria(result, scope.criteria);
+  }
+  if (scope.permissionType === 'patient') {
+    if (!context?.reference) {
+      // Should be unreachable: applySmartScopes rejects `patient/` scopes without a context
+      throw new OperationOutcomeError(badRequest(missingPatientContext));
+    }
+    appendCriteria(result, `_compartment=${context.reference}`);
   }
   return result;
 }
 
-function getScopeForResourceType(scopes: SmartScope[], resourceType: string): SmartScope | undefined {
-  return scopes.find((s) => s.resourceType === resourceType) ?? scopes.find((s) => s.resourceType === '*');
+function appendCriteria(policy: AccessPolicyResource, criteria: string): void {
+  if (!policy.criteria) {
+    policy.criteria = `${policy.resourceType}?${criteria}`;
+  } else if (policy.criteria.endsWith('&')) {
+    policy.criteria += criteria;
+  } else {
+    policy.criteria += '&' + criteria;
+  }
 }
 
-function generateSmartScopesPolicy(smartScopes: SmartScope[]): PopulatedAccessPolicy {
-  const result: PopulatedAccessPolicy = {
-    resourceType: 'AccessPolicy',
-    resource: [],
-  };
-
-  for (const smartScope of smartScopes) {
-    result.resource.push({
-      resourceType: smartScope.resourceType,
-    });
-  }
-
-  return result;
+function getScopesForResourceType(scopes: SmartScope[], resourceType: string): SmartScope[] {
+  return scopes.filter((s) => s.resourceType === resourceType || s.resourceType === '*');
 }

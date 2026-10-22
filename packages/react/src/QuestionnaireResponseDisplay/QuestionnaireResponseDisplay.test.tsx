@@ -3,7 +3,6 @@
 import type { QuestionnaireResponse } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
-import { MemoryRouter } from 'react-router-dom';
 import { act, render, screen } from '../test-utils/render';
 import { QuestionnaireResponseDisplay } from './QuestionnaireResponseDisplay';
 
@@ -11,11 +10,9 @@ const medplum = new MockClient();
 
 function setup(questionnaireResponse: QuestionnaireResponse | { reference: string; display?: string }): void {
   render(
-    <MemoryRouter>
-      <MedplumProvider medplum={medplum}>
-        <QuestionnaireResponseDisplay questionnaireResponse={questionnaireResponse} />
-      </MedplumProvider>
-    </MemoryRouter>
+    <MedplumProvider medplum={medplum}>
+      <QuestionnaireResponseDisplay questionnaireResponse={questionnaireResponse} />
+    </MedplumProvider>
   );
 }
 
@@ -488,7 +485,7 @@ describe('QuestionnaireResponseDisplay', () => {
       ],
       status: 'completed',
       source: {
-        reference: 'Practitioner/123',
+        reference: 'Practitioner/124',
         display: 'Alice Smith',
       },
       authored: '2025-07-23T21:18:24.488Z',
@@ -525,7 +522,7 @@ describe('QuestionnaireResponseDisplay', () => {
     } as QuestionnaireResponse & { id: string };
 
     // Mock the medplum client to return our test response
-    jest.spyOn(medplum, 'readResource').mockResolvedValue(mockQuestionnaireResponse);
+    vi.spyOn(medplum, 'readResource').mockResolvedValue(mockQuestionnaireResponse);
 
     await act(async () => {
       setup({
@@ -539,7 +536,7 @@ describe('QuestionnaireResponseDisplay', () => {
   });
 
   test('Handles null/undefined response gracefully', () => {
-    jest.spyOn(medplum, 'readResource').mockResolvedValue(null as any);
+    vi.spyOn(medplum, 'readResource').mockResolvedValue(null as any);
 
     setup({
       reference: 'QuestionnaireResponse/non-existent',

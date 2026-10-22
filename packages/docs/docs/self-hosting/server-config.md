@@ -282,7 +282,7 @@ Optional AWS CloudWatch Log Stream name for `AuditEvent` logs. Only applies if `
 
 ### registerEnabled
 
-Optional flag whether new user registration is enabled. See [Open Patient Registration](/docs/user-management/open-patient-registration) for more details.
+Optional flag whether new user registration is enabled. When `false`, the server rejects both new user registration (`/auth/newuser`) and new project creation (`/auth/newproject`). See [Open Patient Registration](/docs/user-management/open-patient-registration) for more details.
 
 **Default:** `true`
 
@@ -290,11 +290,11 @@ Optional flag whether new user registration is enabled. See [Open Patient Regist
 
 Optional TOTP authenticator window for MFA token validation. This controls how many time steps (each 30 seconds) are accepted before and after the current time. A higher value is more lenient but less secure.
 
-| Value | Time Tolerance                     |
-| ----- | ---------------------------------- |
-| 0     | Only current 30-second window      |
-| 1     | ±30 seconds (~90 sec total)        |
-| 2     | ±60 seconds (~150 sec total)       |
+| Value | Time Tolerance                |
+| ----- | ----------------------------- |
+| 0     | Only current 30-second window |
+| 1     | ±30 seconds (~90 sec total)   |
+| 2     | ±60 seconds (~150 sec total)  |
 
 **Default:** `1`
 
@@ -316,11 +316,23 @@ Optional SMTP email settings to use SMTP for email. See [Sending SMTP Emails](/d
 
 **Default:** None
 
+#### smtp.secure
+
+Optional flag to use TLS when connecting to the SMTP relay (TLS-on-connect, as opposed to STARTTLS upgrade). Set to `true` for relays using implicit TLS, typically on port 465.
+
+**Default:** `false`
+
 ### emailProvider
 
 Optional email provider setting. Can be one of: `'none'`, `'awsses'`, `'smtp'`.
 
 **Default:** `'awsses'` if in AWS, otherwise `'none'`
+
+### allowProjectSmtp
+
+Optional flag to allow projects to send email through their own SMTP relay, configured via `Project.secret` entries. See [Project SMTP](/docs/user-management/project-smtp) for more details. Set to `false` to force all emails through the server-wide email provider.
+
+**Default:** `true`
 
 ### bullmq
 
@@ -346,6 +358,104 @@ Configuration for removing jobs from the queue when they fail.
 See [BullMQ Job Removal](https://docs.bullmq.io/guide/jobs/auto-removal).
 
 **Default:** `false`
+
+### dataWarehouse
+
+:::info[Enterprise feature]
+
+Data Warehouse sync is part of Medplum Enterprise. On the Medplum hosted service, a Medplum team member creates and enables the pipeline for your project. Contact us at [hello@medplum.com](mailto:hello@medplum.com) to get started.
+
+See [Snowflake](/docs/analytics/snowflake) or [Amazon Redshift](/docs/analytics/redshift) for the tables this worker produces, how to query them, and what to send us to open a request.
+
+:::
+
+Optional configuration for the scheduled Data Warehouse sync worker. This worker runs incremental sync jobs via BullMQ on a fixed cron schedule.
+It uses `readonlyDatabase` connection settings when available; otherwise it falls back to `database`.
+History tables synced are every `{ResourceType}_History` name derived from indexed repository resource types (the same pattern as database migrations), not a separate configurable list.
+
+When `dataWarehouse.enabled` is `true`, you must set `cron` and `destination`. There is no default destination. You must also set the fields required for your chosen destination: `awsS3TableArn` and `namespace` for `s3tables`, or `localBasePath` for `local`.
+
+Example (`s3tables`):
+
+```json
+{
+  "dataWarehouse": {
+    "enabled": true,
+    "cron": "0 * * * *",
+    "destination": "s3tables",
+    "awsS3TableArn": "arn:aws:s3tables:us-east-1:123456789012:bucket/my-warehouse",
+    "namespace": "default"
+  }
+}
+```
+
+Example (`local`):
+
+```json
+{
+  "dataWarehouse": {
+    "enabled": true,
+    "cron": "0 * * * *",
+    "destination": "local",
+    "localBasePath": "/var/medplum/warehouse"
+  }
+}
+```
+
+#### dataWarehouse.enabled
+
+Enable or disable the scheduled Data Warehouse sync worker.
+
+**Default:** `false`
+
+#### dataWarehouse.cron
+
+Cron expression used for scheduling sync runs.
+
+**Required when:** `dataWarehouse.enabled` is `true`
+
+**Default:** None
+
+#### dataWarehouse.destination
+
+Warehouse export destination type.
+
+- `s3tables`: Managed Iceberg tables in Amazon S3 Tables. Uses the top-level [`awsRegion`](#awsregion) for AWS API and DuckDB S3 credentials.
+- `local`: Write per-table Parquet files to `dataWarehouse.localBasePath`.
+
+**Required when:** `dataWarehouse.enabled` is `true`
+
+**Default:** None
+
+#### dataWarehouse.awsS3TableArn
+
+AWS S3 Table ARN for managed Iceberg table access.
+
+**Required when:** `dataWarehouse.destination` is `s3tables`
+
+**Default:** None
+
+#### dataWarehouse.localBasePath
+
+Base output directory for local Parquet exports. Each repository history table is written as `<table_key>.parquet` under this directory.
+
+**Required when:** `dataWarehouse.destination` is `local`
+
+**Default:** None
+
+#### dataWarehouse.namespace
+
+Iceberg namespace used by sync when using the `s3tables` destination.
+
+**Required when:** `dataWarehouse.destination` is `s3tables`
+
+**Default:** None
+
+#### dataWarehouse.startDate
+
+Earliest resource `lastUpdated` timestamp to include in warehouse sync (ISO 8601 string in JSON or environment config). History rows older than this bound are excluded from export.
+
+**Default:** None (no lower bound; sync all history rows that pass other filters)
 
 ### awsRegion
 
@@ -386,6 +496,31 @@ Optional max offset for search queries.
 
 **Default:** `10000`
 
+### disableChainedSearch
+
+Optional list of resource types for which [chained search](/docs/search/chained-search) is disabled. This is a write optimization for high-volume resource types that never need chained search. For each listed type:
+
+- References are no longer written to the `<ResourceType>_References` table on create or update.
+- Chained searches that would read that table, including `_has` reverse chains originating from the type, are rejected with `400 Bad Request`.
+
+Project Admin resource types (e.g. `ProjectMembership`) are always indexed and are ignored if listed.
+
+When using environment variables or parameter store, provide a comma-separated list (e.g. `Observation,AuditEvent`).
+
+:::warning
+
+Disabling chained search is intended to be a one-way operation. To re-enable chained search for a resource type, remove it from this list, restart the server, and then run a reindex of that resource type before using chained search again. Until the reindex completes, chained search results for that type will be incomplete or out of date.
+
+:::
+
+**Default:** None
+
+### rangeSearch
+
+When `true`, date search parameters compare the full period or range. When unset, a period is indexed as its start, or as its end when the start is missing. Projects can enable the same behavior with the [`range-search`](/docs/self-hosting/project-settings#project-feature-flags) feature. See [Searching by due date range](/docs/careplans/tasks#searching-by-due-date-range).
+
+**Default:** `false`
+
 ### defaultBotRuntimeVersion
 
 Optional default bot runtime version. See [Bot runtime version](/docs/api/fhir/medplum/bot) for more details.
@@ -425,7 +560,13 @@ Limit for the rate at which requests can be sent to or processed by the server. 
 
 Limit for the rate at which auth requests can be sent to or processed by the server. If developers are hitting this limit, it could be an indication of a suboptimal integration where each request is authenticating rather than reusing a token. For more details see the [Rate Limit docs](/docs/rate-limits).
 
-**Default:** `60/minute`
+**Default:** `160/minute`
+
+### defaultMfaRateLimit
+
+Limit for MFA verification requests per IP address. This is an outer guard in addition to per-login and per-user MFA attempt limits.
+
+**Default:** `10/minute`
 
 ### defaultFhirQuota
 
@@ -450,6 +591,22 @@ Downloaded content will be stored as a FHIR `Binary` resource, and the `contentU
 This feature can be disabled if you want to preserve the original external URL of the resource, or if you want to control the download process manually.
 
 **Default:** `true`
+
+### cacheResourcesOnWrite
+
+Optional flag to control whether creating or updating a resource writes it to the Redis resource cache. Set `MEDPLUM_CACHE_RESOURCES_ON_WRITE=false` when using environment variable config.
+
+When set to `false`, a write only refreshes a cache entry that already exists. A resource is added to the cache only when a read misses the cache. This keeps high-volume writes, such as bulk imports, from filling the cache with resources that are never read.
+
+**Default:** `true`
+
+### allowUnsafeOutbound
+
+Optional flag to allow outbound `fetch` requests to private or local network addresses. Set `MEDPLUM_ALLOW_UNSAFE_OUTBOUND=true` when using environment variable config.
+
+This is intended only for on-premises deployments that must connect to trusted local services. Do not enable this setting in hosted or cloud-managed environments.
+
+**Default:** `false`
 
 ### redactAuditEvents
 
@@ -567,16 +724,24 @@ Flag to enable pre-commit subscriptions for the interceptor pattern.
 
 **Default:** `false`
 
+### serverScopedSubscriptionsEnabled
+
+Flag to enable server-scoped rest-hook Subscriptions. When enabled, the subscription worker evaluates not only the subscriptions within a resource's own project, but also "server-scoped" subscriptions that are not scoped to any project (i.e. a system resource created by a super admin). This allows a single set of subscriptions to fire for changes across every project on the server, which is useful for large self-hosted deployments that use a project-per-tenant model but need a central data-processing flow for all tenants.
+
+Server-scoped subscriptions can only be created by a super admin (they are the only ones who can create project-less resources), and `AuditEvent` resources generated by these firings are themselves project-less and live in the system scope.
+
+**Default:** `false`
+
 ### externalAuthProviders
 
 Optional list of external authentication providers for [Direct External Authentication](/docs/auth/direct-external-auth). Each entry allows users with JWTs from the specified issuer to authenticate directly against the Medplum API without a token exchange.
 
 Each provider object has the following properties:
 
-| Property | Type | Description |
-| :--- | :--- | :--- |
-| `issuer` | `string` | The expected `iss` claim in JWTs from this IDP. Must match exactly. |
-| `userInfoUrl` | `string` | The IDP's userinfo endpoint URL, used to validate tokens. |
+| Property      | Type     | Description                                                         |
+| :------------ | :------- | :------------------------------------------------------------------ |
+| `issuer`      | `string` | The expected `iss` claim in JWTs from this IDP. Must match exactly. |
+| `userInfoUrl` | `string` | The IDP's userinfo endpoint URL, used to validate tokens.           |
 
 Example configuration:
 
@@ -631,9 +796,15 @@ Optional flag to enable custom functions in Bots.
 
 **Default:** `false`
 
+### storeBotInput
+
+Optional flag to write the input of every bot invocation to binary storage (e.g. S3) under `bot/<projectId>/<yyyy>/<mm>/<dd>/`, for debugging and analytics. Set to `false` to disable. On AWS, set the CDK [`storageBotInputExpirationDays`](/docs/self-hosting/aws-cdk-settings#storagebotinputexpirationdays) setting to delete these inputs automatically.
+
+**Default:** `true`
+
 ### AWS Secrets
 
-Postgres and Redis connection details have special cases due the way CDK exposes them.
+Postgres and Redis connection details have special cases due to the way CDK exposes them.
 
 When using a JSON config file, use JSON objects for `database` and `redis`. For example:
 

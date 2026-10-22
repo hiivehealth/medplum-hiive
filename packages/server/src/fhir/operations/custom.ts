@@ -5,6 +5,7 @@ import {
   badRequest,
   getExtension,
   isOperationOutcome,
+  isResource,
   normalizeOperationOutcome,
   Operator,
 } from '@medplum/core';
@@ -85,6 +86,7 @@ export async function tryCustomOperation(req: FhirRequest, repo: Repository): Pr
   const result = await executeBot({
     bot,
     runAs: await getBotProjectMembership(ctx, bot),
+    runAsProject: ctx.project,
     requester: ctx.membership.profile,
     input,
     contentType: req.headers?.['content-type'] as string,
@@ -100,6 +102,10 @@ export async function tryCustomOperation(req: FhirRequest, repo: Repository): Pr
   if (!result.success) {
     // On error, the return value is the OperationOutcome
     return [badRequest(result.logResult), result.returnValue];
+  }
+
+  if (isResource(result.returnValue, 'Parameters')) {
+    return [allOk, result.returnValue];
   }
 
   try {

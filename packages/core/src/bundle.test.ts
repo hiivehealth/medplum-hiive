@@ -9,6 +9,9 @@ import type {
   Resource,
   Specimen,
 } from '@medplum/fhirtypes';
+import { readFileSync } from 'node:fs';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { vi } from 'vitest';
 import {
   convertContainedResourcesToBundle,
@@ -17,7 +20,7 @@ import {
   reorderBundle,
 } from './bundle';
 import { getDataType } from './typeschema/types';
-import { deepClone, isUUID } from './utils';
+import { deepClone, EMPTY, isUUID } from './utils';
 
 let jsonFile: any;
 
@@ -301,6 +304,7 @@ describe('Bundle tests', () => {
           source: 'https://example.com/source',
           tag: [{ system: 'http://hl7.org/fhir/v3/ObservationValue', code: 'SUBSETTED' }],
           versionId: '55555555-5555-5555-5555-555555555555',
+          deleted: false,
         },
         active: true,
       };
@@ -314,6 +318,7 @@ describe('Bundle tests', () => {
       const removedKeys = ['project', 'versionId', 'lastUpdated', 'compartment', 'author'];
       for (const key of Object.keys(getDataType('Meta').elements)) {
         // make sure every possible element is defined in the test
+        expect(meta).toMatchObject({ [key]: expect.anything() });
         expect((meta as any)[key]).toBeDefined();
 
         if (removedKeys.includes(key)) {
@@ -374,6 +379,125 @@ describe('Bundle tests', () => {
       const attachmentUrl = (docRefEntry?.resource as any)?.content?.[0]?.attachment?.url;
       expect(attachmentUrl).toBe(binaryEntry?.fullUrl);
       expect(attachmentUrl).toMatch(/^urn:uuid:/);
+    });
+
+    test('Synthea collection bundle (Abbott509) should not fail topological sort', () => {
+      // given
+      const syntheaPath = join(
+        dirname(fileURLToPath(import.meta.url)),
+        '__fixtures__',
+        'Abbott509_Aaron203_44-subset.json'
+      );
+      let bundle = JSON.parse(readFileSync(syntheaPath, 'utf8')) as Bundle;
+      expect(bundle.type).toStrictEqual('collection');
+      // when
+      bundle = convertToTransactionBundle(bundle);
+      // then
+      expect(bundle.resourceType).toBe('Bundle');
+      expect(bundle.type).toBe('transaction');
+      expect(bundle.entry?.length).toBeGreaterThan(0);
+      for (const entry of bundle.entry ?? EMPTY) {
+        expect(entry.request?.method).toBe('POST');
+      }
+    });
+
+    test('SMART Health Card style references', () => {
+      // Source: https://build.fhir.org/ig/HL7/smart-health-cards-and-links/example-00-a-fhirBundle.json
+      const smartHealthExamplePath = join(
+        dirname(fileURLToPath(import.meta.url)),
+        '__fixtures__',
+        'example-00-a-fhirBundle.json'
+      );
+      const bundle = JSON.parse(readFileSync(smartHealthExamplePath, 'utf8')) as Bundle;
+      const transactionBundle = convertToTransactionBundle(bundle);
+      expect(transactionBundle.resourceType).toBe('Bundle');
+      expect(transactionBundle.type).toBe('transaction');
+      expect(transactionBundle.entry?.length).toBeGreaterThan(0);
+
+      const patientEntry = transactionBundle.entry?.find((e) => e.resource?.resourceType === 'Patient');
+      const immunizations =
+        transactionBundle.entry
+          ?.filter((e) => e.resource?.resourceType === 'Immunization')
+          .map((e) => e.resource as any) ?? [];
+
+      for (const immunization of immunizations) {
+        expect(immunization.patient?.reference).toBe(patientEntry?.fullUrl);
+      }
+    });
+
+    test('Patient with self-referential link does not produce duplicate entries', () => {
+      const inputBundle: Bundle = {
+        resourceType: 'Bundle',
+        type: 'collection',
+        entry: [
+          {
+            resource: {
+              resourceType: 'Patient',
+              id: '1',
+              link: [
+                {
+                  extension: [
+                    {
+                      url: 'https://open.epic.com/FHIR/StructureDefinition/patient-merge-target-reference',
+                      valueReference: {
+                        reference: 'Patient/1',
+                      },
+                    },
+                  ],
+                  other: {
+                    reference: 'Patient/2',
+                  },
+                  type: 'replaces',
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const result = convertToTransactionBundle(inputBundle);
+
+      expect(result.entry).toHaveLength(1);
+      expect(result.entry?.[0]?.request?.method).toBe('POST');
+      expect(result.entry?.[0]?.resource?.resourceType).toBe('Patient');
+    });
+
+    test('Patient self-referential link is remapped to the new urn:uuid', () => {
+      const inputBundle: Bundle = {
+        resourceType: 'Bundle',
+        type: 'collection',
+        entry: [
+          {
+            resource: {
+              resourceType: 'Patient',
+              id: '1',
+              link: [
+                {
+                  extension: [
+                    {
+                      url: 'https://open.epic.com/FHIR/StructureDefinition/patient-merge-target-reference',
+                      valueReference: { reference: 'Patient/1' },
+                    },
+                  ],
+                  other: { reference: 'Patient/1' },
+                  type: 'seealso',
+                },
+              ],
+            },
+          },
+        ],
+      };
+
+      const result = convertToTransactionBundle(inputBundle);
+      expect(result.entry).toHaveLength(1);
+
+      const patientEntry = result.entry?.[0];
+      const patientFullUrl = patientEntry?.fullUrl;
+      expect(patientFullUrl).toMatch(/^urn:uuid:/);
+
+      const patient = patientEntry?.resource as any;
+      expect(patient.link?.[0]?.extension?.[0]?.valueReference?.reference).toBe(patientFullUrl);
+      expect(patient.link?.[0]?.other?.reference).toBe(patientFullUrl);
     });
   });
 

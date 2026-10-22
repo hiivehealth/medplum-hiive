@@ -1,3 +1,5 @@
+// SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
+// SPDX-License-Identifier: Apache-2.0
 import type {
   DocSearchHit,
   DocSearchModalProps,
@@ -15,7 +17,6 @@ import { useHistory } from '@docusaurus/router';
 import { isRegexpStringMatch, useSearchLinkCreator } from '@docusaurus/theme-common';
 import {
   mergeFacetFilters,
-  useAlgoliaAskAi,
   useAlgoliaContextualFacetFilters,
   useSearchResultUrlProcessor,
 } from '@docusaurus/theme-search-algolia/client';
@@ -23,43 +24,41 @@ import Translate from '@docusaurus/Translate';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import { IconSearch } from '@tabler/icons-react';
 import translations from '@theme/SearchTranslations';
-import { useCallback, useMemo, useRef, useState, type ReactNode } from 'react';
+import type { ReactNode } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { createPortal } from 'react-dom';
 import './styles.css';
 
 import type { AutocompleteState } from '@algolia/autocomplete-core';
-import type { ThemeConfigAlgolia } from '@docusaurus/theme-search-algolia';
 import type { FacetFilters } from 'algoliasearch/lite';
 
-type DocSearchProps = Omit<DocSearchModalProps, 'onClose' | 'initialScrollY'> & {
+type DocSearchProps = Omit<DocSearchModalProps, 'onClose' | 'initialScrollY' | 'askAi'> & {
   contextualSearch?: string;
   externalUrlRegex?: string;
   searchPagePath: boolean | string;
-  askAi?: Exclude<(DocSearchModalProps & { askAi: unknown })['askAi'], string | undefined>;
 };
 
-// extend DocSearchProps for v4 features
-// TODO Docusaurus v4: cleanup after we drop support for DocSearch v3
 interface DocSearchV4Props extends DocSearchProps {
   indexName: string;
-  askAi?: ThemeConfigAlgolia['askAi'];
   translations?: DocSearchTranslations;
 }
 
 let DocSearchModal: typeof DocSearchModalType | null = null;
 
-function importDocSearchModalIfNeeded() {
+function importDocSearchModalIfNeeded(): Promise<void> {
   if (DocSearchModal) {
     return Promise.resolve();
   }
-  return Promise.all([import('@docsearch/react/modal'), import('@docsearch/react/style'), import('./styles.css')]).then(
+  return Promise.all([import('@docsearch/react/modal'), import('@docsearch/react/style')]).then(
     ([{ DocSearchModal: Modal }]) => {
       DocSearchModal = Modal;
     }
   );
 }
 
-function useNavigator({ externalUrlRegex }: Pick<DocSearchProps, 'externalUrlRegex'>) {
+function useNavigator({
+  externalUrlRegex,
+}: Pick<DocSearchProps, 'externalUrlRegex'>): DocSearchModalProps['navigator'] {
   const history = useHistory();
   const [navigator] = useState<DocSearchModalProps['navigator']>(() => {
     return {
@@ -90,15 +89,13 @@ function useTransformSearchClient(): DocSearchModalProps['transformSearchClient'
   );
 }
 
-function useTransformItems(props: Pick<DocSearchProps, 'transformItems'>) {
+function useTransformItems(props: Pick<DocSearchProps, 'transformItems'>): DocSearchModalProps['transformItems'] {
   const processSearchResultUrl = useSearchResultUrlProcessor();
   const [transformItems] = useState<DocSearchModalProps['transformItems']>(() => {
     return (items: DocSearchHit[]) =>
       props.transformItems
-        ? // Custom transformItems
-          props.transformItems(items)
-        : // Default transformItems
-          items.map((item) => ({
+        ? props.transformItems(items)
+        : items.map((item) => ({
             ...item,
             url: processSearchResultUrl(item.url),
           }));
@@ -118,7 +115,7 @@ function useResultsFooterComponent({
   );
 }
 
-function Hit({ hit, children }: { hit: InternalDocSearchHit | StoredDocSearchHit; children: ReactNode }) {
+function Hit({ hit, children }: { hit: InternalDocSearchHit | StoredDocSearchHit; children: ReactNode }): ReactNode {
   return <Link to={hit.url}>{children}</Link>;
 }
 
@@ -127,7 +124,7 @@ type ResultsFooterProps = {
   onClose: () => void;
 };
 
-function ResultsFooter({ state, onClose }: ResultsFooterProps) {
+function ResultsFooter({ state, onClose }: ResultsFooterProps): ReactNode {
   const createSearchLink = useSearchLinkCreator();
 
   return (
@@ -141,25 +138,20 @@ function ResultsFooter({ state, onClose }: ResultsFooterProps) {
 
 function useSearchParameters({ contextualSearch, ...props }: DocSearchProps): DocSearchProps['searchParameters'] {
   const contextualSearchFacetFilters = useAlgoliaContextualFacetFilters();
-
   const configFacetFilters: FacetFilters = props.searchParameters?.facetFilters ?? [];
-
   const facetFilters: FacetFilters = contextualSearch
-    ? // Merge contextual search filters with config filters
-      mergeFacetFilters(contextualSearchFacetFilters, configFacetFilters)
-    : // ... or use config facetFilters
-      configFacetFilters;
+    ? mergeFacetFilters(contextualSearchFacetFilters, configFacetFilters)
+    : configFacetFilters;
 
-  // We let users override default searchParameters if they want to
   return {
     ...props.searchParameters,
     facetFilters,
   };
 }
 
-function DocSearch({ externalUrlRegex, ...props }: DocSearchV4Props) {
+function DocSearch({ externalUrlRegex, ...props }: DocSearchProps): ReactNode {
   const navigator = useNavigator({ externalUrlRegex });
-  const searchParameters = useSearchParameters({ ...props });
+  const searchParameters = useSearchParameters(props);
   const transformItems = useTransformItems(props);
   const transformSearchClient = useTransformSearchClient();
 
@@ -167,8 +159,6 @@ function DocSearch({ externalUrlRegex, ...props }: DocSearchV4Props) {
   const searchButtonRef = useRef<HTMLButtonElement | null>(null);
   const [isOpen, setIsOpen] = useState(false);
   const [initialQuery, setInitialQuery] = useState<string | undefined>(undefined);
-
-  const { isAskAiActive, currentPlaceholder, onAskAiToggle, extraAskAiProps } = useAlgoliaAskAi(props);
 
   const prepareSearchContainer = useCallback(() => {
     if (!searchContainer.current) {
@@ -180,23 +170,22 @@ function DocSearch({ externalUrlRegex, ...props }: DocSearchV4Props) {
 
   const openModal = useCallback(() => {
     prepareSearchContainer();
-    importDocSearchModalIfNeeded().then(() => setIsOpen(true));
+    importDocSearchModalIfNeeded()
+      .then(() => setIsOpen(true))
+      .catch(console.error);
   }, [prepareSearchContainer]);
 
   const closeModal = useCallback(() => {
     setIsOpen(false);
     searchButtonRef.current?.focus();
     setInitialQuery(undefined);
-    onAskAiToggle(false);
-  }, [onAskAiToggle]);
+  }, []);
 
   const handleInput = useCallback(
     (event: KeyboardEvent) => {
       if (event.key === 'f' && (event.metaKey || event.ctrlKey)) {
-        // ignore browser's ctrl+f
         return;
       }
-      // prevents duplicate key insertion in the modal input
       event.preventDefault();
       setInitialQuery(event.key);
       openModal();
@@ -212,20 +201,14 @@ function DocSearch({ externalUrlRegex, ...props }: DocSearchV4Props) {
     onClose: closeModal,
     onInput: handleInput,
     searchButtonRef,
-    isAskAiActive: isAskAiActive ?? false,
-    onAskAiToggle: onAskAiToggle ?? (() => {}),
-  } satisfies UseDocSearchKeyboardEventsProps & {
-    // TODO Docusaurus v4: cleanup after we drop support for DocSearch v3
-    isAskAiActive: boolean;
-    onAskAiToggle: (askAiToggle: boolean) => void;
+    isAskAiActive: false,
+    onAskAiToggle: () => undefined,
   } as UseDocSearchKeyboardEventsProps);
 
   return (
     <>
       <Head>
-        {/* This hints the browser that the website will load data from Algolia,
-        and allows it to preconnect to the DocSearch cluster. It makes the first
-        query faster, especially on mobile. */}
+        {/* Preconnect to Algolia so the first search query is faster, especially on mobile. */}
         <link rel="preconnect" href={`https://${props.appId}-dsn.algolia.net`} crossOrigin="anonymous" />
       </Head>
 
@@ -257,11 +240,11 @@ function DocSearch({ externalUrlRegex, ...props }: DocSearchV4Props) {
             {...(props.searchPagePath && {
               resultsFooterComponent,
             })}
-            placeholder={currentPlaceholder}
             {...props}
             translations={props.translations?.modal ?? translations.modal}
             searchParameters={searchParameters}
-            {...extraAskAiProps}
+            // AI chat is served by the Kapa widget, not DocSearch
+            onAskAiToggle={() => undefined}
           />,
           searchContainer.current
         )}

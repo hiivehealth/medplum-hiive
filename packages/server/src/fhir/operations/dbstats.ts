@@ -2,45 +2,31 @@
 // SPDX-License-Identifier: Apache-2.0
 import { allOk } from '@medplum/core';
 import type { FhirRequest, FhirResponse } from '@medplum/fhir-router';
-import type { OperationDefinition } from '@medplum/fhirtypes';
-import { requireSuperAdmin } from '../../admin/super';
+import { requireSuperAdmin } from '../../context';
 import { DatabaseMode, getDatabasePool } from '../../database';
-import { buildOutputParameters, parseInputParameters } from './utils/parameters';
+import { makeOperationDefinition } from './definitions';
+import { buildOutputParameters, getShardIdParam, parseInputParameters } from './utils/parameters';
 
-const operation: OperationDefinition = {
-  resourceType: 'OperationDefinition',
-  name: 'db-stats',
-  status: 'active',
-  kind: 'operation',
-  code: 'db-stats',
-  experimental: true,
-  system: true,
-  type: false,
-  instance: false,
-  parameter: [
-    {
-      use: 'in',
-      name: 'tableNames',
-      type: 'string',
-      min: 0,
-      max: '1',
-    },
-    {
-      use: 'out',
-      name: 'tableString',
-      type: 'string',
-      min: 1,
-      max: '1',
-    },
-  ],
-};
+const operation = makeOperationDefinition(
+  { scope: 'system' },
+  {
+    name: 'db-stats',
+    code: 'db-stats',
+    parameter: [
+      { use: 'in', name: 'shardId', type: 'string', min: 0, max: '1' },
+      { use: 'in', name: 'tableNames', type: 'string', min: 0, max: '1' },
+      { use: 'out', name: 'tableString', type: 'string', min: 1, max: '1' },
+    ],
+  }
+);
 
 export async function dbStatsHandler(req: FhirRequest): Promise<FhirResponse> {
   requireSuperAdmin();
 
-  const params = parseInputParameters<{ tableNames?: string }>(operation, req);
+  const params = parseInputParameters<{ shardId?: string; tableNames?: string }>(operation, req);
+  const shardId = getShardIdParam(params);
 
-  const client = getDatabasePool(DatabaseMode.WRITER);
+  const client = getDatabasePool(DatabaseMode.WRITER, shardId);
 
   const tableNames = params.tableNames?.split(',').map((name) => name.trim());
 

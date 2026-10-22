@@ -8,7 +8,10 @@ import type {
   Condition,
   Coverage,
   DiagnosticReport,
+  Goal,
+  Immunization,
   MedicationRequest,
+  MedicationStatement,
   Observation,
   ServiceRequest,
 } from '@medplum/fhirtypes';
@@ -22,6 +25,8 @@ import {
 } from '@tabler/icons-react';
 import type { ComponentType } from 'react';
 import { Allergies } from './Allergies';
+import { Goals } from './Goals';
+import { Immunizations } from './Immunizations';
 import { Insurance } from './Insurance';
 import { Labs } from './Labs';
 import { Medications } from './Medications';
@@ -46,57 +51,52 @@ import { Vitals } from './Vitals';
 export const DemographicsSection: PatientSummarySectionConfig = {
   key: 'demographics',
   title: 'Demographics',
-  component: ({ patient, onClickResource }: SectionRenderContext) => {
+  component: ({ patient, onClickResource, onEditPatient }: SectionRenderContext) => {
     const languageDisplay = getPreferredLanguage(patient);
+    const onClick = onEditPatient ?? (onClickResource ? () => onClickResource(patient) : undefined);
     return (
-      <Stack gap="xs" py={8}>
+      <Stack gap="xs" py="md">
         <PatientInfoItem
-          patient={patient}
           value={patient.birthDate ? `${patient.birthDate} (${calculateAgeString(patient.birthDate)})` : undefined}
           icon={<IconCake size={16} stroke={2} color="var(--mantine-color-gray-6)" />}
           placeholder="Add Birthdate"
           label="Birthdate & Age"
-          onClickResource={onClickResource}
+          onClick={onClick}
         />
         <PatientInfoItem
-          patient={patient}
           value={patient.gender ? formatPatientGenderDisplay(patient) : undefined}
           icon={<IconEmpathize size={16} stroke={2} color="var(--mantine-color-gray-6)" />}
           placeholder="Add Gender & Identity"
           label="Gender & Identity"
-          onClickResource={onClickResource}
+          onClick={onClick}
         />
         <PatientInfoItem
-          patient={patient}
           value={getRace(patient) || getEthnicity(patient) ? formatPatientRaceEthnicityDisplay(patient) : undefined}
           icon={<IconBinaryTree size={16} stroke={2} color="var(--mantine-color-gray-6)" />}
           placeholder="Add Race & Ethnicity"
           label="Race & Ethnicity"
-          onClickResource={onClickResource}
+          onClick={onClick}
         />
         <PatientInfoItem
-          patient={patient}
           value={patient.address?.[0] ? formatAddress(patient.address[0]) : undefined}
           icon={<IconMapPin size={16} stroke={2} color="var(--mantine-color-gray-6)" />}
           placeholder="Add Location"
           label="Location"
-          onClickResource={onClickResource}
+          onClick={onClick}
         />
         <PatientInfoItem
-          patient={patient}
           value={languageDisplay}
           icon={<IconLanguage size={16} stroke={2} color="var(--mantine-color-gray-6)" />}
           placeholder="Add Language"
           label="Language"
-          onClickResource={onClickResource}
+          onClick={onClick}
         />
         <PatientInfoItem
-          patient={patient}
           value={getGeneralPractitioner(patient)}
           icon={<IconStethoscope size={16} stroke={2} color="var(--mantine-color-gray-6)" />}
           placeholder="Add General Practitioner"
           label="General Practitioner"
-          onClickResource={onClickResource}
+          onClick={onClick}
         />
       </Stack>
     );
@@ -141,17 +141,41 @@ export const ProblemListSection: PatientSummarySectionConfig = {
   ),
 };
 
-/** Medications section — searches for MedicationRequest resources. */
+/** Medications section — searches for MedicationRequest and MedicationStatement resources. */
 export const MedicationsSection: PatientSummarySectionConfig = {
   key: 'medications',
   title: 'Medications',
-  searches: [{ key: 'medications', resourceType: 'MedicationRequest', patientParam: 'subject' }],
+  searches: [
+    { key: 'medicationRequests', resourceType: 'MedicationRequest', patientParam: 'subject' },
+    { key: 'medicationStatements', resourceType: 'MedicationStatement', patientParam: 'subject' },
+  ],
   component: ({ results, patient, onClickResource }: SectionRenderContext) => (
     <Medications
       patient={patient}
-      medicationRequests={(results['medications'] as MedicationRequest[]) || []}
+      medicationRequests={(results['medicationRequests'] as MedicationRequest[]) || []}
+      medicationStatements={(results['medicationStatements'] as MedicationStatement[]) || []}
       onClickResource={onClickResource}
     />
+  ),
+};
+
+/** Immunizations section — searches for Immunization resources. */
+export const ImmunizationsSection: PatientSummarySectionConfig = {
+  key: 'immunizations',
+  title: 'Immunizations',
+  searches: [{ key: 'immunizations', resourceType: 'Immunization', patientParam: 'patient' }],
+  component: ({ results, patient }: SectionRenderContext) => (
+    <Immunizations patient={patient} immunizations={(results['immunizations'] as Immunization[]) || []} />
+  ),
+};
+
+/** Goals section — searches for Goal resources. */
+export const GoalsSection: PatientSummarySectionConfig = {
+  key: 'goals',
+  title: 'Goals',
+  searches: [{ key: 'goals', resourceType: 'Goal', patientParam: 'patient' }],
+  component: ({ results, patient }: SectionRenderContext) => (
+    <Goals patient={patient} goals={(results['goals'] as Goal[]) || []} />
   ),
 };
 
@@ -260,10 +284,12 @@ export function getDefaultSections(onRequestLabs?: () => void): PatientSummarySe
     AllergiesSection,
     ProblemListSection,
     MedicationsSection,
+    ImmunizationsSection,
     createLabsSection(onRequestLabs),
     SexualOrientationSection,
     SmokingStatusSection,
     VitalsSection,
+    GoalsSection,
     PharmaciesSection,
   ];
 }

@@ -124,24 +124,19 @@ describe('GraphQL', () => {
     expect(outcome).toMatchObject(badRequest('GraphQL syntax error.'));
   });
 
-  test('Introspection forbidden', async () => {
-    // https://graphql.org/learn/introspection/
-    const fhirRouter = new FhirRouter({ introspectionEnabled: false });
-    const [outcome] = await graphqlHandler(
-      makeSimpleRequest('POST', '/fhir/R4/$graphql', {
-        query: `{
-          __schema {
-            types {
-              name
-            }
-          }
-        }`,
-      }),
-      repo,
-      fhirRouter
-    );
-    expect(outcome).toMatchObject(forbidden);
-  });
+  test.each<string>([`{ __schema {types {name} } }`, `{ __type(name:"Patient") { fields {name} } }`])(
+    'Introspection forbidden',
+    async (query) => {
+      // https://graphql.org/learn/introspection/
+      const fhirRouter = new FhirRouter({ introspectionEnabled: false });
+      const [outcome] = await graphqlHandler(
+        makeSimpleRequest('POST', '/fhir/R4/$graphql', { query }),
+        repo,
+        fhirRouter
+      );
+      expect(outcome).toMatchObject(forbidden);
+    }
+  );
 
   test('Introspection allowed', async () => {
     // https://graphql.org/learn/introspection/
@@ -155,6 +150,22 @@ describe('GraphQL', () => {
         }`,
     });
     const fhirRouter = new FhirRouter({ introspectionEnabled: true });
+    const res = await graphqlHandler(request, repo, fhirRouter);
+
+    expect(res[0]).toMatchObject(allOk);
+  });
+
+  test('Allows value introspection', async () => {
+    // https://graphql.org/learn/introspection/
+    const request = makeSimpleRequest('POST', '/fhir/R4/$graphql', {
+      query: `{
+        Patient(id: "${randomUUID()}") {
+          id
+          name { __typename given }
+        }
+      }`,
+    });
+    const fhirRouter = new FhirRouter({ introspectionEnabled: false });
     const res = await graphqlHandler(request, repo, fhirRouter);
 
     expect(res[0]).toMatchObject(allOk);
@@ -459,7 +470,7 @@ describe('GraphQL', () => {
     const fhirRouter = new FhirRouter();
     const res = await graphqlHandler(request, repo, fhirRouter);
     expect(res[0].issue?.[0]?.details?.text).toStrictEqual(
-      'Field "ObservationList" argument "_reference" of type "Patient_Observation_reference!" is required, but it was not provided.'
+      'Argument "Patient.ObservationList(_reference:)" of type "Patient_Observation_reference!" is required, but it was not provided.'
     );
   });
 
@@ -1168,7 +1179,7 @@ describe('GraphQL', () => {
     const fhirRouter = new FhirRouter();
     const res = await graphqlHandler(request, repo, fhirRouter);
     expect(res[0]?.issue?.[0]?.details?.text).toStrictEqual(
-      'Field "PatientUpdate" argument "res" of type "PatientCreate!" is required, but it was not provided.'
+      'Argument "MutationType.PatientUpdate(res:)" of type "PatientCreate!" is required, but it was not provided.'
     );
   });
 
@@ -1430,7 +1441,7 @@ describe('GraphQL', () => {
     const res = await graphqlHandler(request, repo, fhirRouter);
     // GraphQL validation happens before our resolver, so we get a validation error in the OperationOutcome
     expect(res[0]?.issue?.[0]?.details?.text).toMatch(
-      /Field "PatientPatch" argument "patch" of type "\[PatchOperationInput!\]!" is required/
+      `Argument "MutationType.PatientPatch(patch:)" of type "[PatchOperationInput!]!" is required`
     );
   });
 
@@ -1454,7 +1465,7 @@ describe('GraphQL', () => {
     const res = await graphqlHandler(request, repo, fhirRouter);
     // GraphQL type validation catches this before our resolver
     expect(res[0]?.issue?.[0]?.details?.text).toMatch(
-      /Expected value of type "\[PatchOperationInput!\]!", found "not-an-array"/
+      /Expected value of type "PatchOperationInput" to be an object, found: "not-an-array"/
     );
   });
 });

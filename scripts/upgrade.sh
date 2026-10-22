@@ -83,7 +83,8 @@ echo "Last completed step: $LAST_STEP"
 # Exclude known problem packages
 # ioredis - v5.9.x broke BullMQ, holding off on updating until late Jan 2026
 # pdfmake, @types/pdfmake - v0.3.x introduced breaking changes to the API
-EXCLUDE="ioredis pdfmake @types/pdfmake"
+# vitest-websocket-mock - Newer versions changed the way they extend vitest, causing typing issues
+EXCLUDE="ioredis pdfmake @types/pdfmake vitest-websocket-mock"
 
 # Append any additional excludes from the command line
 if [ -n "$ADDITIONAL_EXCLUDES" ]; then
@@ -95,13 +96,13 @@ fi
 # commander - v13 has backwards-incompatible changes which require a decent amount of refactoring to get our current code to work. We are considering migrating off of commander but for now we should just freeze it
 # eslint - version 10 is incompatible with some plugins we use, holding back until we can upgrade all at once and test
 # hibp - version 15 is ESM-only and we can't use it until we configure Jest/Babel to work with ESM packages
-# jose - version 6+ requires ESM (depending on the precise NodeJS version), holding back until server supports ESM
 # node-fetch - version 3+ requires ESM, holding back until server supports ESM
 # zod - version 4+ is incompatible with MCP SDK
 # otplib - version 13+ requires ESM, holding back until server supports ESM
-# temporal-polyfill - version 1.0.0 is actually an old version, holding back to 0.3.0 which is the latest stable version
 # @mantine/* - version 9 has a few small backwards-incompatible changes, namely affecting at least our `PatientSummary` component, which would make it hard to support both Mantine 8 and 9 simultaneously
-MAJOR_EXCLUDE="@types/node @types/node-fetch commander eslint hibp jose node-fetch npm zod otplib temporal-polyfill @mantine/*"
+# typescript - v7 needs us to do some work before we can use it
+# vitest - v5 needs to wait until our mock libraries can catch up on compatibility
+MAJOR_EXCLUDE="@types/node @types/node-fetch commander eslint hibp node-fetch npm zod otplib @mantine/* typescript vitest @vitest/coverage-v8 @vitest/ui"
 
 if [ "$LAST_STEP" -lt 1 ]; then
     # First, only upgrade patch and minor versions
@@ -114,6 +115,9 @@ if [ "$LAST_STEP" -lt 1 ]; then
     # "minor" - Upgrade to the highest minor version without bumping the major version
     # `enginesNode` makes sure that packages can be run against the node requirement specified in the monorepo "engines.node"
     npx npm-check-updates --workspaces --root --upgrade --no-deprecated --cooldown "$COOLDOWN" --reject "$EXCLUDE" --target minor --enginesNode
+
+    # Re-pin packageManager (with its integrity hash) in case ncu bumped it
+    corepack use $(node -p "require('./package.json').packageManager")
 
     # Commit and push before running NPM install
     git add -u .
@@ -155,6 +159,9 @@ if [ "$LAST_STEP" -lt 3 ]; then
     # "latest" - Upgrade to whatever the package's "latest" git tag points to.
     # `enginesNode` makes sure that packages can be run against the node requirement specified in the monorepo "engines.node"
     npx npm-check-updates --workspaces --root --upgrade --no-deprecated --cooldown "$COOLDOWN" --reject "$EXCLUDE $MAJOR_EXCLUDE" --target greatest --pre 0 --enginesNode
+
+    # Re-pin packageManager (with its integrity hash) in case ncu bumped it
+    corepack use $(node -p "require('./package.json').packageManager")
 
     # Check for changes in the working directory
     if git diff --quiet; then

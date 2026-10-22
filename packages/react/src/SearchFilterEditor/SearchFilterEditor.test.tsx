@@ -5,7 +5,7 @@ import { Operator } from '@medplum/core';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import type { ReactNode } from 'react';
-import { act, fireEvent, render, screen, waitFor } from '../test-utils/render';
+import { act, fireEvent, render, screen, typeInAutocomplete, waitFor } from '../test-utils/render';
 import { SearchFilterEditor } from './SearchFilterEditor';
 
 const medplum = new MockClient();
@@ -18,19 +18,19 @@ async function setup(child: ReactNode): Promise<void> {
 
 describe('SearchFilterEditor', () => {
   beforeEach(() => {
-    jest.useFakeTimers();
+    vi.useFakeTimers();
   });
 
   afterEach(async () => {
     await act(async () => {
-      jest.runOnlyPendingTimers();
+      vi.runOnlyPendingTimers();
     });
-    jest.useRealTimers();
+    vi.useRealTimers();
   });
 
   test('Not visible', async () => {
     await setup(
-      <SearchFilterEditor search={{ resourceType: 'Patient' }} visible={false} onOk={jest.fn()} onCancel={jest.fn()} />
+      <SearchFilterEditor search={{ resourceType: 'Patient' }} visible={false} onOk={vi.fn()} onCancel={vi.fn()} />
     );
 
     expect(screen.queryByTestId('filter-field')).toBeNull();
@@ -100,7 +100,7 @@ describe('SearchFilterEditor', () => {
         {
           code: 'organization',
           operator: Operator.EQUALS,
-          value: 'Organization/123',
+          value: 'Organization/125',
         },
       ],
     };
@@ -115,7 +115,7 @@ describe('SearchFilterEditor', () => {
     );
 
     await act(async () => {
-      jest.advanceTimersByTime(200);
+      vi.advanceTimersByTime(200);
     });
 
     // Wait for the resource to load
@@ -128,24 +128,10 @@ describe('SearchFilterEditor', () => {
     });
 
     const input = screen.getAllByRole('searchbox')[0] as HTMLInputElement;
-    await act(async () => {
-      fireEvent.change(input, { target: { value: 'Different' } });
-    });
-
-    // Wait for the drop down
-    await act(async () => {
-      jest.advanceTimersByTime(200);
-    });
-
-    expect(screen.getByText('Different')).toBeInTheDocument();
-
-    // Press the down arrow
+    await typeInAutocomplete(input, 'Different');
+    expect(await screen.findByText('Different')).toBeInTheDocument();
     await act(async () => {
       fireEvent.keyDown(input, { key: 'ArrowDown', code: 'ArrowDown' });
-    });
-
-    // Press "Enter"
-    await act(async () => {
       fireEvent.keyDown(input, { key: 'Enter', code: 'Enter' });
     });
 
@@ -251,7 +237,7 @@ describe('SearchFilterEditor', () => {
       />
     );
 
-    expect(screen.queryByDisplayValue('not-a-code')).not.toBeInTheDocument();
+    expect(screen.queryByDisplayValue('not-a-code')).toBeNull();
   });
 
   test('_lastUpdated filter', async () => {
@@ -277,10 +263,32 @@ describe('SearchFilterEditor', () => {
     );
 
     // Wait for the resource to load
-    await waitFor(() => screen.queryAllByText('Last Updated').length > 0);
+    await waitFor(() => screen.queryAllByText('_lastUpdated').length > 0);
 
     const input = screen.getByTestId<HTMLInputElement>('filter-0-row-filter-value');
     expect(input.value).toMatch(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})$/);
+  });
+
+  test('Meta fields are disambiguated from same-named elements', async () => {
+    // ProjectMembership has both `project`/`profile` elements and `_project`/`_profile` meta fields.
+    const currSearch: SearchRequest = {
+      resourceType: 'ProjectMembership',
+      filters: [{ code: '', operator: Operator.EQUALS, value: '' }],
+    };
+
+    await setup(<SearchFilterEditor search={currSearch} visible={true} onOk={vi.fn()} onCancel={vi.fn()} />);
+
+    const fieldInput = screen.getByTestId<HTMLSelectElement>('filter-0-row-filter-field');
+    const optionLabels = Array.from(fieldInput.options).map((o) => o.textContent);
+
+    expect(optionLabels.filter((label) => label === 'Project')).toHaveLength(1);
+    expect(optionLabels.filter((label) => label === '_project')).toHaveLength(1);
+    expect(optionLabels.filter((label) => label === 'Profile')).toHaveLength(1);
+    expect(optionLabels.filter((label) => label === '_profile')).toHaveLength(1);
+
+    const groups = Array.from(fieldInput.querySelectorAll('optgroup')).map((g) => g.label);
+    expect(groups).toContain('Fields');
+    expect(groups).toContain('Metadata');
   });
 
   test('Quantity filter', async () => {

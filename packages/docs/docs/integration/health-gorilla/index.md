@@ -13,7 +13,9 @@ Need help? This is an advanced integration. [Contact our team](mailto:info+healt
 
 This guide provides an overview of Medplum's Health Gorilla labs integration and a list of recommendations for systemizing lab ordering.
 
-For more information about the FHIR resources involved in the integration, see [Sending Orders](/docs/integration/health-gorilla/sending-orders) and [Receiving Results](/docs/integration/health-gorilla/receiving-results). See our [Changelog](/docs/integration/health-gorilla/hg-changelog) for information about integration upgrades.
+Choose one ordering interface for your workflow: build a form with Medplum's [React components and `useHealthGorillaLabOrder` hook](./sending-orders.md#creating-an-order-form-in-react), or embed Health Gorilla's hosted interface using the [`health-gorilla-iframe` bot](./iframe.md). The iframe is optional; you do not need both approaches. Results arrive through the API integration with either approach.
+
+For more information about the FHIR resources involved in the integration, see [Sending Orders](/docs/integration/health-gorilla/sending-orders) and [Receiving Results](/docs/integration/health-gorilla/receiving-results). To backfill or recover results that were not delivered by webhook, see [Sync Resources from Health Gorilla](/docs/integration/health-gorilla/sync-resources-from-health-gorilla). See our [Changelog](/docs/integration/health-gorilla/hg-changelog) for information about integration upgrades.
 
 ## Prerequisites
 
@@ -21,6 +23,20 @@ In order to integrate with Health Gorilla for labs, your organization must:
 
 - Be a provider organization, i.e. with a clinician licensed to review lab orders,
 - Have an account number with a [connected lab](https://developer.healthgorilla.com/docs/list-of-connected-labs), such as Quest or LabCorp.
+
+## Lab Integration Eligibility: Do I Qualify?
+
+Medplum integrates with labs like Labcorp and Quest Diagnostics through Health Gorilla to bring lab ordering and results directly into your workflow. Before we can submit a request for an API connection between your lab and Health Gorilla on your behalf, there are a few things worth confirming so the process goes smoothly.
+
+### Eligibility Checklist
+
+- **An existing relationship with a lab rep**: Setting up this API connection ultimately depends on your lab representative approving and processing the request on the lab's side. Before starting, you should already have an account with the lab and a point of contact there. We'll ask you to loop them in directly once the request is submitted, so having that relationship in place ahead of time avoids delays.
+- **Transaction volume**: Labs generally require a minimum order volume to justify standing up a dedicated API connection. If your organization doesn't yet meet a lab's internal volume threshold, they may deny the request outright. If you're not sure whether you meet this bar, your lab rep can tell you.
+- **Parallel Interface Support**: If your lab account is used with an existing API-based connection to another EHR, you may also want to check with your lab rep that the new API-based connection will not impact any existing ones. This is usually possible, but worth confirming with your lab rep.
+
+### What Happens Next
+
+If you meet the criteria above, reach out to your Medplum contact to start the process. We'll create your Health Gorilla tenant, collect your lab details, and submit the API connection request - but note that lab-side timelines vary, and your involvement (especially with your lab rep) is often the key to moving things along.
 
 ## Requisite information for successful lab order
 
@@ -124,6 +140,8 @@ To avoid this and ensure results are properly matched to the correct patient:
 By doing this, the `receive-from-health-gorilla` bot will successfully match the incoming result's Placer/Accession number to the placeholder order, automatically linking the result to the correct patient and avoiding unsolicited reports.
 
 #### 3. Ordering from Medplum
+
+You can embed Health Gorilla's hosted ordering interface using the [Lab Ordering iFrame](./iframe.md) bot, or build a custom order form with Medplum's React components.
 
 In the final phase, you transition to placing lab orders directly from your Medplum application. To accelerate the development of the ordering interface, you can use the [`useHealthGorillaLabOrder` hook](./sending-orders.md#creating-an-order-form-in-react) from the `@medplum/health-gorilla-react` package. This headless UI hook helps manage the complex state required for creating an order, including searching and selecting lab tests, answering Ask on Entry (AOE) questions, and completing the order workflow.
 

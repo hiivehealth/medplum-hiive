@@ -1,7 +1,5 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { badRequest } from '@medplum/core';
-import type { OperationOutcome, Project } from '@medplum/fhirtypes';
 import { Router } from 'express';
 import { authenticateRequest } from '../oauth/middleware';
 import { changePasswordHandler, changePasswordValidator } from './changepassword';
@@ -16,13 +14,14 @@ import { mfaRouter } from './mfa';
 import { newPatientHandler, newPatientValidator } from './newpatient';
 import { newProjectHandler, newProjectValidator } from './newproject';
 import { newUserHandler, newUserValidator } from './newuser';
+import { preAuthorizeHandler, preAuthorizeValidator } from './preauthorize';
 import { profileHandler, profileValidator } from './profile';
 import { resetPasswordHandler, resetPasswordValidator } from './resetpassword';
 import { revokeHandler, revokeValidator } from './revoke';
 import { scopeHandler, scopeValidator } from './scope';
 import { setPasswordHandler, setPasswordValidator } from './setpassword';
 import { statusHandler, statusValidator } from './status';
-import { validateRecaptcha } from './utils';
+import { projectRegistrationAllowed, validateRecaptcha } from './utils';
 import { verifyEmailHandler, verifyEmailValidator } from './verifyemail';
 
 export const authRouter = Router();
@@ -43,12 +42,6 @@ authRouter.post('/verifyemail', verifyEmailValidator, verifyEmailHandler);
 authRouter.post('/google', googleValidator, googleHandler);
 authRouter.post('/exchange', exchangeValidator, exchangeHandler);
 authRouter.post('/revoke', authenticateRequest, revokeValidator, revokeHandler);
+authRouter.post('/preauthorize', authenticateRequest, preAuthorizeValidator, preAuthorizeHandler);
 authRouter.get('/login/:login', statusValidator, statusHandler);
 authRouter.get('/clientinfo/:clientId', clientInfoHandler);
-
-function projectRegistrationAllowed(project: Project): OperationOutcome | undefined {
-  if (!project.defaultPatientAccessPolicy) {
-    return badRequest('Project does not allow open registration');
-  }
-  return undefined;
-}

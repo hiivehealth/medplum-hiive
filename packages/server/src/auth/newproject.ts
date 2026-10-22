@@ -1,15 +1,18 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { badRequest } from '@medplum/core';
-import type { Login, Reference, User } from '@medplum/fhirtypes';
+import { Operator, badRequest, getReferenceString } from '@medplum/core';
+import type { Login, Project, Reference, User } from '@medplum/fhirtypes';
 import type { Request, Response } from 'express';
 import { body } from 'express-validator';
+import { getConfig } from '../config/loader';
 import { createProject } from '../fhir/operations/projectinit';
 import { sendOutcome } from '../fhir/outcomes';
 import { getGlobalSystemRepo } from '../fhir/repo';
 import { setLoginMembership } from '../oauth/utils';
 import { makeValidationMiddleware } from '../util/validator';
+import { sendVerificationEmail } from './newuser';
 import { sendLoginResult } from './utils';
+import { sendWelcomeEmail } from './welcomeemail';
 
 export interface NewProjectRequest {
   readonly loginId: string;
@@ -29,6 +32,13 @@ export const newProjectValidator = makeValidationMiddleware([
  * @param res - The HTTP response.
  */
 export async function newProjectHandler(req: Request, res: Response): Promise<void> {
+  const config = getConfig();
+  if (config.registerEnabled === false) {
+    // Explicitly check for "false" because the config value may be undefined
+    sendOutcome(res, badRequest('Registration is disabled'));
+    return;
+  }
+
   const systemRepo = getGlobalSystemRepo();
   const login = await systemRepo.readResource<Login>('Login', req.body.login);
 
@@ -37,9 +47,39 @@ export async function newProjectHandler(req: Request, res: Response): Promise<vo
     return;
   }
 
-  const projectName = req.body.projectName;
   const user = await systemRepo.readReference<User>(login.user as Reference<User>);
-  const { membership } = await createProject(projectName, user);
+
+  if (config.requireVerifiedEmailForProjectCreation && !user.emailVerified) {
+    // This is the only gate on `emailVerified`, and users reach it by paths that never
+    // offer a verification link: an existing member creating a second project arrives
+    // via the login status endpoint, not registration. Send the link here so the
+    // requirement is actionable rather than a dead end.
+    await sendVerificationEmail(user, login);
+    sendOutcome(
+      res,
+      badRequest('Email verification is required to create a project. Check your email for a verification link.')
+    );
+    return;
+  }
+
+  // Determine whether this is the user's first project (before creating the new
+  // one) so we only welcome first-time project owners.
+  const existingProject = await systemRepo.searchOne<Project>({
+    resourceType: 'Project',
+    filters: [{ code: 'owner', operator: Operator.EQUALS, value: getReferenceString(user) }],
+  });
+  const isFirstProject = !existingProject;
+
+  const projectName = req.body.projectName;
+  const { project, membership } = await createProject(projectName, user);
   const updatedLogin = await setLoginMembership(login, membership);
+
+  // Send a welcome email, but only for the user's first project. This is
+  // best-effort: any failure is logged inside sendWelcomeEmail and never blocks
+  // registration.
+  if (isFirstProject) {
+    await sendWelcomeEmail(systemRepo, project, user);
+  }
+
   await sendLoginResult(res, updatedLogin);
 }

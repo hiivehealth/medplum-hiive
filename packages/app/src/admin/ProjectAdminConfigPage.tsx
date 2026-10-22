@@ -1,10 +1,11 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import { Button, Divider, PasswordInput, Stack, Text, TextInput, Title } from '@mantine/core';
+import { Button, Divider, Stack, Text, TextInput, Title } from '@mantine/core';
 import { showNotification } from '@mantine/notifications';
 import { forbidden, normalizeErrorString } from '@medplum/core';
-import { Document, Form, OperationOutcomeAlert, useMedplum } from '@medplum/react';
+import { Document, Form, OperationOutcomeAlert, PasswordInput, useMedplum } from '@medplum/react';
 import type { JSX } from 'react';
+import { RescopeUserWidget } from './RescopeUserWidget';
 
 export function ProjectAdminConfigPage(): JSX.Element {
   const medplum = useMedplum();
@@ -37,6 +38,8 @@ export function ProjectAdminConfigPage(): JSX.Element {
           <Button type="submit">Force Set Password</Button>
         </Stack>
       </Form>
+      <Divider my="lg" />
+      <RescopeUserWidget />
     </Document>
   );
 }

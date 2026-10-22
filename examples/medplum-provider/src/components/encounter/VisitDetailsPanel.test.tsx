@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { MantineProvider } from '@mantine/core';
-import type { WithId } from '@medplum/core';
-import type { Encounter, Practitioner } from '@medplum/fhirtypes';
+import type { PatchOperation, WithId } from '@medplum/core';
+import type { Encounter, Location, Organization, Practitioner } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react';
 import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
@@ -41,7 +41,12 @@ describe('VisitDetailsPanel', () => {
       <MemoryRouter>
         <MedplumProvider medplum={medplum}>
           <MantineProvider>
-            <VisitDetailsPanel encounter={mockEncounter} onEncounterChange={vi.fn()} {...props} />
+            <VisitDetailsPanel
+              encounter={mockEncounter}
+              onEncounterChange={vi.fn()}
+              onBillingOrganizationChange={vi.fn()}
+              {...props}
+            />
           </MantineProvider>
         </MedplumProvider>
       </MemoryRouter>
@@ -103,13 +108,13 @@ describe('VisitDetailsPanel', () => {
     // Find the ResourceInput searchbox (ResourceInput uses AsyncAutocomplete which renders a searchbox)
     await waitFor(
       () => {
-        const searchbox = screen.queryByRole('searchbox');
+        const searchbox = screen.queryByPlaceholderText('Search for practitioner');
         expect(searchbox).toBeInTheDocument();
       },
       { timeout: 3000 }
     );
 
-    const practitionerInput = screen.getByRole('searchbox');
+    const practitionerInput = screen.getByPlaceholderText('Search for practitioner');
 
     // Type to search for a practitioner using fireEvent.change (like PlanDefinitionBuilder)
     await act(async () => {
@@ -143,17 +148,164 @@ describe('VisitDetailsPanel', () => {
       fireEvent.click(smithOption);
     });
 
-    // Verify onEncounterChange was called with updated encounter
+    // Verify onEncounterChange was called with a participant patch
     await waitFor(
       () => {
         expect(onEncounterChange).toHaveBeenCalled();
         const call = onEncounterChange.mock.calls[onEncounterChange.mock.calls.length - 1];
-        const updatedEncounter = call[0] as Encounter;
-        expect(updatedEncounter.participant).toBeDefined();
-        expect(updatedEncounter.participant?.[0]?.individual?.reference).toBe('Practitioner/practitioner-2');
+        const ops = call[0] as PatchOperation[];
+        expect(ops).toEqual([
+          {
+            op: 'add',
+            path: '/participant',
+            value: [{ individual: expect.objectContaining({ reference: 'Practitioner/practitioner-2' }) }],
+          },
+        ]);
       },
       { timeout: 5000 }
     );
+  });
+
+  test('calls onBillingOrganizationChange when billing organization is changed', async () => {
+    const onBillingOrganizationChange = vi.fn();
+
+    const mockOrganization: Organization = {
+      resourceType: 'Organization',
+      id: 'org-1',
+      name: 'Test Medical Practice',
+      identifier: [{ system: 'https://www.medplum.com/provider', value: 'billing-organization' }],
+      address: [{ line: ['1 Main St'], city: 'Springfield', state: 'IL', postalCode: '62701' }],
+    };
+
+    await medplum.createResource(mockOrganization);
+
+    vi.spyOn(medplum, 'searchResources').mockResolvedValue([mockOrganization] as any);
+
+    setup({ onBillingOrganizationChange });
+
+    await waitFor(
+      () => {
+        expect(screen.queryByPlaceholderText('Search for organization')).toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
+
+    const organizationInput = screen.getByPlaceholderText('Search for organization');
+
+    await act(async () => {
+      fireEvent.change(organizationInput, { target: { value: 'Test Medical' } });
+    });
+
+    // The search is restricted to billing organizations, as in the visit's eligibility check
+    await waitFor(
+      () => {
+        expect(medplum.searchResources).toHaveBeenCalledWith(
+          'Organization',
+          expect.any(URLSearchParams),
+          expect.any(Object)
+        );
+        const calls = (medplum.searchResources as ReturnType<typeof vi.fn>).mock.calls;
+        const orgCall = calls.find((call) => call[0] === 'Organization');
+        const params = orgCall?.[1] as URLSearchParams;
+        expect(params.get('identifier')).toBe('https://www.medplum.com/provider|billing-organization');
+        expect(params.get('type')).toBeNull();
+      },
+      { timeout: 3000 }
+    );
+
+    // Dropdown options show the organization name and its address
+    await waitFor(
+      () => {
+        expect(screen.queryByText(/Test Medical Practice/i)).toBeInTheDocument();
+        expect(screen.queryByText(/1 Main St/i)).toBeInTheDocument();
+      },
+      { timeout: 3000 }
+    );
+
+    await act(async () => {
+      fireEvent.click(screen.getByText(/Test Medical Practice/i));
+    });
+
+    await waitFor(
+      () => {
+        expect(onBillingOrganizationChange).toHaveBeenCalled();
+        const call = onBillingOrganizationChange.mock.calls[onBillingOrganizationChange.mock.calls.length - 1];
+        expect((call[0] as Organization).id).toBe('org-1');
+      },
+      { timeout: 5000 }
+    );
+  });
+
+  test('patches the encounter location when a service facility is selected', async () => {
+    const onEncounterChange = vi.fn();
+    const clinic: Location = {
+      resourceType: 'Location',
+      id: 'loc-1',
+      name: 'Main Clinic',
+      address: { line: ['9 Clinic St'], city: 'Cambridge', state: 'MA', postalCode: '02139' },
+    };
+    await medplum.createResource(clinic);
+    vi.spyOn(medplum, 'searchResources').mockResolvedValue([clinic] as any);
+
+    setup({ onEncounterChange });
+
+    const facilityInput = await screen.findByPlaceholderText('Search for location');
+    await act(async () => {
+      fireEvent.change(facilityInput, { target: { value: 'Main' } });
+    });
+
+    // Dropdown options show the location name and its address
+    await waitFor(() => {
+      expect(medplum.searchResources).toHaveBeenCalledWith('Location', expect.any(URLSearchParams), expect.any(Object));
+      expect(screen.getByText('9 Clinic St, Cambridge, MA, 02139')).toBeInTheDocument();
+    });
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('Main Clinic'));
+    });
+
+    await waitFor(() => {
+      expect(onEncounterChange).toHaveBeenLastCalledWith([
+        {
+          op: 'add',
+          path: '/location',
+          value: [{ location: expect.objectContaining({ reference: 'Location/loc-1' }) }],
+        },
+      ]);
+    });
+  });
+
+  test('shows the current service facility and removes it when cleared', async () => {
+    const onEncounterChange = vi.fn();
+    await medplum.createResource<Location>({ resourceType: 'Location', id: 'loc-1', name: 'Main Clinic' });
+
+    // No practitioner, so the only clear button belongs to the service facility picker
+    setup({
+      onEncounterChange,
+      encounter: { ...mockEncounter, location: [{ location: { reference: 'Location/loc-1' } }] },
+    });
+
+    expect(await screen.findByText('Main Clinic')).toBeInTheDocument();
+
+    await act(async () => {
+      fireEvent.click(screen.getByTitle('Clear all'));
+    });
+
+    expect(onEncounterChange).toHaveBeenLastCalledWith([{ op: 'remove', path: '/location' }]);
+  });
+
+  test('displays the default billing organization', async () => {
+    await medplum.createResource<Organization>({
+      resourceType: 'Organization',
+      id: 'org-default',
+      name: 'Default Billing Org',
+    });
+
+    setup({ billingOrganization: { reference: 'Organization/org-default' } });
+
+    await waitFor(() => {
+      expect(screen.getByText('Default Billing Org')).toBeInTheDocument();
+    });
   });
 
   test('calls onEncounterChange when check in time is changed', async () => {

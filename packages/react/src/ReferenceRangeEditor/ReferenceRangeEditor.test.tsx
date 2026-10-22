@@ -5,7 +5,6 @@ import type { ObservationDefinition } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
 import { StrictMode } from 'react';
-import { MemoryRouter } from 'react-router';
 import { HDLDefinition, TestosteroneDefinition } from '../stories/referenceLab';
 import { act, fireEvent, render, screen } from '../test-utils/render';
 import type { ReferenceRangeEditorProps } from './ReferenceRangeEditor';
@@ -17,11 +16,9 @@ async function setup(args: ReferenceRangeEditorProps): Promise<void> {
   await act(async () => {
     render(
       <StrictMode>
-        <MemoryRouter>
-          <MedplumProvider medplum={medplum}>
-            <ReferenceRangeEditor {...args} />
-          </MedplumProvider>
-        </MemoryRouter>
+        <MedplumProvider medplum={medplum}>
+          <ReferenceRangeEditor {...args} />
+        </MedplumProvider>
       </StrictMode>
     );
   });
@@ -36,7 +33,7 @@ describe('ReferenceRangeEditor', () => {
       definition: {
         resourceType: 'ObservationDefinition',
       } as ObservationDefinition,
-      onSubmit: jest.fn(),
+      onSubmit: vi.fn(),
     });
     const checkAddButton = screen.getByTitle('Add Group');
     expect(screen.getByTestId('reference-range-editor')).toBeDefined();
@@ -48,7 +45,7 @@ describe('ReferenceRangeEditor', () => {
    * Add group with no filters. Make sure value looks ok
    */
   test('Add and Remove group', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: {
         resourceType: 'ObservationDefinition',
@@ -71,7 +68,7 @@ describe('ReferenceRangeEditor', () => {
    * Add group with no filters. Make sure value looks ok
    */
   test('Add Empty Group', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: {
         resourceType: 'ObservationDefinition',
@@ -104,7 +101,7 @@ describe('ReferenceRangeEditor', () => {
    * Create a group 'hole'. Make sure ids are monotonic
    */
   test('Non-sequential groups', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: {
         resourceType: 'ObservationDefinition',
@@ -131,7 +128,7 @@ describe('ReferenceRangeEditor', () => {
    * Modify HDL gender filter. Make sure submitted value reflects filter
    */
   test('Set Gender Filter', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -153,7 +150,7 @@ describe('ReferenceRangeEditor', () => {
    * Modify HDL age filter. Make sure submitted value reflects filter
    */
   test('Set Age Filter', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -180,7 +177,7 @@ describe('ReferenceRangeEditor', () => {
    * Modify HDL endocrine filter. Make sure submitted value reflects filter
    */
   test('Set Endocrine Filter', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -205,7 +202,7 @@ describe('ReferenceRangeEditor', () => {
    * Modify null HDL filter to a value to something and back to null. Make sure resulting values are "undefined"
    */
   test('Set Null Filter', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -238,7 +235,7 @@ describe('ReferenceRangeEditor', () => {
    * Modify category filter. Make sure submitted value reflects filter
    */
   test('Set Category Filter', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -261,7 +258,7 @@ describe('ReferenceRangeEditor', () => {
    * Add an interval, and ensure that unit is pre-populated
    */
   test('Add Interval', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -280,7 +277,7 @@ describe('ReferenceRangeEditor', () => {
    * Add an interval with existing filters, and ensure that filters propagate
    */
   test('Add Interval w/ filters', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     const definition = deepClone(HDLDefinition);
     definition.qualifiedInterval = definition.qualifiedInterval?.map((interval) => ({
       ...interval,
@@ -315,7 +312,7 @@ describe('ReferenceRangeEditor', () => {
    * Remove an interval. Test Submitted Observation def
    */
   test('Remove Interval', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -359,7 +356,7 @@ describe('ReferenceRangeEditor', () => {
     if (definition.qualifiedInterval?.[2]) {
       definition.qualifiedInterval[2].id = 'id-21';
     }
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
 
     await setup({
       definition,
@@ -394,7 +391,7 @@ describe('ReferenceRangeEditor', () => {
     if (definition.qualifiedInterval?.[2]) {
       definition.qualifiedInterval[2].id = 'id-2';
     }
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
 
     await setup({
       definition,
@@ -412,7 +409,7 @@ describe('ReferenceRangeEditor', () => {
    * Modify HDL value. Make sure submitted interval reflects change
    */
   test('Update Range', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -429,7 +426,7 @@ describe('ReferenceRangeEditor', () => {
    * Modify HDL condition. Make sure submitted interval reflects change
    */
   test('Update Condition', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: HDLDefinition,
       onSubmit,
@@ -451,7 +448,7 @@ describe('ReferenceRangeEditor', () => {
    * Make sure updating one group's filters does not affect the others
    */
   test('Update Multiple Group Filters', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: deepClone(TestosteroneDefinition),
       onSubmit,
@@ -498,7 +495,7 @@ describe('ReferenceRangeEditor', () => {
    * Update one group's filters to match another group. Make sure no other groups are affected
    */
   test('Overlapping Group Filters', async () => {
-    const onSubmit = jest.fn();
+    const onSubmit = vi.fn();
     await setup({
       definition: deepClone(TestosteroneDefinition),
       onSubmit,

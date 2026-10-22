@@ -11,6 +11,7 @@ import {
   isString,
   OperationOutcomeError,
   projectAdminResourceTypes,
+  readInteractions,
   resolveId,
 } from '@medplum/core';
 import type {
@@ -28,6 +29,7 @@ import { getLogger } from '../logger';
 import type { AuthState } from '../oauth/middleware';
 import type { SystemRepository } from './repo';
 import { getGlobalSystemRepo, getProjectSystemRepo, Repository } from './repo';
+import { PLACEHOLDER_SHARD_ID } from './sharding';
 import { applySmartScopes } from './smart';
 
 export type PopulatedAccessPolicy = AccessPolicy & { resource: AccessPolicyResource[] };
@@ -39,18 +41,27 @@ export type PopulatedAccessPolicy = AccessPolicy & { resource: AccessPolicyResou
  * This method ensures that the repository is setup correctly.
  * @param authState - The authentication state.
  * @param extendedMode - Optional flag to enable extended mode for custom Medplum properties.
+ * @param remoteAddress - Optional current request IP, used for AuditEvents instead of `login.remoteAddress`
+ *   (which is only as fresh as the last token issuance/refresh).
  * @returns A repository configured for the login details.
  */
-export async function getRepoForLogin(authState: AuthState, extendedMode?: boolean): Promise<Repository> {
-  const { login, membership: realMembership, onBehalfOfMembership } = authState;
+export async function getRepoForLogin(
+  authState: AuthState,
+  extendedMode?: boolean,
+  remoteAddress?: string
+): Promise<Repository> {
+  const { login, membership: realMembership, onBehalfOfMembership, project: realProject } = authState;
   const membership = onBehalfOfMembership ?? realMembership;
   const accessPolicy = await getAccessPolicyForLogin(authState);
 
-  const globalSystemRepo = getGlobalSystemRepo();
   let profile: WithId<ProfileResource | Bot | ClientApplication> | undefined = authState.profile;
   if (!profile) {
     try {
-      profile = await globalSystemRepo.readReference<ProfileResource | Bot | ClientApplication>(realMembership.profile);
+      // project system repo since not all ProfileResource types are global
+      const realProjectSystemRepo = await getProjectSystemRepo(realProject);
+      profile = await realProjectSystemRepo.readReference<ProfileResource | Bot | ClientApplication>(
+        realMembership.profile
+      );
     } catch (err: unknown) {
       if (!(err instanceof OperationOutcomeError && isNotFound(err.outcome))) {
         throw err;
@@ -58,11 +69,42 @@ export async function getRepoForLogin(authState: AuthState, extendedMode?: boole
     }
   }
 
-  let project = authState.project;
+  let project = realProject;
+  let globalSystemRepo: SystemRepository | undefined;
   if (membership.project.reference !== realMembership.project.reference) {
+    globalSystemRepo = getGlobalSystemRepo();
     project = await globalSystemRepo.readReference<Project>(membership.project);
   }
 
+  const allowedProjects = await getAllowedProjects(project, globalSystemRepo);
+
+  return new Repository({
+    routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
+    projects: allowedProjects,
+    author: profile ? createReference(profile) : realMembership.profile,
+    remoteAddress: remoteAddress ?? login.remoteAddress,
+    superAdmin: project.superAdmin,
+    projectAdmin: membership.admin,
+    accessPolicy,
+    strictMode: project.strictMode,
+    extendedMode,
+    checkReferencesOnWrite: project.checkReferencesOnWrite,
+    validateTerminology: project.features?.includes('validate-terminology'),
+    onBehalfOf: authState.onBehalfOf ? createReference(authState.onBehalfOf) : undefined,
+    client: login.client,
+  });
+}
+
+/**
+ * Resolves a project and the projects it links to, which its members may read from.
+ * @param project - The project whose links to resolve.
+ * @param systemRepo - Optional system repository used to read projects
+ * @returns The project followed by each linked project that could be read.
+ */
+export async function getAllowedProjects(
+  project: WithId<Project>,
+  systemRepo?: SystemRepository
+): Promise<WithId<Project>[]> {
   const allowedProjects: WithId<Project>[] = [project];
   if (project.link) {
     const linkedProjectRefs: Reference<Project>[] = [];
@@ -72,8 +114,9 @@ export async function getRepoForLogin(authState: AuthState, extendedMode?: boole
       }
     }
 
-    const systemRepo = await getProjectSystemRepo(project);
-    const linkedProjectsOrError = await systemRepo.readReferences<Project>(linkedProjectRefs);
+    const linkedProjectsOrError = await (systemRepo ?? getGlobalSystemRepo()).readReferences<Project>(
+      linkedProjectRefs
+    );
     for (let i = 0; i < linkedProjectsOrError.length; i++) {
       const linkedProjectOrError = linkedProjectsOrError[i];
       if (isResource(linkedProjectOrError)) {
@@ -85,21 +128,7 @@ export async function getRepoForLogin(authState: AuthState, extendedMode?: boole
       }
     }
   }
-
-  return new Repository({
-    projects: allowedProjects,
-    currentProject: project,
-    author: profile ? createReference(profile) : realMembership.profile,
-    remoteAddress: login.remoteAddress,
-    superAdmin: project.superAdmin,
-    projectAdmin: membership.admin,
-    accessPolicy,
-    strictMode: project.strictMode,
-    extendedMode,
-    checkReferencesOnWrite: project.checkReferencesOnWrite,
-    validateTerminology: project.features?.includes('validate-terminology'),
-    onBehalfOf: authState.onBehalfOf ? createReference(authState.onBehalfOf) : undefined,
-  });
+  return allowedProjects;
 }
 
 /**
@@ -109,14 +138,17 @@ export async function getRepoForLogin(authState: AuthState, extendedMode?: boole
  */
 export async function getAccessPolicyForLogin(authState: AuthState): Promise<AccessPolicy | undefined> {
   const { project, login } = authState;
-  const membership = authState.onBehalfOfMembership ?? authState.membership;
+  // Heal any drift between the admin flag and the default access policy before building.
+  // If a member's admin flag was toggled without updating their (still-default) access policy,
+  // this substitutes the correct role default so an upgraded admin isn't left half-restricted.
+  const membership = reconcileDefaultAccessPolicy(project, authState.onBehalfOfMembership ?? authState.membership);
 
   let accessPolicy = await buildAccessPolicy(membership);
 
   if (login.scope) {
     // If the login specifies SMART scopes,
     // then set the access policy to use those scopes
-    accessPolicy = applySmartScopes(accessPolicy, login.scope);
+    accessPolicy = applySmartScopes(accessPolicy, authState);
   }
 
   // Apply project admin access policies
@@ -125,6 +157,38 @@ export async function getAccessPolicyForLogin(authState: AuthState): Promise<Acc
   accessPolicy = applyProjectAdminAccessPolicy(project, membership, accessPolicy);
 
   return accessPolicy;
+}
+
+/**
+ * Reconciles a project membership's default access policy with its admin flag.
+ *
+ * The `admin` flag does not bypass the access policy, so toggling it without also swapping the
+ * access policy leaves a member "half-upgraded" (e.g. an admin still blocked from editing knowledge
+ * resources by the Practitioner default). This keeps the two in sync: when the membership's current
+ * access policy is exactly the *other* role's recognized project default, it is swapped to the
+ * default that matches the current admin flag. Custom (non-default) access policies are left
+ * untouched, and the operation is idempotent.
+ * @param project - The project, which holds the recognized role defaults in `defaultAccessPolicies`.
+ * @param membership - The project membership to reconcile.
+ * @returns The membership, with its `accessPolicy` swapped to the matching role default if needed.
+ */
+export function reconcileDefaultAccessPolicy<T extends ProjectMembership>(project: Project, membership: T): T {
+  const defaults = project.defaultAccessPolicies;
+  const currentPolicy = membership.accessPolicy?.reference;
+  if (!defaults || !currentPolicy) {
+    return membership;
+  }
+
+  const practitionerDefault = defaults.find((p) => p.profileType === 'Practitioner')?.accessPolicy;
+  const adminDefault = defaults.find((p) => p.profileType === 'Admin')?.accessPolicy;
+
+  if (membership.admin && adminDefault && currentPolicy === practitionerDefault?.reference) {
+    return { ...membership, accessPolicy: adminDefault };
+  }
+  if (!membership.admin && practitionerDefault && currentPolicy === adminDefault?.reference) {
+    return { ...membership, accessPolicy: practitionerDefault };
+  }
+  return membership;
 }
 
 /**
@@ -284,10 +348,14 @@ function applyProjectAdminAccessPolicy(
     // Project admins can edit their own project
     accessPolicy.resource.push(
       {
+        resourceType: 'AccessPolicy',
+        criteria: `AccessPolicy?_project=${resolveId(membership.project)}`,
+      },
+      {
         // Project admins have full access to their own project, except for a few sensitive fields
         resourceType: 'Project',
         criteria: `Project?_id=${resolveId(membership.project)}`,
-        readonlyFields: ['features', 'link', 'systemSetting'],
+        readonlyFields: ['active', 'features', 'link', 'systemSetting'],
         hiddenFields: ['superAdmin', 'systemSecret', 'strictMode'],
         interaction: ['read', 'vread', 'update', 'history', 'create', 'search'], // Everything except delete
       },
@@ -314,6 +382,10 @@ function applyProjectAdminAccessPolicy(
         readonlyFields: ['email', 'emailVerified', 'mfaEnrolled', 'project'],
       },
       {
+        resourceType: 'Cron',
+        criteria: `Cron?_project=${resolveId(membership.project)}`,
+      },
+      {
         resourceType: 'Package',
         readonly: true,
       },
@@ -327,8 +399,18 @@ function applyProjectAdminAccessPolicy(
       }
     );
   } else {
-    // Remove any references to project admin resource types
-    accessPolicy.resource = accessPolicy.resource?.filter((r) => !projectAdminResourceTypes.includes(r.resourceType));
+    // Preserve policy reads, including wildcard grants, but never grant non-admins policy writes.
+    const policyReadRules = accessPolicy.resource
+      .filter((r) => r.resourceType === 'AccessPolicy' || r.resourceType === '*')
+      .map((r) => ({
+        ...r,
+        resourceType: 'AccessPolicy',
+        criteria: r.criteria?.replace(/^\*\?/, 'AccessPolicy?'),
+        interaction: r.interaction?.filter((i) => readInteractions.includes(i)) ?? [...readInteractions],
+      }));
+
+    accessPolicy.resource = accessPolicy.resource.filter((r) => !projectAdminResourceTypes.includes(r.resourceType));
+    accessPolicy.resource.push(...policyReadRules);
   }
 
   return accessPolicy;

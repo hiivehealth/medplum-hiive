@@ -37,6 +37,24 @@
   },
   {
     "resourceType": "SearchParameter",
+    "id": "HealthcareService-location",
+    "name": "location",
+    "code": "location",
+    "base": ["HealthcareService"],
+    "type": "reference",
+    "expression": "HealthcareService.location"
+  },
+  {
+    "resourceType": "SearchParameter",
+    "id": "HealthcareService-name",
+    "name": "name",
+    "code": "name",
+    "base": ["HealthcareService"],
+    "type": "string",
+    "expression": "HealthcareService.name"
+  },
+  {
+    "resourceType": "SearchParameter",
     "id": "Measure-url",
     "name": "url",
     "code": "url",
@@ -60,7 +78,7 @@
     "code": "value-quantity",
     "base": ["Observation"],
     "type": "quantity",
-    "expression": "(Observation.value as Quantity) | (Observation.value as SampledData)"
+    "expression": "(Observation.value.ofType(Quantity)) | (Observation.value.ofType(SampledData))"
   },
   {
     "resourceType": "SearchParameter",
@@ -69,7 +87,7 @@
     "code": "value-string",
     "base": ["Observation"],
     "type": "string",
-    "expression": "(Observation.value as string) | (Observation.value as CodeableConcept).text"
+    "expression": "(Observation.value.ofType(string)) | (Observation.value.ofType(CodeableConcept)).text"
   },
   {
     "resourceType": "SearchParameter",
@@ -163,12 +181,39 @@
   },
   {
     "resourceType": "SearchParameter",
+    "id": "Schedule-active",
+    "name": "active",
+    "code": "active",
+    "base": ["Schedule"],
+    "type": "token",
+    "expression": "Schedule.active"
+  },
+  {
+    "resourceType": "SearchParameter",
+    "id": "Schedule-actor",
+    "name": "actor",
+    "code": "actor",
+    "base": ["Schedule"],
+    "type": "reference",
+    "expression": "Schedule.actor"
+  },
+  {
+    "resourceType": "SearchParameter",
     "id": "Schedule-identifier",
     "name": "identifier",
     "code": "identifier",
     "base": ["Schedule"],
     "type": "token",
     "expression": "Schedule.identifier"
+  },
+  {
+    "resourceType": "SearchParameter",
+    "id": "Schedule-service-type",
+    "name": "service-type",
+    "code": "service-type",
+    "base": ["Schedule"],
+    "type": "token",
+    "expression": "Schedule.serviceType"
   },
   {
     "resourceType": "SearchParameter",

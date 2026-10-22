@@ -2,10 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { MedplumSourceInfraConfig } from '@medplum/core';
 import { App } from 'aws-cdk-lib';
+import { Match, Template } from 'aws-cdk-lib/assertions';
 import { unlink, writeFile } from 'fs/promises';
 import { resolve } from 'path';
 import { normalizeInfraConfig } from './config';
 import { main, MedplumStack } from './index';
+
+const scanStatusTag = 's3:ExistingObjectTag/GuardDutyMalwareScanStatus';
 
 async function writeConfig(filename: string, config: any): Promise<string> {
   const resolvedPath = resolve(filename);
@@ -43,7 +46,7 @@ describe('Infra', () => {
   };
 
   beforeEach(() => {
-    console.log = jest.fn();
+    console.log = vi.fn();
   });
 
   test('Missing config', async () => {
@@ -73,6 +76,69 @@ describe('Infra', () => {
     await unlink(filename);
   });
 
+  test.each(['us-east-1', 'ap-southeast-1'])('Hiive app hosting and environment overrides in %s', async (region) => {
+    const config = await normalizeInfraConfig({
+      ...baseConfig,
+      region,
+      stackName: 'HiiveAppHostingStack',
+      skipDns: true,
+      clamscanEnabled: false,
+      patientAppDomainName: 'patient.example.com',
+      patientAppSslCertArn: baseConfig.appSslCertArn,
+      providerAppDomainName: 'provider.example.com',
+      providerAppSslCertArn: baseConfig.appSslCertArn,
+    });
+    const stack = new MedplumStack(new App(), config);
+    const primary = Template.fromStack(stack.primaryStack);
+    const global = stack.globalStack ? Template.fromStack(stack.globalStack) : primary;
+
+    for (const domain of ['patient.example.com', 'provider.example.com']) {
+      primary.hasResourceProperties('AWS::S3::Bucket', {
+        BucketName: domain,
+        VersioningConfiguration: { Status: 'Enabled' },
+        PublicAccessBlockConfiguration: {
+          BlockPublicAcls: true,
+          BlockPublicPolicy: true,
+          IgnorePublicAcls: true,
+          RestrictPublicBuckets: true,
+        },
+      });
+      global.hasResourceProperties('AWS::CloudFront::Distribution', {
+        DistributionConfig: Match.objectLike({
+          Aliases: [domain],
+          DefaultRootObject: 'index.html',
+          CustomErrorResponses: Match.arrayWith([
+            { ErrorCode: 403, ResponseCode: 200, ResponsePagePath: '/index.html' },
+            { ErrorCode: 404, ResponseCode: 200, ResponsePagePath: '/index.html' },
+          ]),
+        }),
+      });
+    }
+
+    global.hasResourceProperties('AWS::CloudFront::ResponseHeadersPolicy', {
+      ResponseHeadersPolicyConfig: Match.objectLike({
+        CorsConfig: Match.objectLike({
+          AccessControlAllowOrigins: {
+            Items: [
+              config.appDomainName,
+              `https://${config.appDomainName}`,
+              'https://patient.example.com',
+              'https://provider.example.com',
+              'https://ccda.medplum.com',
+            ],
+          },
+        }),
+      }),
+    });
+    primary.hasResourceProperties('AWS::ECS::TaskDefinition', {
+      ContainerDefinitions: Match.arrayWith([
+        Match.objectLike({
+          Command: [region === 'us-east-1' ? 'aws:/medplum/unittest/,env' : `aws:${region}:/medplum/unittest/,env`],
+        }),
+      ]),
+    });
+  });
+
   test('ECR image', async () => {
     const filename = await writeConfig('./medplum.customvpc.config.json', {
       ...baseConfig,
@@ -83,6 +149,33 @@ describe('Infra', () => {
 
     await expect(main({ config: filename })).resolves.not.toThrow();
     await unlink(filename);
+  });
+
+  test('ECR image pinned by digest', async () => {
+    const digest = 'sha256:a3ed4dd54a141f1068831a8a1c6144db1d07261204d39afd1b14be883ff00501';
+    const config = await normalizeInfraConfig({
+      ...baseConfig,
+      stackName: 'MedplumEcrDigestStack',
+      additionalContainers: [
+        {
+          name: 'otel-collector',
+          image: `647991932601.dkr.ecr.us-east-1.amazonaws.com/medplum/otel-collector@${digest}`,
+        },
+      ],
+    } as unknown as MedplumSourceInfraConfig);
+    const template = Template.fromStack(new MedplumStack(new App(), config).primaryStack);
+
+    expect(JSON.stringify(template.toJSON())).toContain(`/medplum/otel-collector@${digest}`);
+    template.hasResourceProperties('AWS::IAM::Policy', {
+      PolicyDocument: Match.objectLike({
+        Statement: Match.arrayWith([
+          Match.objectLike({
+            Action: Match.arrayWith(['ecr:BatchGetImage']),
+            Resource: 'arn:aws:ecr:us-east-1:647991932601:repository/medplum/otel-collector',
+          }),
+        ]),
+      }),
+    });
   });
 
   test('Custom VPC', async () => {
@@ -579,5 +672,196 @@ describe('Infra', () => {
 
     await expect(main({ config: filename })).resolves.not.toThrow();
     await unlink(filename);
+  });
+
+  test('GuardDuty', async () => {
+    const filename = await writeConfig('./medplum.guardduty.config.json', {
+      ...baseConfig,
+      name: 'guardduty',
+      stackName: 'MedplumGuardDutyStack',
+      guardDutyMalwareProtectionEnabled: true,
+      clamScanEnabled: false,
+    });
+
+    await expect(main({ config: filename })).resolves.not.toThrow();
+    await unlink(filename);
+  });
+
+  test.each([false, true])('GuardDuty (on-demand only %s) grants the server scan permissions', async (onDemandOnly) => {
+    const sourceConfig = {
+      ...baseConfig,
+      stackName: `MedplumGuardDutyScan${onDemandOnly}Stack`,
+      guardDutyMalwareProtectionEnabled: true,
+      guardDutyMalwareProtectionOnDemandOnly: onDemandOnly,
+    } as unknown as MedplumSourceInfraConfig;
+    const config = await normalizeInfraConfig(sourceConfig);
+    const template = Template.fromStack(new MedplumStack(new App(), config).primaryStack);
+
+    template.hasResourceProperties('AWS::IAM::Role', {
+      Description: 'Medplum Server Task Execution Role',
+      Policies: Match.arrayWith([
+        Match.objectLike({
+          PolicyDocument: Match.objectLike({
+            Statement: Match.arrayWith([
+              Match.objectLike({
+                Action: [
+                  's3:GetObject',
+                  's3:PutObject',
+                  's3:DeleteObject',
+                  's3:GetObjectTagging',
+                  's3:PutObjectTagging',
+                ],
+                Resource: 'arn:aws:s3:::medplum-storage/*',
+              }),
+              Match.objectLike({ Action: 'guardduty:SendObjectMalwareScan', Resource: '*' }),
+            ]),
+          }),
+        }),
+      ]),
+    });
+  });
+
+  test.each([
+    [true, ['guardduty-on-demand-only/'], { StringEquals: { [scanStatusTag]: 'THREATS_FOUND' } }],
+    [false, Match.absent(), { StringNotEquals: { [scanStatusTag]: 'NO_THREATS_FOUND' } }],
+  ])(
+    'GuardDuty on-demand only (%s) sets the plan prefixes and read gate',
+    async (onDemandOnly, prefixes, condition) => {
+      const config = await normalizeInfraConfig({
+        ...baseConfig,
+        stackName: `MedplumGuardDutyOnDemandOnly${onDemandOnly}Stack`,
+        guardDutyMalwareProtectionEnabled: true,
+        guardDutyMalwareProtectionOnDemandOnly: onDemandOnly,
+      } as unknown as MedplumSourceInfraConfig);
+      const template = Template.fromStack(new MedplumStack(new App(), config).primaryStack);
+
+      template.hasResourceProperties('AWS::GuardDuty::MalwareProtectionPlan', {
+        ProtectedResource: { S3Bucket: Match.objectLike({ ObjectPrefixes: prefixes }) },
+      });
+      const readGates = Object.values(template.findResources('AWS::S3::BucketPolicy')).flatMap((policy) =>
+        (policy.Properties.PolicyDocument.Statement as { Action: unknown; Condition?: unknown }[]).filter(
+          (s) => JSON.stringify(s.Action) === JSON.stringify(['s3:GetObject', 's3:GetObjectVersion'])
+        )
+      );
+      expect(readGates.map((s) => s.Condition)).toStrictEqual([condition]);
+    }
+  );
+
+  test('No on-demand scan permissions without GuardDuty', async () => {
+    const config = await normalizeInfraConfig({
+      ...baseConfig,
+      stackName: 'MedplumNoGuardDutyScanStack',
+    } as unknown as MedplumSourceInfraConfig);
+    const template = Template.fromStack(new MedplumStack(new App(), config).primaryStack);
+
+    expect(JSON.stringify(template.toJSON())).not.toContain('guardduty:SendObjectMalwareScan');
+    template.hasResourceProperties('AWS::IAM::Role', {
+      Description: 'Medplum Server Task Execution Role',
+      Policies: Match.arrayWith([
+        Match.objectLike({
+          PolicyDocument: Match.objectLike({
+            Statement: Match.arrayWith([
+              Match.objectLike({
+                Action: ['s3:GetObject', 's3:PutObject', 's3:DeleteObject'],
+                Resource: 'arn:aws:s3:::medplum-storage/*',
+              }),
+            ]),
+          }),
+        }),
+      ]),
+    });
+  });
+
+  test('storageBotInputExpirationDays expires only the bot input prefix', async () => {
+    const config = await normalizeInfraConfig({
+      ...baseConfig,
+      stackName: 'MedplumBotInputExpirationStack',
+      storageBotInputExpirationDays: 30,
+    } as unknown as MedplumSourceInfraConfig);
+    const template = Template.fromStack(new MedplumStack(new App(), config).primaryStack);
+
+    template.hasResourceProperties('AWS::S3::Bucket', {
+      BucketName: 'medplum-storage',
+      LifecycleConfiguration: {
+        Rules: [
+          {
+            Id: 'ExpireBotInput',
+            Prefix: 'bot/',
+            Status: 'Enabled',
+            ExpirationInDays: 30,
+            NoncurrentVersionExpiration: { NoncurrentDays: 1 },
+          },
+          { Id: 'ExpireBotInputDeleteMarkers', Prefix: 'bot/', Status: 'Enabled', ExpiredObjectDeleteMarker: true },
+        ],
+      },
+    });
+  });
+
+  test('No storage lifecycle rules without storageBotInputExpirationDays', async () => {
+    const config = await normalizeInfraConfig({
+      ...baseConfig,
+      stackName: 'MedplumNoBotInputExpirationStack',
+    } as unknown as MedplumSourceInfraConfig);
+    const template = Template.fromStack(new MedplumStack(new App(), config).primaryStack);
+
+    template.hasResourceProperties('AWS::S3::Bucket', {
+      BucketName: 'medplum-storage',
+      LifecycleConfiguration: Match.absent(),
+    });
+  });
+
+  // Regression test for https://github.com/medplum/medplum/issues/8985:
+  // The default ElastiCache node type was `cache.t2.medium`, but AWS no longer
+  // allows creating new ElastiCache clusters on T2 instances, so fresh deploys
+  // failed. The default must be a current-generation node type.
+  test('Default cacheNodeType is a supported instance type', async () => {
+    const sourceConfig = {
+      ...baseConfig,
+      stackName: 'MedplumDefaultCacheNodeTypeStack',
+    } as unknown as MedplumSourceInfraConfig;
+    const config = await normalizeInfraConfig(sourceConfig);
+    const app = new App();
+    const stack = new MedplumStack(app, config);
+    const template = Template.fromStack(stack.primaryStack);
+
+    template.resourcePropertiesCountIs('AWS::ElastiCache::ReplicationGroup', { CacheNodeType: 'cache.t4g.medium' }, 1);
+  });
+
+  // Regression test for https://github.com/medplum/medplum/issues/9287:
+  // `loadBalancerLoggingPrefix` was being silently ignored because both
+  // `BackEnd.createLoadBalancer` call sites passed `loadBalancerLoggingBucket`
+  // (the bucket name) as the prefix argument.
+  test('ALB access log prefix uses loadBalancerLoggingPrefix', async () => {
+    const sourceConfig = {
+      ...baseConfig,
+      stackName: 'MedplumAlbAccessLogPrefixStack',
+      mtlsDomainName: 'mtls.medplum.com',
+      mtlsSslCertArn: 'arn:aws:acm:us-east-1:647991932601:certificate/19d85245-0a1d-4bf5-9789-23082b1a15fc',
+    } as unknown as MedplumSourceInfraConfig;
+    const config = await normalizeInfraConfig(sourceConfig);
+    const app = new App();
+    const stack = new MedplumStack(app, config);
+    const template = Template.fromStack(stack.primaryStack);
+
+    // Both the main and mTLS ALBs should set `access_logs.s3.prefix` to the
+    // configured prefix (`'elb'`), not to the bucket name.
+    const loadBalancers = template.findResources('AWS::ElasticLoadBalancingV2::LoadBalancer');
+    expect(Object.keys(loadBalancers)).toHaveLength(2);
+    template.resourcePropertiesCountIs(
+      'AWS::ElasticLoadBalancingV2::LoadBalancer',
+      {
+        LoadBalancerAttributes: Match.arrayWith([{ Key: 'access_logs.s3.prefix', Value: 'elb' }]),
+      },
+      2
+    );
+    template.resourcePropertiesCountIs(
+      'AWS::ElasticLoadBalancingV2::LoadBalancer',
+      {
+        LoadBalancerAttributes: Match.arrayWith([
+          { Key: 'access_logs.s3.prefix', Value: baseConfig.loadBalancerLoggingBucket },
+        ]),
+      },
+      0
+    );
   });
 });

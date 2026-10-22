@@ -1,14 +1,13 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import fs from 'node:fs';
-import { join } from 'node:path';
-import { addDataMigrationToManifest, DATA_DIR } from './migrate-main';
+import type * as NodeFs from 'node:fs';
+import { vi } from 'vitest';
 
-const originalReadFileSync = fs.readFileSync;
-
-describe('addDataMigrationToManifest', () => {
+const manifestState = vi.hoisted(() => {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const { join, resolve } = require('node:path');
+  const DATA_DIR = resolve('./src/migrations/data');
   const manifestPath = join(DATA_DIR, 'data-version-manifest.json');
-
   const manifestFixture =
     JSON.stringify(
       {
@@ -19,38 +18,63 @@ describe('addDataMigrationToManifest', () => {
       2
     ) + '\n';
 
-  let updatedManifest: string | undefined = undefined;
+  return {
+    DATA_DIR,
+    manifestPath,
+    manifestFixture,
+    updatedManifest: undefined as string | undefined,
+  };
+});
 
-  beforeAll(() => {
-    updatedManifest = undefined;
-    jest.spyOn(fs, 'readFileSync').mockImplementation((path, options) => {
-      if (path === manifestPath) {
-        return manifestFixture;
+vi.mock('node:fs', async (importOriginal) => {
+  const actual = await importOriginal<typeof NodeFs>();
+  return {
+    ...actual,
+    readFileSync: vi.fn((path, options) => {
+      if (path === manifestState.manifestPath) {
+        return manifestState.manifestFixture;
       }
-      // Jest seems to rely on readFileSync in some situations - defer to the original
-      // function for paths other than the manifest
-      return originalReadFileSync(path, options);
-    });
-    jest.spyOn(fs, 'writeFileSync').mockImplementation((path, data) => {
-      if (path !== manifestPath) {
+      return actual.readFileSync(path, options);
+    }),
+    writeFileSync: vi.fn((path, data) => {
+      if (path !== manifestState.manifestPath) {
         throw new Error(`Tried to write to unexpected file ${path}`);
       }
       if (typeof data === 'string') {
-        updatedManifest = data.toString();
+        manifestState.updatedManifest = data;
       } else {
         throw new Error(`Data type ${typeof data} not yet handled in writeFileSync test stub`);
       }
-    });
-  });
+    }),
+  };
+});
 
-  afterAll(() => {
-    jest.restoreAllMocks();
+import { readFileSync } from 'node:fs';
+import { join } from 'node:path';
+import * as loggerModule from '../logger';
+import * as dataMigrations from './data';
+import * as migrate from './migrate';
+import {
+  addDataMigrationToManifest,
+  buildMigrationExports,
+  DATA_DIR,
+  getMigrationFilenames,
+  runFromCli,
+  SCHEMA_DIR,
+} from './migrate-main';
+import { getPostDeployMigrationVersions, getPreDeployMigrationVersions } from './migration-versions';
+import * as schemaMigrations from './schema';
+
+describe('addDataMigrationToManifest', () => {
+  beforeEach(() => {
+    manifestState.updatedManifest = undefined;
   });
 
   test('adds new entry with incremented patch version', () => {
     const testVersion = 'v9999';
 
     addDataMigrationToManifest(testVersion);
+    const updatedManifest = manifestState.updatedManifest;
     if (typeof updatedManifest !== 'string') {
       throw new Error('Manifest was not updated');
     }
@@ -67,10 +91,11 @@ describe('addDataMigrationToManifest', () => {
   });
 
   test('preserves existing manifest entries', () => {
-    const originalParsed = JSON.parse(manifestFixture);
+    const originalParsed = JSON.parse(manifestState.manifestFixture);
     const existingKeys = Object.keys(originalParsed);
 
     addDataMigrationToManifest('v9999');
+    const updatedManifest = manifestState.updatedManifest;
     if (typeof updatedManifest !== 'string') {
       throw new Error('Manifest was not updated');
     }
@@ -84,6 +109,7 @@ describe('addDataMigrationToManifest', () => {
 
   test('writes file with proper JSON formatting and trailing newline', () => {
     addDataMigrationToManifest('v9999');
+    const updatedManifest = manifestState.updatedManifest;
     if (typeof updatedManifest !== 'string') {
       throw new Error('Manifest was not updated');
     }
@@ -97,6 +123,7 @@ describe('addDataMigrationToManifest', () => {
 
   test('appends new entry at end of manifest object', () => {
     addDataMigrationToManifest('v9999');
+    const updatedManifest = manifestState.updatedManifest;
     if (typeof updatedManifest !== 'string') {
       throw new Error('Manifest was not updated');
     }
@@ -109,5 +136,70 @@ describe('addDataMigrationToManifest', () => {
 
     expect(places.v1).toBeLessThan(places.v2);
     expect(places.v2).toBeLessThan(places.v9999);
+  });
+});
+
+describe('buildMigrationExports', () => {
+  test.each([
+    ['schema', SCHEMA_DIR, schemaMigrations],
+    ['data', DATA_DIR, dataMigrations],
+  ])('%s index registers every migration file', (name, directory, registeredMigrations) => {
+    const migrationFiles = getMigrationFilenames(directory).map((filename) => filename.slice(0, -3));
+
+    expect(Object.keys(registeredMigrations)).toContainExactly(migrationFiles);
+  });
+
+  test('exports versions in numeric order, guarding each digit-count boundary', () => {
+    const guard = [
+      '/* CAUTION: LOAD-BEARING COMMENT */',
+      '/* This comment prevents auto-organization of imports in VSCode which would break the numeric ordering of the migrations. */',
+    ];
+    const output = buildMigrationExports([8, 9, 10, 11, 99, 100, 101]);
+
+    // Guards belong only where the digit count grows — before v10 and v100, not v9, v11 or v101
+    expect(output.slice(output.indexOf('export * as'))).toStrictEqual(
+      [
+        `export * as v8 from './v8';`,
+        `export * as v9 from './v9';`,
+        ...guard,
+        `export * as v10 from './v10';`,
+        `export * as v11 from './v11';`,
+        `export * as v99 from './v99';`,
+        ...guard,
+        `export * as v100 from './v100';`,
+        `export * as v101 from './v101';`,
+        '',
+      ].join('\n')
+    );
+  });
+
+  test('reproduces the checked-in index files', () => {
+    expect(buildMigrationExports(getPreDeployMigrationVersions())).toStrictEqual(
+      readFileSync(join(SCHEMA_DIR, 'index.ts'), 'utf8')
+    );
+    expect(buildMigrationExports(getPostDeployMigrationVersions())).toStrictEqual(
+      readFileSync(join(DATA_DIR, 'index.ts'), 'utf8')
+    );
+  });
+});
+
+describe('runFromCli', () => {
+  test('logs and exits via exitAfterStdoutDrain when main rejects', async () => {
+    const exitDrainSpy = vi.spyOn(loggerModule, 'exitAfterStdoutDrain').mockResolvedValue();
+    const errorSpy = vi.spyOn(loggerModule.globalLogger, 'error').mockImplementation(() => undefined);
+    const indexSpy = vi.spyOn(migrate, 'indexStructureDefinitionsAndSearchParameters').mockImplementation(() => {
+      throw new Error('boom');
+    });
+
+    await runFromCli();
+
+    expect(indexSpy).toHaveBeenCalledTimes(1);
+    expect(errorSpy).toHaveBeenCalled();
+    expect(errorSpy.mock.calls[0][0]).toBe('Migration failed');
+    expect(exitDrainSpy).toHaveBeenCalledTimes(1);
+
+    exitDrainSpy.mockRestore();
+    errorSpy.mockRestore();
+    indexSpy.mockRestore();
   });
 });

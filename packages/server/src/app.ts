@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 import {
   badRequest,
+  contentTooLarge,
   ContentType,
   parseLogLevel,
   unsupportedMediaType,
@@ -21,7 +22,7 @@ import { asyncBatchHandler } from './async-batch';
 import { authRouter } from './auth/routes';
 import { cdsRouter } from './cds/routes';
 import { getConfig } from './config/loader';
-import type { MedplumServerConfig } from './config/types';
+import type { ServerConfig } from './config/utils';
 import {
   attachRequestContext,
   AuthenticatedRequestContext,
@@ -33,6 +34,8 @@ import { closeDatabase, initDatabase } from './database';
 import { dicomRouter } from './dicom/routes';
 import { emailRouter } from './email/routes';
 import { binaryRouter } from './fhir/binary';
+import { smartHealthLinkRouter } from './fhir/operations/smarthealthlinks';
+import { closeAgentCallbackSubscriber } from './fhir/operations/utils/agentcallback';
 import { sendOutcome } from './fhir/outcomes';
 import { fhirRouter } from './fhir/routes';
 import { loadStructureDefinitions } from './fhir/structure';
@@ -41,9 +44,9 @@ import { cleanupReservedDatabaseConnections, healthcheckHandler } from './health
 import { cleanupHeartbeat, initHeartbeat } from './heartbeat';
 import { hl7BodyParser } from './hl7/parser';
 import { keyValueRouter } from './keyvalue/routes';
-import { getLogger, globalLogger } from './logger';
+import { drainStdout, getLogger, globalLogger } from './logger';
 import { mcpRouter } from './mcp/routes';
-import { maybeAutoRunPendingPostDeployMigration } from './migrations/migration-utils';
+import { maybeAutoRunPendingPostDeployMigrationOnAllShards } from './migrations/migration-utils';
 import { initKeys } from './oauth/keys';
 import { authenticateRequest } from './oauth/middleware';
 import { oauthRouter } from './oauth/routes';
@@ -56,7 +59,7 @@ import { seedDatabase } from './seed';
 import { initServerRegistryHeartbeatListener } from './server-registry';
 import { initBinaryStorage } from './storage/loader';
 import { storageRouter } from './storage/routes';
-import { webhookRouter } from './webhook/routes';
+import { WEBHOOK_PATHS, webhookRouter } from './webhook/routes';
 import { wellKnownRouter } from './wellknown';
 import { closeWorkers, initWorkers } from './workers';
 import { closeWebSockets, initWebSockets } from './ws/routes';
@@ -148,8 +151,8 @@ function errorHandler(err: any, req: Request, res: Response, next: NextFunction)
     sendOutcome(res, badRequest('Content could not be parsed'));
     return;
   }
-  if (err.type === 'entity.too.large') {
-    sendOutcome(res, badRequest('File too large'));
+  if (err.type === 'entity.too.large' || err.type === 'parameters.too.many') {
+    sendOutcome(res, contentTooLarge('Request body too large'));
     return;
   }
   if (err.type === 'stream.not.readable') {
@@ -174,7 +177,7 @@ function errorHandler(err: any, req: Request, res: Response, next: NextFunction)
   res.status(500).json({ msg: 'Internal Server Error' });
 }
 
-export async function initApp(app: Express, config: MedplumServerConfig): Promise<http.Server> {
+export async function initApp(app: Express, config: ServerConfig): Promise<http.Server> {
   if (process.env.NODE_ENV !== 'test') {
     await warnIfNewerVersionAvailable('server', { base: config.baseUrl });
   }
@@ -204,10 +207,42 @@ export async function initApp(app: Express, config: MedplumServerConfig): Promis
   app.use(attachRequestContext);
 
   app.use(rateLimitHandler(config));
-  app.use('/fhir/R4/Binary', binaryRouter);
+  app.use(
+    ['/dicomweb', '/api/dicomweb', '/projects/:projectId/dicomweb', '/api/projects/:projectId/dicomweb'],
+    dicomRouter
+  );
+  app.use(
+    [
+      '/fhir/R4/Binary',
+      '/api/fhir/R4/Binary',
+      '/projects/:projectId/fhir/R4/Binary',
+      '/api/projects/:projectId/fhir/R4/Binary',
+    ],
+    binaryRouter
+  );
+  // Presigned uploads stream the raw body, so like binaryRouter this must precede the body parsers
+  app.use(
+    ['/storage', '/api/storage', '/projects/:projectId/storage', '/api/projects/:projectId/storage'],
+    storageRouter
+  );
 
   // Handle async batch by enqueueing job
-  app.post('/fhir/R4', authenticateRequest, asyncBatchHandler(config));
+  app.post(
+    ['/fhir/R4', '/api/fhir/R4', '/projects/:projectId/fhir/R4', '/api/projects/:projectId/fhir/R4'],
+    authenticateRequest,
+    asyncBatchHandler(config)
+  );
+
+  app.use(
+    WEBHOOK_PATHS,
+    json({
+      type: JSON_TYPE,
+      limit: config.maxJsonSize,
+      verify: (req, _res, buf) => {
+        (req as any).rawBody = buf;
+      },
+    })
+  );
 
   app.use(urlencoded({ extended: false }));
   app.use(text({ type: [ContentType.TEXT, ContentType.HL7_V2] }));
@@ -228,39 +263,43 @@ export async function initApp(app: Express, config: MedplumServerConfig): Promis
   apiRouter.use('/admin/', adminRouter);
   apiRouter.use('/auth/', authRouter);
   apiRouter.use('/cds-services/', cdsRouter);
-  apiRouter.use('/dicom/PS3/', dicomRouter);
   apiRouter.use('/email/v1/', emailRouter);
   apiRouter.use('/fhir/R4/', fhirRouter);
   apiRouter.use('/fhircast/STU2/', fhircastSTU2Router);
   apiRouter.use('/fhircast/STU3/', fhircastSTU3Router);
+  // Some subscribers (e.g. the OHIF DICOM viewer) hardcode `hub.url` to `/api/hub`.
+  // Alias it to the latest FHIRcast version we support.
+  apiRouter.use('/hub/', fhircastSTU3Router);
   apiRouter.use('/keyvalue/v1/', keyValueRouter);
   apiRouter.use('/oauth2/', oauthRouter);
   apiRouter.use('/scim/v2/', scimRouter);
-  apiRouter.use('/storage/', storageRouter);
+  apiRouter.use('/shl/', smartHealthLinkRouter);
   apiRouter.use('/webhook/', webhookRouter);
 
   if (config.mcpEnabled) {
     apiRouter.use('/mcp', mcpRouter);
   }
 
+  app.use('/api/projects/:projectId/', apiRouter);
+  app.use('/projects/:projectId/', apiRouter);
   app.use('/api/', apiRouter);
   app.use('/', apiRouter);
   app.use(errorHandler);
   return server;
 }
 
-export async function initAppServices(config: MedplumServerConfig): Promise<void> {
-  loadStructureDefinitions();
+export async function initAppServices(config: ServerConfig): Promise<void> {
+  loadStructureDefinitions(config);
   initRedis(config);
   await initDatabase(config);
-  initWorkers(config);
+  await initWorkers(config);
   await seedDatabase(config);
   await initKeys(config);
   initBinaryStorage(config.binaryStorage);
   initHeartbeat(config);
   initOtelHeartbeat();
   initServerRegistryHeartbeatListener();
-  await maybeAutoRunPendingPostDeployMigration();
+  await maybeAutoRunPendingPostDeployMigrationOnAllShards();
 }
 
 export async function shutdownApp(): Promise<void> {
@@ -277,6 +316,7 @@ export async function shutdownApp(): Promise<void> {
 
   await closeWorkers();
   await closeDatabase();
+  closeAgentCallbackSubscriber();
   await closeRedis();
   closeRateLimiter();
 
@@ -285,6 +325,8 @@ export async function shutdownApp(): Promise<void> {
   if (binaryStorage?.startsWith('file:' + join(tmpdir(), 'medplum-temp-storage'))) {
     rmSync(binaryStorage.replace('file:', ''), { recursive: true, force: true });
   }
+
+  await drainStdout();
 }
 
 const loggingMiddleware = (req: Request, res: Response, next: NextFunction): void => {
@@ -303,6 +345,7 @@ const loggingMiddleware = (req: Request, res: Response, next: NextFunction): voi
       status: res.writableFinished ? res.statusCode : 408,
       ua: req.get('User-Agent'),
       mode: ctx instanceof AuthenticatedRequestContext ? ctx.repo.mode : undefined,
+      fhirQuota: ctx?.fhirRateLimiter?.unitsConsumed,
     });
   });
 

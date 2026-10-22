@@ -1,38 +1,74 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import { SendEmailCommand, SESv2Client } from '@aws-sdk/client-sesv2';
-import { allOk, ContentType, createReference, getReferenceString, normalizeErrorString } from '@medplum/core';
-import type { BundleEntry, Practitioner, ProjectMembership, User } from '@medplum/fhirtypes';
+import type { WithId } from '@medplum/core';
+import {
+  allOk,
+  badRequest,
+  ContentType,
+  createReference,
+  getReferenceString,
+  normalizeErrorString,
+} from '@medplum/core';
+import type {
+  AccessPolicy,
+  BundleEntry,
+  Patient,
+  Practitioner,
+  Project,
+  ProjectMembership,
+  Reference,
+  RelatedPerson,
+  User,
+} from '@medplum/fhirtypes';
 import type { AwsClientStub } from 'aws-sdk-client-mock';
 import { mockClient } from 'aws-sdk-client-mock';
-import 'aws-sdk-client-mock-jest';
 import { randomUUID } from 'crypto';
 import express from 'express';
-import { pwnedPassword } from 'hibp';
 import { simpleParser } from 'mailparser';
-import fetch from 'node-fetch';
 import { authenticator } from 'otplib';
+import type { Pool } from 'pg';
 import { Readable } from 'stream';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { initApp, shutdownApp } from '../app';
 import { registerNew } from '../auth/register';
-import { loadTestConfig } from '../config/loader';
+import { getConfig, loadTestConfig } from '../config/loader';
 import { DatabaseMode, getDatabasePool } from '../database';
+import { getProjectSystemRepo } from '../fhir/repo';
+import { GLOBAL_SHARD_ID } from '../fhir/sharding';
 import { SelectQuery } from '../fhir/sql';
-import { addTestUser, initTestAuth, setupPwnedPasswordMock, setupRecaptchaMock, withTestContext } from '../test.setup';
+import {
+  addTestUser,
+  createTestProject,
+  getSuperAdminAccessToken,
+  setupRecaptchaMock,
+  withTestContext,
+} from '../test.setup';
+import { inviteUser } from './invite';
 
-jest.mock('hibp');
-jest.mock('node-fetch');
-
+const fetchMock = vi.spyOn(globalThis, 'fetch');
 const app = express();
+
+async function addAllowedEmailDomain(project: WithId<Project>, domain: string): Promise<WithId<Project>> {
+  const systemRepo = await getProjectSystemRepo(project);
+  return withTestContext(() =>
+    systemRepo.updateResource<Project>({
+      ...project,
+      setting: [...(project.setting ?? []), { name: 'allowedPractitionerEmailDomain', valueString: domain }],
+    })
+  );
+}
 
 describe('Admin Invite', () => {
   let mockSESv2Client: AwsClientStub<SESv2Client>;
+  let globalPool: Pool;
 
   beforeAll(async () => {
     const config = await loadTestConfig();
     config.emailProvider = 'awsses';
     await withTestContext(() => initApp(app, config));
+    globalPool = getDatabasePool(DatabaseMode.WRITER, GLOBAL_SHARD_ID);
   });
 
   afterAll(async () => {
@@ -43,10 +79,9 @@ describe('Admin Invite', () => {
     mockSESv2Client = mockClient(SESv2Client);
     mockSESv2Client.on(SendEmailCommand).resolves({ MessageId: 'ID_TEST_123' });
 
-    (fetch as unknown as jest.Mock).mockClear();
-    (pwnedPassword as unknown as jest.Mock).mockClear();
-    setupPwnedPasswordMock(pwnedPassword as unknown as jest.Mock, 0);
-    setupRecaptchaMock(fetch as unknown as jest.Mock, true);
+    fetchMock.mockClear();
+    setupRecaptchaMock(true);
+    getConfig().blockedEmailDomains = undefined;
   });
 
   afterEach(() => {
@@ -81,22 +116,18 @@ describe('Admin Invite', () => {
         email: bobEmail,
       });
 
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.invitedBy).toMatchObject(createReference(aliceUser));
     expect(mockSESv2Client.send.callCount).toBe(1);
-    expect(mockSESv2Client).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
 
     const inputArgs = mockSESv2Client.commandCalls(SendEmailCommand)[0].args[0].input;
 
     expect(inputArgs?.Destination?.ToAddresses?.[0] ?? '').toBe(bobEmail);
-
     const parsed = await simpleParser(Readable.from(inputArgs?.Content?.Raw?.Data ?? ''));
 
     expect(parsed.subject).toBe('Welcome to Medplum');
-    const rows = await new SelectQuery('User')
-      .column('content')
-      .where('email', '=', bobEmail)
-      .execute(getDatabasePool(DatabaseMode.READER));
+    const rows = await new SelectQuery('User').column('content').where('email', '=', bobEmail).execute(globalPool);
     const user = JSON.parse(rows[0].content) as User;
     expect(user.meta?.project).toStrictEqual(undefined);
   });
@@ -137,9 +168,9 @@ describe('Admin Invite', () => {
         email: bobEmail,
       });
 
-    expect(res3.status).toBe(200);
+    expect(res3).toHaveStatus(200);
     expect(mockSESv2Client.send.callCount).toBe(1);
-    expect(mockSESv2Client).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
 
     const inputArgs = mockSESv2Client.commandCalls(SendEmailCommand)[0].args[0].input;
 
@@ -148,10 +179,7 @@ describe('Admin Invite', () => {
     const parsed = await simpleParser(Readable.from(inputArgs?.Content?.Raw?.Data ?? ''));
     expect(parsed.subject).toBe('Medplum: Welcome to Alice Project');
 
-    const rows = await new SelectQuery('User')
-      .column('content')
-      .where('email', '=', bobEmail)
-      .execute(getDatabasePool(DatabaseMode.READER));
+    const rows = await new SelectQuery('User').column('content').where('email', '=', bobEmail).execute(globalPool);
     const user = JSON.parse(rows[0].content) as User;
     expect(user.meta?.project).toStrictEqual(undefined);
   });
@@ -179,7 +207,7 @@ describe('Admin Invite', () => {
         name: [{ given: ['Bob'], family: 'Jones' }],
         telecom: [{ system: 'email', value: bobEmail }],
       });
-    expect(res2.status).toBe(201);
+    expect(res2).toHaveStatus(201);
     expect(res2.body.id).toBeDefined();
 
     // Third, Alice invites Bob to the project
@@ -195,13 +223,10 @@ describe('Admin Invite', () => {
         email: bobEmail,
       });
 
-    expect(res3.status).toBe(200);
+    expect(res3).toHaveStatus(200);
     expect(res3.body.profile.reference).toStrictEqual(getReferenceString(res2.body));
 
-    const rows = await new SelectQuery('User')
-      .column('content')
-      .where('email', '=', bobEmail)
-      .execute(getDatabasePool(DatabaseMode.READER));
+    const rows = await new SelectQuery('User').column('content').where('email', '=', bobEmail).execute(globalPool);
     const user = JSON.parse(rows[0].content) as User;
     expect(user.meta?.project).toStrictEqual(undefined);
   });
@@ -228,7 +253,7 @@ describe('Admin Invite', () => {
         resourceType: 'Practitioner',
         name: [{ given: ['Bob'], family: 'Jones' }],
       });
-    expect(res2.status).toBe(201);
+    expect(res2).toHaveStatus(201);
     expect(res2.body.id).toBeDefined();
 
     // Third, Alice invites Bob to the project
@@ -247,13 +272,10 @@ describe('Admin Invite', () => {
         },
       });
 
-    expect(res3.status).toBe(200);
+    expect(res3).toHaveStatus(200);
     expect(res3.body.profile.reference).toStrictEqual(getReferenceString(res2.body));
 
-    const rows = await new SelectQuery('User')
-      .column('content')
-      .where('email', '=', bobEmail)
-      .execute(getDatabasePool(DatabaseMode.READER));
+    const rows = await new SelectQuery('User').column('content').where('email', '=', bobEmail).execute(globalPool);
     const user = JSON.parse(rows[0].content) as User;
     expect(user.meta?.project).toStrictEqual(undefined);
   });
@@ -286,9 +308,9 @@ describe('Admin Invite', () => {
         email: `carol${randomUUID()}@example.com`,
       });
 
-    expect(res3.status).toBe(403);
+    expect(res3).toHaveStatus(403);
     expect(mockSESv2Client.send.callCount).toBe(0);
-    expect(mockSESv2Client).not.toHaveReceivedCommand(SendEmailCommand);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(0);
   });
 
   test('Input validation', async () => {
@@ -316,10 +338,10 @@ describe('Admin Invite', () => {
         email: '',
       });
 
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue).toBeDefined();
     expect(mockSESv2Client.send.callCount).toBe(0);
-    expect(mockSESv2Client).not.toHaveReceivedCommand(SendEmailCommand);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(0);
   });
 
   test('Do not send email', async () => {
@@ -347,9 +369,9 @@ describe('Admin Invite', () => {
         sendEmail: false,
       });
 
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(mockSESv2Client.send.callCount).toBe(0);
-    expect(mockSESv2Client).not.toHaveReceivedCommand(SendEmailCommand);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(0);
   });
 
   test('Invite by externalId', async () => {
@@ -379,16 +401,13 @@ describe('Admin Invite', () => {
         externalId: bobSub,
       });
 
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.profile.reference).toContain('Patient/');
     expect(res2.body.admin).toBe(undefined);
     expect(mockSESv2Client.send.callCount).toBe(0);
-    expect(mockSESv2Client).not.toHaveReceivedCommand(SendEmailCommand);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(0);
 
-    const rows = await new SelectQuery('User')
-      .column('projectId')
-      .where('email', '=', bobEmail)
-      .execute(getDatabasePool(DatabaseMode.READER));
+    const rows = await new SelectQuery('User').column('projectId').where('email', '=', bobEmail).execute(globalPool);
     expect(rows[0].projectId).toStrictEqual(project.id);
   });
 
@@ -416,7 +435,7 @@ describe('Admin Invite', () => {
         externalId: bobSub,
       });
 
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
 
     // Third, Alice tries to invite Carol to the project with the same externalId
     // This should fail
@@ -431,7 +450,7 @@ describe('Admin Invite', () => {
         externalId: carolSub,
       });
 
-    expect(res3.status).toBe(409);
+    expect(res3).toHaveStatus(409);
     expect(res3.body.issue[0].details.text).toMatch(/already exists/);
   });
 
@@ -458,7 +477,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         externalId: bobSub,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.profile.reference).toContain('Patient/');
 
     // Delete the ProjectMembership
@@ -468,7 +487,7 @@ describe('Admin Invite', () => {
       .delete('/fhir/R4/ProjectMembership/' + res2.body.id)
       .set('Authorization', 'Bearer ' + accessToken)
       .send({});
-    expect(res3.status).toBe(200);
+    expect(res3).toHaveStatus(200);
 
     // Alice invites Bob to the project again
     // Make sure that we can reuse the same externalId
@@ -481,7 +500,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         externalId: bobSub,
       });
-    expect(res4.status).toBe(200);
+    expect(res4).toHaveStatus(200);
     expect(res4.body.profile.reference).toContain('Patient/');
   });
 
@@ -501,7 +520,7 @@ describe('Admin Invite', () => {
     const res2 = await request(app)
       .get('/fhir/R4/ProjectMembership?profile=' + getReferenceString(client))
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
 
     const clientMembership = res2.body.entry.find(
       (e: BundleEntry<ProjectMembership>) => e.resource?.profile?.reference === getReferenceString(client)
@@ -512,7 +531,7 @@ describe('Admin Invite', () => {
     const res4 = await request(app)
       .get('/admin/projects/' + project.id + '/members/' + clientMembership.id)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res4.status).toBe(200);
+    expect(res4).toHaveStatus(200);
 
     // Promote the client to admin
     const res7 = await request(app)
@@ -523,7 +542,7 @@ describe('Admin Invite', () => {
         ...res4.body,
         admin: true,
       });
-    expect(res7.status).toBe(200);
+    expect(res7).toHaveStatus(200);
 
     // Call the invite endpoint as the client
     const bobEmail = `bob${randomUUID()}@example.com`;
@@ -537,7 +556,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: bobEmail,
       });
-    expect(res8.status).toBe(200);
+    expect(res8).toHaveStatus(200);
     expect(res8.body.profile.reference).toContain('Patient/');
   });
 
@@ -565,15 +584,12 @@ describe('Admin Invite', () => {
         email: bobEmail,
         admin: true,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.admin).toBe(true);
     expect(mockSESv2Client.send.callCount).toBe(1);
-    expect(mockSESv2Client).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
 
-    const rows = await new SelectQuery('User')
-      .column('projectId')
-      .where('email', '=', bobEmail)
-      .execute(getDatabasePool(DatabaseMode.READER));
+    const rows = await new SelectQuery('User').column('projectId').where('email', '=', bobEmail).execute(globalPool);
     expect(rows[0].projectId).toStrictEqual(project.id);
   });
 
@@ -601,10 +617,10 @@ describe('Admin Invite', () => {
         email: bobEmail,
         admin: false,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.admin).toBe(false);
     expect(mockSESv2Client.send.callCount).toBe(1);
-    expect(mockSESv2Client).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
   });
 
   test('Email sending error due to SES not being set up', async () => {
@@ -632,7 +648,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: bobEmail,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(mockSESv2Client.send.callCount).toBe(1);
     expect(res2.body.issue?.[0].details.text).toBe('Could not send email. Make sure you have AWS SES set up.');
   });
@@ -650,7 +666,7 @@ describe('Admin Invite', () => {
     );
 
     // As a super admin, invite Bob to Alice's project
-    const superAdminAccessToken = await initTestAuth({ superAdmin: true });
+    const superAdminAccessToken = await getSuperAdminAccessToken();
     const res = await request(app)
       .post('/admin/projects/' + aliceRegistration.project.id + '/invite')
       .set('Authorization', 'Bearer ' + superAdminAccessToken)
@@ -661,7 +677,7 @@ describe('Admin Invite', () => {
         email: `bob${randomUUID()}@example.com`,
         sendEmail: false,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect((res.body as ProjectMembership).project?.reference).toBe(getReferenceString(aliceRegistration.project));
   });
 
@@ -690,10 +706,10 @@ describe('Admin Invite', () => {
         email: upperBobEmail,
       });
 
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.user.display).toBe(lowerBobEmail);
     expect(mockSESv2Client.send.callCount).toBe(1);
-    expect(mockSESv2Client).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
 
     const inputArgs = mockSESv2Client.commandCalls(SendEmailCommand)[0].args[0].input;
 
@@ -725,7 +741,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: bobEmail,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toBe('ProjectMembership');
 
     // Invite Bob second time - should fail
@@ -738,7 +754,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: bobEmail,
       });
-    expect(res3.status).toBe(409);
+    expect(res3).toHaveStatus(409);
     expect(normalizeErrorString(res3.body)).toStrictEqual('User is already a member of this project');
 
     // Invite Bob third time with "upsert = true" - should succeed
@@ -752,7 +768,7 @@ describe('Admin Invite', () => {
         email: bobEmail,
         upsert: true,
       });
-    expect(res4.status).toBe(200);
+    expect(res4).toHaveStatus(200);
     expect(res4.body.resourceType).toBe('ProjectMembership');
     expect(res4.body.id).toStrictEqual(res2.body.id);
     expect(res4.body.invitedBy).toBeDefined();
@@ -769,7 +785,7 @@ describe('Admin Invite', () => {
         upsert: true,
         membership: { profile: createReference(profile) },
       });
-    expect(res5.status).toBe(409);
+    expect(res5).toHaveStatus(409);
     expect(normalizeErrorString(res5.body)).toStrictEqual(
       'User is already a member of this project with a different profile'
     );
@@ -785,7 +801,7 @@ describe('Admin Invite', () => {
         email: bobEmail,
         forceNewMembership: true,
       });
-    expect(res6.status).toBe(200);
+    expect(res6).toHaveStatus(200);
     expect(res6.body.resourceType).toBe('ProjectMembership');
     expect(res6.body.id).not.toStrictEqual(res2.body.id);
   });
@@ -812,7 +828,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: bobEmail,
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toBe('ProjectMembership');
 
     // Invite Bob second time as project scoped user - should fail
@@ -826,7 +842,7 @@ describe('Admin Invite', () => {
         email: bobEmail,
         scope: 'project',
       });
-    expect(res3.status).toBe(409);
+    expect(res3).toHaveStatus(409);
     expect(normalizeErrorString(res3.body)).toStrictEqual('User is already a member of this project');
   });
 
@@ -853,7 +869,7 @@ describe('Admin Invite', () => {
         email: bobEmail,
         scope: 'project',
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toBe('ProjectMembership');
 
     // Invite Bob second time as server-scoped user - should fail
@@ -866,7 +882,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: bobEmail,
       });
-    expect(res3.status).toBe(409);
+    expect(res3).toHaveStatus(409);
     expect(normalizeErrorString(res3.body)).toStrictEqual('User is already a member of this project');
   });
 
@@ -892,7 +908,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: bobEmail,
       });
-    expect(resBob1.status).toBe(200);
+    expect(resBob1).toHaveStatus(200);
     expect(resBob1.body.resourceType).toBe('ProjectMembership');
 
     const resBob2 = await request(app)
@@ -905,7 +921,7 @@ describe('Admin Invite', () => {
         email: bobEmail,
         forceNewMembership: true,
       });
-    expect(resBob2.status).toBe(200);
+    expect(resBob2).toHaveStatus(200);
     expect(resBob2.body.resourceType).toBe('ProjectMembership');
     expect(resBob2.body.id).not.toStrictEqual(resBob1.body.id);
 
@@ -920,7 +936,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: jackEmail,
       });
-    expect(resJack1.status).toBe(200);
+    expect(resJack1).toHaveStatus(200);
     expect(resJack1.body.resourceType).toBe('ProjectMembership');
 
     const resJack2 = await request(app)
@@ -933,7 +949,7 @@ describe('Admin Invite', () => {
         email: jackEmail,
         forceNewMembership: true,
       });
-    expect(resJack2.status).toBe(200);
+    expect(resJack2).toHaveStatus(200);
     expect(resJack2.body.resourceType).toBe('ProjectMembership');
     expect(resJack2.body.id).not.toStrictEqual(resJack1.body.id);
 
@@ -949,7 +965,7 @@ describe('Admin Invite', () => {
         email: jillEmail,
         scope: 'project',
       });
-    expect(resJill1.status).toBe(200);
+    expect(resJill1).toHaveStatus(200);
     expect(resJill1.body.resourceType).toBe('ProjectMembership');
 
     const resJill2 = await request(app)
@@ -963,7 +979,7 @@ describe('Admin Invite', () => {
         scope: 'project',
         forceNewMembership: true,
       });
-    expect(resJill2.status).toBe(200);
+    expect(resJill2).toHaveStatus(200);
     expect(resJill2.body.resourceType).toBe('ProjectMembership');
     expect(resJill2.body.id).not.toStrictEqual(resJill1.body.id);
 
@@ -978,7 +994,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: camEmail,
       });
-    expect(resCam1.status).toBe(200);
+    expect(resCam1).toHaveStatus(200);
     expect(resCam1.body.resourceType).toBe('ProjectMembership');
 
     const resCam2 = await request(app)
@@ -992,7 +1008,7 @@ describe('Admin Invite', () => {
         scope: 'project',
         forceNewMembership: true,
       });
-    expect(resCam2.status).toBe(200);
+    expect(resCam2).toHaveStatus(200);
     expect(resCam2.body.resourceType).toBe('ProjectMembership');
     expect(resCam2.body.id).not.toStrictEqual(resCam1.body.id);
 
@@ -1007,7 +1023,7 @@ describe('Admin Invite', () => {
         lastName: 'Jones',
         email: tomEmail,
       });
-    expect(resTom1.status).toBe(200);
+    expect(resTom1).toHaveStatus(200);
     expect(resTom1.body.resourceType).toBe('ProjectMembership');
 
     const resTom2 = await request(app)
@@ -1021,7 +1037,7 @@ describe('Admin Invite', () => {
         scope: 'project',
         forceNewMembership: true,
       });
-    expect(resTom2.status).toBe(200);
+    expect(resTom2).toHaveStatus(200);
     expect(resTom2.body.resourceType).toBe('ProjectMembership');
     expect(resTom2.body.id).not.toStrictEqual(resTom1.body.id);
   });
@@ -1050,11 +1066,11 @@ describe('Admin Invite', () => {
         scope: 'project',
       });
 
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     const res2 = await request(app)
       .get('/fhir/R4/User?email=' + bobEmail)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     const user = res2.body.entry[0].resource;
     expect(user.resourceType).toBe('User');
     expect(user.project.reference).toBe(getReferenceString(project));
@@ -1084,11 +1100,11 @@ describe('Admin Invite', () => {
         scope: 'server',
       });
 
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     const res2 = await request(app)
       .get('/fhir/R4/User?email=' + bobEmail)
       .set('Authorization', 'Bearer ' + accessToken);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body.resourceType).toBe('Bundle');
     expect(res2.body.entry).toBeUndefined();
   });
@@ -1118,9 +1134,9 @@ describe('Admin Invite', () => {
         mfaRequired: true,
       });
 
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     expect(mockSESv2Client.send.callCount).toBe(1);
-    expect(mockSESv2Client).toHaveReceivedCommandTimes(SendEmailCommand, 1);
+    expect(mockSESv2Client.commandCalls(SendEmailCommand)).toHaveLength(1);
 
     const inputArgs = mockSESv2Client.commandCalls(SendEmailCommand)[0].args[0].input;
     expect(inputArgs?.Destination?.ToAddresses?.[0] ?? '').toBe(bobEmail);
@@ -1144,7 +1160,7 @@ describe('Admin Invite', () => {
       secret: setPasswordSecret,
       password: bobPassword,
     });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body).toMatchObject(allOk);
 
     // Start new login
@@ -1153,7 +1169,7 @@ describe('Admin Invite', () => {
       password: bobPassword,
       scope: 'openid',
     });
-    expect(res3.status).toBe(200);
+    expect(res3).toHaveStatus(200);
     expect(res3.body.login).toBeDefined();
     expect(res3.body.mfaEnrollRequired).toBe(true);
     expect(res3.body.enrollUri).toBeDefined();
@@ -1167,7 +1183,7 @@ describe('Admin Invite', () => {
       .set('Authorization', `Bearer ${accessToken}`)
       .type('json')
       .send({ login: res3.body.login, token: 'invalid' });
-    expect(res4.status).toBe(400);
+    expect(res4).toHaveStatus(400);
     expect(res4.body.issue[0].details.text).toBe('Invalid MFA token');
 
     // Enroll with actual token, should succeed
@@ -1176,7 +1192,7 @@ describe('Admin Invite', () => {
       .set('Authorization', `Bearer ${accessToken}`)
       .type('json')
       .send({ login: res3.body.login, token: authenticator.generate(secret) });
-    expect(res5.status).toBe(200);
+    expect(res5).toHaveStatus(200);
     expect(res5.body.login).toBeDefined();
     expect(res5.body.code).toBeDefined();
 
@@ -1186,7 +1202,7 @@ describe('Admin Invite', () => {
       .set('Authorization', `Bearer ${accessToken}`)
       .type('json')
       .send({ login: res3.body.login, token: authenticator.generate(secret) });
-    expect(res6.status).toBe(400);
+    expect(res6).toHaveStatus(400);
     expect(res6.body.issue[0].details.text).toBe('Already enrolled');
   });
 
@@ -1210,7 +1226,7 @@ describe('Admin Invite', () => {
         resourceType: 'AccessPolicy',
         resource: [{ resourceType: 'Patient' }],
       });
-    expect(accessPolicyRes.status).toBe(201);
+    expect(accessPolicyRes).toHaveStatus(201);
     const accessPolicy = accessPolicyRes.body;
 
     // Invite Bob with the valid access policy
@@ -1227,7 +1243,7 @@ describe('Admin Invite', () => {
         sendEmail: false,
       });
 
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.resourceType).toBe('ProjectMembership');
     expect(res.body.accessPolicy?.reference).toBe(getReferenceString(accessPolicy));
   });
@@ -1258,7 +1274,7 @@ describe('Admin Invite', () => {
         sendEmail: false,
       });
 
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(normalizeErrorString(res.body)).toContain('Access policy');
     expect(normalizeErrorString(res.body)).toContain('does not exist');
@@ -1285,7 +1301,7 @@ describe('Admin Invite', () => {
         resourceType: 'AccessPolicy',
         resource: [{ resourceType: 'Patient' }],
       });
-    expect(accessPolicyRes.status).toBe(201);
+    expect(accessPolicyRes).toHaveStatus(201);
     const accessPolicy = accessPolicyRes.body;
 
     // Create second project with Bob
@@ -1313,7 +1329,7 @@ describe('Admin Invite', () => {
         sendEmail: false,
       });
 
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(normalizeErrorString(res.body)).toContain('Access policy');
     expect(normalizeErrorString(res.body)).toContain('does not belong to this project');
@@ -1344,7 +1360,7 @@ describe('Admin Invite', () => {
         sendEmail: false,
       });
 
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body.resourceType).toBe('ProjectMembership');
   });
 
@@ -1368,7 +1384,7 @@ describe('Admin Invite', () => {
         resourceType: 'AccessPolicy',
         resource: [{ resourceType: 'Patient' }],
       });
-    expect(accessPolicyRes.status).toBe(201);
+    expect(accessPolicyRes).toHaveStatus(201);
     const validAccessPolicy = accessPolicyRes.body;
 
     // Try to invite with access array containing both valid and invalid policies
@@ -1389,7 +1405,7 @@ describe('Admin Invite', () => {
         sendEmail: false,
       });
 
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(normalizeErrorString(res.body)).toContain('Access policy');
     expect(normalizeErrorString(res.body)).toContain('does not exist');
@@ -1423,9 +1439,852 @@ describe('Admin Invite', () => {
         sendEmail: false,
       });
 
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue).toBeDefined();
     expect(normalizeErrorString(res.body)).toContain('Access policy');
     expect(normalizeErrorString(res.body)).toContain('does not exist');
+  });
+
+  test('Invite Patient with scope: server creates server-scoped user', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const bobEmail = `bob${randomUUID()}@example.com`;
+    const res = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: bobEmail,
+        scope: 'server',
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(200);
+    expect(res.body.resourceType).toBe('ProjectMembership');
+
+    // Server-scoped user should NOT be visible from the project context
+    const res2 = await request(app)
+      .get('/fhir/R4/User?email=' + bobEmail)
+      .set('Authorization', 'Bearer ' + accessToken);
+    expect(res2).toHaveStatus(200);
+    expect(res2.body.resourceType).toBe('Bundle');
+    expect(res2.body.entry).toBeUndefined();
+  });
+
+  test('Invite Patient without scope defaults to project-scoped', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const bobEmail = `bob${randomUUID()}@example.com`;
+    const res = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: bobEmail,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(200);
+
+    // Project-scoped user should be visible from the project context
+    const res2 = await request(app)
+      .get('/fhir/R4/User?email=' + bobEmail)
+      .set('Authorization', 'Bearer ' + accessToken);
+    expect(res2).toHaveStatus(200);
+    const user = res2.body.entry[0].resource;
+    expect(user.resourceType).toBe('User');
+    expect(user.project?.reference).toBe(getReferenceString(project));
+  });
+
+  test('Invite Patient with scope: server - conflict with existing project-scoped Patient', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const bobEmail = `bob${randomUUID()}@example.com`;
+
+    // Invite Bob first as project-scoped Patient
+    const res1 = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: bobEmail,
+        sendEmail: false,
+      });
+    expect(res1).toHaveStatus(200);
+
+    // Invite Bob again as server-scoped Patient - should fail (different scope, same project)
+    const res2 = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: bobEmail,
+        scope: 'server',
+        sendEmail: false,
+      });
+    expect(res2).toHaveStatus(409);
+    expect(normalizeErrorString(res2.body)).toStrictEqual('User is already a member of this project');
+  });
+
+  test('Invite Patient applies defaultPatientAccessPolicy when no explicit policy', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const defaultAccessPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const projectWithDefault = await systemRepo.updateResource({
+        ...project,
+        defaultPatientAccessPolicy: createReference(defaultAccessPolicy),
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithDefault,
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy?.reference).toBe(getReferenceString(defaultAccessPolicy));
+    }));
+
+  test('Invite Patient uses explicit access policy over defaultPatientAccessPolicy', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const defaultAccessPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const explicitAccessPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Explicit Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const projectWithDefault = await systemRepo.updateResource({
+        ...project,
+        defaultPatientAccessPolicy: createReference(defaultAccessPolicy),
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithDefault,
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        accessPolicy: createReference(explicitAccessPolicy),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy?.reference).toBe(getReferenceString(explicitAccessPolicy));
+    }));
+
+  test('Invite Patient without explicit policy and no defaultPatientAccessPolicy', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+
+      const { membership } = await inviteUser({
+        project,
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy).toBeUndefined();
+    }));
+
+  test('Invite Practitioner does not apply defaultPatientAccessPolicy', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const defaultAccessPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const projectWithDefault = await systemRepo.updateResource({
+        ...project,
+        defaultPatientAccessPolicy: createReference(defaultAccessPolicy),
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithDefault,
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy).toBeUndefined();
+    }));
+
+  test('Invite RelatedPerson does not apply defaultPatientAccessPolicy', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const defaultAccessPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const patient = await systemRepo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { project: project.id },
+        name: [{ given: ['Alice'], family: 'Smith' }],
+      });
+      const relatedPerson = await systemRepo.createResource<RelatedPerson>({
+        resourceType: 'RelatedPerson',
+        meta: { project: project.id },
+        patient: createReference(patient),
+        name: [{ given: ['Bob'], family: 'Jones' }],
+      });
+      const projectWithDefault = await systemRepo.updateResource({
+        ...project,
+        defaultPatientAccessPolicy: createReference(defaultAccessPolicy),
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithDefault,
+        resourceType: 'RelatedPerson',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+        membership: {
+          profile: createReference(relatedPerson),
+        },
+      });
+
+      expect(membership.accessPolicy).toBeUndefined();
+    }));
+
+  test('Invite RelatedPerson provisions profile with patient', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const patient = await systemRepo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { project: project.id },
+        name: [{ given: ['Alice'], family: 'Smith' }],
+      });
+
+      const { profile } = await inviteUser({
+        project,
+        resourceType: 'RelatedPerson',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+        patient: createReference(patient),
+      });
+
+      expect(profile.resourceType).toStrictEqual('RelatedPerson');
+      expect((profile as RelatedPerson).patient).toMatchObject(createReference(patient));
+    }));
+
+  test('Invite RelatedPerson without patient throws', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+
+      await expect(
+        inviteUser({
+          project,
+          resourceType: 'RelatedPerson',
+          firstName: 'Bob',
+          lastName: 'Jones',
+          externalId: randomUUID(),
+          sendEmail: false,
+        })
+      ).rejects.toThrow('Patient is required to create a RelatedPerson');
+    }));
+
+  test('Invite RelatedPerson with non-existent patient throws badRequest', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const patientReference = { reference: `Patient/${randomUUID()}` } as Reference<Patient>;
+
+      await expect(
+        inviteUser({
+          project,
+          resourceType: 'RelatedPerson',
+          firstName: 'Bob',
+          lastName: 'Jones',
+          externalId: randomUUID(),
+          sendEmail: false,
+          patient: patientReference,
+        })
+      ).rejects.toThrow(`Patient ${patientReference.reference} does not exist`);
+    }));
+
+  test('Invite existing RelatedPerson by email does not require patient', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const bobEmail = `bob${randomUUID()}@example.com`;
+
+    // Pre-create a Patient and a RelatedPerson with a matching email in the project.
+    const relatedPerson = await withTestContext(async () => {
+      const systemRepo = await getProjectSystemRepo(project);
+      const patient = await systemRepo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { project: project.id },
+        name: [{ given: ['Carol'], family: 'Patient' }],
+      });
+      return systemRepo.createResource<RelatedPerson>({
+        resourceType: 'RelatedPerson',
+        meta: { project: project.id },
+        patient: createReference(patient),
+        name: [{ given: ['Bob'], family: 'Jones' }],
+        telecom: [{ system: 'email', use: 'work', value: bobEmail }],
+      });
+    });
+
+    // Invite by email with NO patient param. The existing RelatedPerson matches
+    // by project + email, so it should be reused rather than requiring a patient.
+    const res = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'RelatedPerson',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: bobEmail,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(200);
+    expect(res.body.profile).toMatchObject(createReference(relatedPerson));
+  });
+
+  test('Invite RelatedPerson by email with duplicate matches throws', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+
+    const bobEmail = `bob${randomUUID()}@example.com`;
+
+    // Pre-create two RelatedPersons sharing the same email in the project.
+    await withTestContext(async () => {
+      const systemRepo = await getProjectSystemRepo(project);
+      const patient = await systemRepo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { project: project.id },
+        name: [{ given: ['Carol'], family: 'Patient' }],
+      });
+      for (let i = 0; i < 2; i++) {
+        await systemRepo.createResource<RelatedPerson>({
+          resourceType: 'RelatedPerson',
+          meta: { project: project.id },
+          patient: createReference(patient),
+          name: [{ given: ['Bob'], family: 'Jones' }],
+          telecom: [{ system: 'email', use: 'work', value: bobEmail }],
+        });
+      }
+    });
+
+    // Inviting by email with no patient must fail deterministically rather than
+    // arbitrarily picking one of the duplicate RelatedPersons.
+    const res = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'RelatedPerson',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: bobEmail,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(412);
+    expect(res.body.issue?.[0]?.code).toStrictEqual('multiple-matches');
+  });
+
+  test('Invite RelatedPerson with patient from another project throws', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const { project: otherProject } = await createTestProject();
+      const otherSystemRepo = await getProjectSystemRepo(otherProject);
+      const otherPatient = await otherSystemRepo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { project: otherProject.id },
+        name: [{ given: ['Alice'], family: 'Smith' }],
+      });
+
+      await expect(
+        inviteUser({
+          project,
+          resourceType: 'RelatedPerson',
+          firstName: 'Bob',
+          lastName: 'Jones',
+          externalId: randomUUID(),
+          sendEmail: false,
+          patient: createReference(otherPatient),
+        })
+      ).rejects.toThrow('Patient does not belong to project');
+    }));
+
+  test('Invite Practitioner without patient does not error', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+
+      const { profile } = await inviteUser({
+        project,
+        resourceType: 'Practitioner',
+        firstName: 'Carol',
+        lastName: 'Davis',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(profile.resourceType).toStrictEqual('Practitioner');
+    }));
+
+  test('Invite Patient prefers defaultAccessPolicies over legacy defaultPatientAccessPolicy', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const legacyPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Legacy Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const newPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'New Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const projectWithBoth = await systemRepo.updateResource({
+        ...project,
+        defaultPatientAccessPolicy: createReference(legacyPolicy),
+        defaultAccessPolicies: [{ profileType: 'Patient', accessPolicy: createReference(newPolicy) }],
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithBoth,
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy?.reference).toBe(getReferenceString(newPolicy));
+    }));
+
+  test('Invite Patient falls back to legacy defaultPatientAccessPolicy when not in defaultAccessPolicies', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const legacyPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Legacy Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const projectWithLegacyOnly = await systemRepo.updateResource({
+        ...project,
+        defaultPatientAccessPolicy: createReference(legacyPolicy),
+        defaultAccessPolicies: [
+          {
+            profileType: 'RelatedPerson',
+            accessPolicy: createReference(legacyPolicy),
+          },
+        ],
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithLegacyOnly,
+        resourceType: 'Patient',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy?.reference).toBe(getReferenceString(legacyPolicy));
+    }));
+
+  test('Invite RelatedPerson applies defaultAccessPolicies with patient parameter', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const relatedPersonPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default RelatedPerson Policy',
+        compartment: { reference: '%patient' },
+        resource: [{ resourceType: 'RelatedPerson', criteria: 'RelatedPerson?patient=%patient' }],
+      });
+      const patient = await systemRepo.createResource<Patient>({
+        resourceType: 'Patient',
+        meta: { project: project.id },
+        name: [{ given: ['Alice'], family: 'Smith' }],
+      });
+      const projectWithDefault = await systemRepo.updateResource({
+        ...project,
+        defaultAccessPolicies: [{ profileType: 'RelatedPerson', accessPolicy: createReference(relatedPersonPolicy) }],
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithDefault,
+        resourceType: 'RelatedPerson',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+        patient: createReference(patient),
+      });
+
+      expect(membership.access).toHaveLength(1);
+      expect(membership.access?.[0].policy?.reference).toBe(getReferenceString(relatedPersonPolicy));
+      expect(membership.access?.[0].parameter).toHaveLength(1);
+      expect(membership.access?.[0].parameter?.[0].name).toBe('patient');
+      expect(membership.access?.[0].parameter?.[0].valueReference?.reference).toBe(getReferenceString(patient));
+    }));
+
+  test('Invite admin Practitioner applies Admin defaultAccessPolicies', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const adminPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Admin Policy',
+        resource: [{ resourceType: '*' }],
+      });
+      const projectWithDefault = await systemRepo.updateResource({
+        ...project,
+        defaultAccessPolicies: [{ profileType: 'Admin', accessPolicy: createReference(adminPolicy) }],
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithDefault,
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+        admin: true,
+      });
+
+      expect(membership.accessPolicy?.reference).toBe(getReferenceString(adminPolicy));
+    }));
+
+  test('Invite non-admin Practitioner applies Practitioner defaultAccessPolicies (not Admin)', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      const adminPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Admin Policy',
+        resource: [{ resourceType: '*' }],
+      });
+      const practitionerPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Practitioner Policy',
+        resource: [{ resourceType: '*', readonly: true }, { resourceType: 'Patient' }],
+      });
+      const projectWithDefault = await systemRepo.updateResource({
+        ...project,
+        defaultAccessPolicies: [
+          { profileType: 'Admin', accessPolicy: createReference(adminPolicy) },
+          { profileType: 'Practitioner', accessPolicy: createReference(practitionerPolicy) },
+        ],
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithDefault,
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy?.reference).toBe(getReferenceString(practitionerPolicy));
+    }));
+
+  test('Invite admin Practitioner applies no policy when there is no Admin default', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      // A project with some defaults, including a Practitioner default, but none for the Admin role.
+      // The Practitioner default must NOT be selected for an admin invite.
+      const patientPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const practitionerPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Practitioner Policy',
+        resource: [{ resourceType: '*', readonly: true }, { resourceType: 'Patient' }],
+      });
+      const projectWithoutAdminDefault = await systemRepo.updateResource({
+        ...project,
+        defaultAccessPolicies: [
+          { profileType: 'Patient', accessPolicy: createReference(patientPolicy) },
+          { profileType: 'Practitioner', accessPolicy: createReference(practitionerPolicy) },
+        ],
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithoutAdminDefault,
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+        admin: true,
+      });
+
+      expect(membership.accessPolicy).toBeUndefined();
+    }));
+
+  test('Invite non-admin Practitioner applies no policy when there is no Practitioner default', () =>
+    withTestContext(async () => {
+      const { project } = await createTestProject();
+      const systemRepo = await getProjectSystemRepo(project);
+      // A project with some defaults, including an Admin default, but none for the Practitioner role.
+      // The Admin default must NOT be selected for a non-admin Practitioner invite.
+      const patientPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Patient Policy',
+        resource: [{ resourceType: 'Patient' }],
+      });
+      const adminPolicy = await systemRepo.createResource<AccessPolicy>({
+        resourceType: 'AccessPolicy',
+        name: 'Default Admin Policy',
+        resource: [{ resourceType: '*' }],
+      });
+      const projectWithoutPractitionerDefault = await systemRepo.updateResource({
+        ...project,
+        defaultAccessPolicies: [
+          { profileType: 'Patient', accessPolicy: createReference(patientPolicy) },
+          { profileType: 'Admin', accessPolicy: createReference(adminPolicy) },
+        ],
+      });
+
+      const { membership } = await inviteUser({
+        project: projectWithoutPractitionerDefault,
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+      expect(membership.accessPolicy).toBeUndefined();
+    }));
+
+  test('Invite with allowed email domain succeeds', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+    const restricted = await addAllowedEmailDomain(project, 'allowed.example.com');
+
+    const res = await request(app)
+      .post('/admin/projects/' + restricted.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: `bob${randomUUID()}@allowed.example.com`,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(200);
+  });
+
+  test('Invite with disallowed email domain is rejected', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+    const restricted = await addAllowedEmailDomain(project, 'allowed.example.com');
+
+    const res = await request(app)
+      .post('/admin/projects/' + restricted.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: `bob${randomUUID()}@other.example.com`,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(400);
+    expect(res.body).toMatchObject(badRequest('Email domain is not allowed for this project', 'email'));
+  });
+
+  test('Invite by externalId is unaffected by allowed domain restrictions', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+    const restricted = await addAllowedEmailDomain(project, 'allowed.example.com');
+
+    const res = await request(app)
+      .post('/admin/projects/' + restricted.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        externalId: randomUUID(),
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(200);
+  });
+
+  test('Super admin invite bypasses allowed domain restriction', async () => {
+    const { project } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+    const restricted = await addAllowedEmailDomain(project, 'allowed.example.com');
+
+    const superAdminAccessToken = await getSuperAdminAccessToken();
+    const res = await request(app)
+      .post('/admin/projects/' + restricted.id + '/invite')
+      .set('Authorization', 'Bearer ' + superAdminAccessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: `bob${randomUUID()}@other.example.com`,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(200);
+  });
+
+  test('Invite with blocked email domain is rejected even without project restrictions', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+    getConfig().blockedEmailDomains = ['blocked.example.com'];
+
+    const res = await request(app)
+      .post('/admin/projects/' + project.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: `bob${randomUUID()}@blocked.example.com`,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(400);
+    expect(res.body).toMatchObject(badRequest('Email domain is not allowed for this project', 'email'));
+  });
+
+  test('Invite with blocked email domain takes precedence over an allowed domain setting', async () => {
+    const { project, accessToken } = await withTestContext(() =>
+      registerNew({
+        firstName: 'Alice',
+        lastName: 'Smith',
+        projectName: 'Alice Project',
+        email: `alice${randomUUID()}@example.com`,
+        password: 'password!@#',
+      })
+    );
+    const restricted = await addAllowedEmailDomain(project, 'blocked.example.com');
+    getConfig().blockedEmailDomains = ['blocked.example.com'];
+
+    const res = await request(app)
+      .post('/admin/projects/' + restricted.id + '/invite')
+      .set('Authorization', 'Bearer ' + accessToken)
+      .send({
+        resourceType: 'Practitioner',
+        firstName: 'Bob',
+        lastName: 'Jones',
+        email: `bob${randomUUID()}@blocked.example.com`,
+        sendEmail: false,
+      });
+
+    expect(res).toHaveStatus(400);
+    expect(res.body).toMatchObject(badRequest('Email domain is not allowed for this project', 'email'));
   });
 });

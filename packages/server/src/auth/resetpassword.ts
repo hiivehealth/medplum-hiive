@@ -1,8 +1,8 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { Filter } from '@medplum/core';
+import type { Filter, WithId } from '@medplum/core';
 import { allOk, badRequest, concatUrls, createReference, Operator, resolveId } from '@medplum/core';
-import type { User, UserSecurityRequest } from '@medplum/fhirtypes';
+import type { Project, User, UserSecurityRequest } from '@medplum/fhirtypes';
 import type { Request, Response } from 'express';
 import { body } from 'express-validator';
 import { getConfig } from '../config/loader';
@@ -13,6 +13,7 @@ import { getGlobalSystemRepo } from '../fhir/repo';
 import { generateSecret } from '../oauth/keys';
 import { makeValidationMiddleware } from '../util/validator';
 import { isExternalAuth } from './method';
+import { getSecurityRequestExpiration, supersedePriorSecurityRequests } from './securityrequest';
 
 export const resetPasswordValidator = makeValidationMiddleware([
   body('email')
@@ -71,23 +72,28 @@ export async function resetPasswordHandler(req: Request, res: Response): Promise
   const url = await resetPassword(systemRepo, user, 'reset', req.body.redirectUri);
 
   if (req.body.sendEmail !== false) {
-    await sendEmail(systemRepo, {
-      to: user.email,
-      subject: 'Medplum Password Reset',
-      text: [
-        'Someone requested to reset your Medplum password.',
-        '',
-        'Please click on the following link:',
-        '',
-        url,
-        '',
-        'If you received this in error, you can safely ignore it.',
-        '',
-        'Thank you,',
-        'Medplum',
-        '',
-      ].join('\n'),
-    });
+    const project = user.project ? await systemRepo.readReference<Project>(user.project) : undefined;
+    await sendEmail(
+      systemRepo,
+      {
+        to: user.email,
+        subject: 'Medplum Password Reset',
+        text: [
+          'Someone requested to reset your Medplum password.',
+          '',
+          'Please click on the following link:',
+          '',
+          url,
+          '',
+          'If you received this in error, you can safely ignore it.',
+          '',
+          'Thank you,',
+          'Medplum',
+          '',
+        ].join('\n'),
+      },
+      project
+    );
   }
 
   sendOutcome(res, allOk);
@@ -104,10 +110,13 @@ export async function resetPasswordHandler(req: Request, res: Response): Promise
  */
 export async function resetPassword(
   systemRepo: SystemRepository,
-  user: User,
+  user: WithId<User>,
   type: UserSecurityRequest['type'],
   redirectUri?: string
 ): Promise<string> {
+  // Invalidate any prior requests of this type, so that only the newest link works
+  await supersedePriorSecurityRequests(systemRepo, user, type);
+
   // Create the password change request
   const { id, secret } = await systemRepo.createResource<UserSecurityRequest>({
     resourceType: 'UserSecurityRequest',
@@ -115,6 +124,7 @@ export async function resetPassword(
     type,
     user: createReference(user),
     secret: generateSecret(16),
+    expiresAt: getSecurityRequestExpiration(type),
     redirectUri,
   });
 

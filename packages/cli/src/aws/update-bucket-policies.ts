@@ -2,12 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { StackResource } from '@aws-sdk/client-cloudformation';
 import { GetBucketPolicyCommand, PutBucketPolicyCommand } from '@aws-sdk/client-s3';
+import { isDeepStrictEqual } from 'node:util';
 import { readConfig } from '../utils';
 import { createInvalidation, getStackByTag, printConfigNotFound, printStackNotFound, s3Client } from './utils';
 
 export interface UpdateBucketPoliciesOptions {
   file?: string;
   dryrun?: boolean;
+  guarddutyMalwareProtection?: boolean;
+  guarddutyOnDemandOnly?: boolean;
 }
 
 interface Policy {
@@ -16,10 +19,12 @@ interface Policy {
 }
 
 interface PolicyStatement {
+  Sid?: string;
   Effect?: string;
-  Principal?: { AWS: string };
+  Principal?: { AWS?: string; CanonicalUser?: string };
   Action?: string | string[];
   Resource?: string | string[];
+  Condition?: Record<string, Record<string, string | string[]>>;
 }
 
 /**
@@ -43,15 +48,29 @@ export async function updateBucketPoliciesCommand(tag: string, options: UpdateBu
     throw new Error(`Stack not found: ${tag}`);
   }
 
-  await updateBucketPolicy('App', details.appBucket, details.appDistribution, details.appOriginAccessIdentity, options);
+  try {
+    await updateBucketPolicy(
+      'App',
+      details.appBucket,
+      details.appDistribution,
+      details.appOriginAccessIdentity,
+      options
+    );
+  } catch (err) {
+    console.error(`Error updating App bucket policy: ${(err as Error).message}`);
+  }
 
-  await updateBucketPolicy(
-    'Storage',
-    details.storageBucket,
-    details.storageDistribution,
-    details.storageOriginAccessIdentity,
-    options
-  );
+  try {
+    await updateBucketPolicy(
+      'Storage',
+      details.storageBucket,
+      details.storageDistribution,
+      details.storageOriginAccessIdentity,
+      options
+    );
+  } catch (err) {
+    console.error(`Error updating Storage bucket policy: ${(err as Error).message}`);
+  }
 
   console.log('Done');
 }
@@ -78,11 +97,17 @@ export async function updateBucketPolicy(
   const bucketName = bucketResource.PhysicalResourceId;
   const oaiId = oaiResource.PhysicalResourceId;
   const bucketPolicy = await getPolicy(bucketName);
-  if (policyHasStatement(bucketPolicy, bucketName, oaiId)) {
+  const hasAllowStatement = policyHasAllowStatement(bucketPolicy, bucketName, oaiId);
+  if (!hasAllowStatement) {
+    addAllowPolicyStatement(bucketPolicy, bucketName, oaiId);
+  }
+  const gateChanged =
+    friendlyName === 'Storage' &&
+    options.guarddutyMalwareProtection &&
+    addGuardDutyReadPolicyStatement(bucketPolicy, bucketName, oaiId, options.guarddutyOnDemandOnly);
+  if (hasAllowStatement && !gateChanged) {
     throw new Error(`${friendlyName} bucket already has policy statement`);
   }
-
-  addPolicyStatement(bucketPolicy, bucketName, oaiId);
   console.log(`${friendlyName} bucket policy:`);
   console.log(JSON.stringify(bucketPolicy, undefined, 2));
 
@@ -121,7 +146,7 @@ async function setPolicy(bucketName: string, policy: Policy): Promise<void> {
   );
 }
 
-function policyHasStatement(policy: Policy, bucketName: string, oaiId: string): boolean {
+function policyHasAllowStatement(policy: Policy, bucketName: string, oaiId: string): boolean {
   return !!policy?.Statement?.some((s: PolicyStatement) => {
     return (
       s?.Effect === 'Allow' &&
@@ -137,7 +162,7 @@ function policyHasStatement(policy: Policy, bucketName: string, oaiId: string): 
   });
 }
 
-function addPolicyStatement(policy: Policy, bucketName: string, oaiId: string): void {
+function addAllowPolicyStatement(policy: Policy, bucketName: string, oaiId: string): void {
   if (!policy.Version) {
     policy.Version = '2012-10-17';
   }
@@ -154,4 +179,49 @@ function addPolicyStatement(policy: Policy, bucketName: string, oaiId: string): 
     Action: ['s3:GetObject*', 's3:GetBucket*', 's3:List*'],
     Resource: [`arn:aws:s3:::${bucketName}`, `arn:aws:s3:::${bucketName}/*`],
   });
+}
+
+function addGuardDutyReadPolicyStatement(
+  policy: Policy,
+  bucketName: string,
+  oaiId: string,
+  onDemandOnly: boolean | undefined
+): boolean {
+  const principal = `arn:aws:iam::cloudfront:user/CloudFront Origin Access Identity ${oaiId}`;
+  const tag = 's3:ExistingObjectTag/GuardDutyMalwareScanStatus';
+  const blanketCondition = { StringNotEquals: { [tag]: 'NO_THREATS_FOUND' } };
+  // Without automatic scans most objects are never scanned, so only block known threats
+  const [sid, condition]: [string, PolicyStatement['Condition']] = onDemandOnly
+    ? ['GuardDutyMalwareProtectionThreatsFoundGate', { StringEquals: { [tag]: 'THREATS_FOUND' } }]
+    : ['GuardDutyMalwareProtectionReadGate', blanketCondition];
+  const isReadGate = (s: PolicyStatement, gateCondition: PolicyStatement['Condition']): boolean =>
+    s?.Effect === 'Deny' &&
+    s?.Principal?.AWS === principal &&
+    statementHasAction(s, 's3:GetObject') &&
+    statementHasAction(s, 's3:GetObjectVersion') &&
+    isDeepStrictEqual(s?.Condition, gateCondition);
+
+  const original = policy.Statement ?? [];
+  const statements = original.filter((s) => !(onDemandOnly && isReadGate(s, blanketCondition)));
+  const removed = statements.length !== original.length;
+  const added = !statements.some((s) => isReadGate(s, condition));
+  if (added) {
+    statements.push({
+      Sid: sid,
+      Effect: 'Deny',
+      Principal: { AWS: principal },
+      Action: ['s3:GetObject', 's3:GetObjectVersion'],
+      Resource: `arn:aws:s3:::${bucketName}/*`,
+      Condition: condition,
+    });
+  }
+  policy.Statement = statements;
+  return removed || added;
+}
+
+function statementHasAction(statement: PolicyStatement, action: string): boolean {
+  if (statement.Action === action) {
+    return true;
+  }
+  return Array.isArray(statement.Action) && statement.Action.includes(action);
 }

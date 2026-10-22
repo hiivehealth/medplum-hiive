@@ -4,9 +4,11 @@ import { ContentType } from '@medplum/core';
 import type { Parameters } from '@medplum/fhirtypes';
 import express from 'express';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { initTestAuth } from '../../test.setup';
+import { globalLogger } from '../../logger';
+import { getSuperAdminAccessToken, initTestAuth } from '../../test.setup';
 
 describe('$db-schema-diff', () => {
   const app = express();
@@ -15,8 +17,8 @@ describe('$db-schema-diff', () => {
     const config = await loadTestConfig();
     await initApp(app, config);
 
-    // The migration script can log a lot to the console sometimes
-    console.log = jest.fn();
+    // The migration script can log a lot sometimes
+    vi.spyOn(globalLogger, 'write' as any).mockImplementation(() => undefined);
   });
 
   afterAll(async () => {
@@ -24,14 +26,14 @@ describe('$db-schema-diff', () => {
   });
 
   test('Success', async () => {
-    const accessToken = await initTestAuth({ project: { superAdmin: true } });
+    const accessToken = await getSuperAdminAccessToken();
 
     const res1 = await request(app)
       .post('/fhir/R4/$db-schema-diff')
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON)
       .send({});
-    expect(res1.status).toBe(200);
+    expect(res1).toHaveStatus(200);
     const params = res1.body as Parameters;
     const migrationString = params.parameter?.find((p) => p.name === 'migrationString')?.valueString;
     expect(migrationString).toBeDefined();
@@ -46,6 +48,6 @@ describe('$db-schema-diff', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON)
       .send({});
-    expect(res1.status).toBe(403);
+    expect(res1).toHaveStatus(403);
   });
 });

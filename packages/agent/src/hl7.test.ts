@@ -20,29 +20,40 @@ import {
 } from '@medplum/core';
 import type { Agent, AgentChannel, Bot, Endpoint, Resource } from '@medplum/fhirtypes';
 import type { Hl7Connection } from '@medplum/hl7';
-import { Hl7Client, Hl7EnhancedAckSentEvent, Hl7Server, ReturnAckCategory } from '@medplum/hl7';
+import { getFreePort, Hl7Client, Hl7EnhancedAckSentEvent, Hl7Server, ReturnAckCategory } from '@medplum/hl7';
 import { MockClient } from '@medplum/mock';
 import type { Client } from 'mock-socket';
 import { Server } from 'mock-socket';
 import { randomUUID } from 'node:crypto';
+import type { Mock } from 'vitest';
 import { App } from './app';
+import type * as AgentConstants from './constants';
 import type { AppLevelAckMode } from './hl7';
 import {
   AgentHl7Channel,
   AgentHl7ChannelConnection,
   APP_LEVEL_ACK_CODES,
   APP_LEVEL_ACK_MODES,
+  describeAckCode,
+  MAX_MAX_WORKERS,
   parseAppLevelAckMode,
   parseEnhancedMode,
+  resolveMaxWorkers,
+  resolveRetryPolicy,
   shouldSendAppLevelAck,
 } from './hl7';
-import { createEndpointWithRandomPort, createMockLogger, getFreePort } from './test-utils';
+import { DEFAULT_NORMAL_MODE_MAX_ATTEMPTS, DEFAULT_RETRY_POLICY } from './queue/worker';
+import { createEndpointWithRandomPort, createMockLogger } from './test-utils';
 
-jest.mock('./constants', () => ({
-  ...jest.requireActual('./constants'),
-  // We don't care about how fast the clients release in these tests
-  CLIENT_RELEASE_COUNTDOWN_MS: 0,
-}));
+vi.mock('./constants', async (importOriginal) => {
+  const actual = await importOriginal<typeof AgentConstants>();
+  return {
+    ...actual,
+    RETRY_WAIT_DURATION_MS: 200,
+    // We don't care about how fast the clients release in these tests
+    CLIENT_RELEASE_COUNTDOWN_MS: 0,
+  };
+});
 
 const medplum = new MockClient();
 const BASE_ENDPOINT: Endpoint = {
@@ -57,7 +68,7 @@ let bot: Bot;
 
 describe('HL7', () => {
   beforeAll(async () => {
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     medplum.router.router.add('POST', ':resourceType/:id/$execute', async () => {
       return [allOk, {} as Resource];
@@ -70,10 +81,6 @@ describe('HL7', () => {
   beforeEach(() => {
     mockServer = new Server('wss://example.com/ws/agent');
   });
-  afterEach(() => {
-    mockServer.stop();
-  });
-
   test('Send and receive', async () => {
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -159,7 +166,7 @@ describe('HL7', () => {
 
   test('Send and receive -- error', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -247,7 +254,7 @@ describe('HL7', () => {
 
   test('Send and receive -- no callback in response', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -422,6 +429,106 @@ describe('HL7', () => {
     await app.stop();
   });
 
+  // Regression: in aaMode the agent sends the AA immediately and the cloud's
+  // app-level ACK is suppressed (never forwarded to the remote). The suppression
+  // path must still clear the pending RTT entry, otherwise every message lingers
+  // and is eventually GC'd with a "never got response" warning.
+  test('Send and receive -- aaMode clears pending RTT entry', async () => {
+    mockServer.on('connection', (socket) => {
+      socket.on('message', (data) => {
+        const command = JSON.parse((data as Buffer).toString('utf8'));
+        if (command.type === 'agent:connect:request') {
+          socket.send(
+            Buffer.from(
+              JSON.stringify({
+                type: 'agent:connect:response',
+              })
+            )
+          );
+        }
+
+        if (command.type === 'agent:transmit:request') {
+          const hl7Message = Hl7Message.parse(command.body);
+          const ackMessage = hl7Message.buildAck();
+          socket.send(
+            Buffer.from(
+              JSON.stringify({
+                type: 'agent:transmit:response',
+                channel: command.channel,
+                callback: command.callback,
+                remote: command.remote,
+                body: ackMessage.toString(),
+              })
+            )
+          );
+        }
+
+        if (command.type === 'agent:heartbeat:request') {
+          socket.send(
+            Buffer.from(
+              JSON.stringify({
+                type: 'agent:heartbeat:response',
+                version: MEDPLUM_VERSION,
+              } satisfies AgentHeartbeatResponse)
+            )
+          );
+        }
+      });
+    });
+
+    const [aaEndpoint, port] = await createEndpointWithRandomPort(medplum, {
+      ...BASE_ENDPOINT,
+      address: BASE_ENDPOINT.address + '?enhanced=aa',
+    });
+
+    const agent = await medplum.createResource<Agent>({
+      resourceType: 'Agent',
+      name: 'Test Agent',
+      status: 'active',
+      channel: [
+        {
+          name: 'test',
+          endpoint: createReference(aaEndpoint),
+          targetReference: createReference(bot),
+        },
+      ],
+    });
+
+    const app = new App(medplum, agent.id, LogLevel.INFO);
+    await app.start();
+
+    const client = new Hl7Client({
+      host: 'localhost',
+      port,
+    });
+
+    const response = await client.sendAndWait(
+      Hl7Message.parse(
+        'MSH|^~\\&|ADT1|MCM|LABADT|MCM|198808181126|SECURITY|ADT^A01|MSG00001|P|2.5\r' +
+          'PID|||PATID1234^5^M11||JONES^WILLIAM^A^III||19610615|M-\r' +
+          'NK1|1|JONES^BARBARA^K|SPO|||||20011105\r' +
+          'PV1|1|I|2000^2012^01||||004777^LEBAUER^SIDNEY^J.|||SUR||-||1|A0-'
+      ),
+      { returnAck: ReturnAckCategory.FIRST }
+    );
+    // In aaMode the agent answers with an immediate application ACK (AA)
+    expect(response.getSegment('MSA')?.getComponent(1, 1)).toStrictEqual('AA');
+
+    // The cloud's app-level ACK is delivered asynchronously and suppressed at the
+    // agent; give it a moment to flow back and clear the pending entry.
+    const channel = app.channels.get('test') as AgentHl7Channel;
+    for (let i = 0; i < 10 && channel.stats.getPendingCount() > 0; i++) {
+      await sleep(20);
+    }
+
+    // Pending entry cleared, and the round-trip was recorded as a completed RTT sample
+    expect(channel.stats.getPendingCount()).toBe(0);
+    expect(channel.stats.getSampleCount()).toBe(1);
+
+    await client.close();
+    await app.stop();
+  });
+
   test('Send and receive -- enhanced mode + messagesPerMin', async () => {
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -528,7 +635,7 @@ describe('HL7', () => {
 
   test('Invalid messagesPerMin logs warning', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     mockServer.on('connection', (socket) => {
       socket.on('message', (data) => {
@@ -939,7 +1046,7 @@ describe('HL7', () => {
 
   test('keepAlive: Remote closes connection', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     const state = {
       reloadConfigResponse: null as AgentReloadConfigResponse | null,
@@ -1047,7 +1154,7 @@ describe('HL7', () => {
 
   test('keepAlive: Error occurs', async () => {
     const originalConsoleLog = console.log;
-    console.log = jest.fn();
+    console.log = vi.fn();
 
     const state = {
       reloadConfigResponse: null as AgentReloadConfigResponse | null,
@@ -2409,7 +2516,7 @@ describe('HL7', () => {
       await app.stop();
     });
 
-    test('When logStatsFreqSecs is not set, channel should not track stats', async () => {
+    test('Channel should track stats by default, even when logStatsFreqSecs is not set', async () => {
       mockServer.on('connection', (socket) => {
         socket.on('message', (data) => {
           const command = JSON.parse((data as Buffer).toString('utf8'));
@@ -2475,13 +2582,13 @@ describe('HL7', () => {
       const channel = app.channels.get('test');
       expect(channel).toBeDefined();
 
-      // Channel should NOT have stats tracker
-      expect((channel as AgentHl7Channel).stats).toBeUndefined();
+      // Channel should have stats tracker by default
+      expect((channel as AgentHl7Channel).stats).toBeDefined();
 
       await app.stop();
     });
 
-    test('When logStatsFreqSecs is set via reload, channel should start tracking', async () => {
+    test('When logStatsFreqSecs is set via reload, channel still has stats tracker', async () => {
       const state = {
         mySocket: undefined as Client | undefined,
         reloadConfigResponse: null as AgentReloadConfigRequest | null,
@@ -2534,8 +2641,8 @@ describe('HL7', () => {
       let channel = app.channels.get('test');
       expect(channel).toBeDefined();
 
-      // Channel should NOT have stats tracker initially
-      expect((channel as AgentHl7Channel).stats).toBeUndefined();
+      // Channel should have stats tracker by default
+      expect((channel as AgentHl7Channel).stats).toBeDefined();
 
       // Update agent to enable logStatsFreqSecs
       await medplum.updateResource<Agent>({
@@ -2568,7 +2675,7 @@ describe('HL7', () => {
       await app.stop();
     });
 
-    test('When logStatsFreqSecs is removed via reload, channel should stop tracking', async () => {
+    test('When logStatsFreqSecs is removed via reload, channel should keep tracking stats', async () => {
       const state = {
         mySocket: undefined as Client | undefined,
         reloadConfigResponse: null as AgentReloadConfigRequest | null,
@@ -2650,8 +2757,8 @@ describe('HL7', () => {
       channel = app.channels.get('test');
       expect(channel).toBeDefined();
 
-      // Channel should NO LONGER have stats tracker
-      expect((channel as AgentHl7Channel).stats).toBeUndefined();
+      // Channel should still have stats tracker (stats are collected by default)
+      expect((channel as AgentHl7Channel).stats).toBeDefined();
 
       await app.stop();
     });
@@ -2669,11 +2776,15 @@ describe('AgentHl7Channel application-level ACK gating', () => {
       log: createMockLogger(),
       channelLog: createMockLogger(),
       heartbeatEmitter: {
-        addEventListener: jest.fn(),
-        removeEventListener: jest.fn(),
-        dispatchEvent: jest.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
       },
-      getAgentConfig: jest.fn(),
+      getAgentConfig: vi.fn(),
+      getDurableQueue: vi.fn().mockReturnValue(undefined),
+      getChannelRetrySettings: vi.fn().mockReturnValue({}),
+      getChannelMaxWorkers: vi.fn().mockReturnValue(undefined),
+      getChannelLogicalChannelKey: vi.fn().mockReturnValue(undefined),
     } as unknown as App;
 
     const definition = { name: 'test-channel' } as AgentChannel;
@@ -2688,12 +2799,12 @@ describe('AgentHl7Channel application-level ACK gating', () => {
     return channel;
   }
 
-  function attachMockConnection(channel: AgentHl7Channel): jest.Mock {
-    const sendMock = jest.fn();
+  function attachMockConnection(channel: AgentHl7Channel): Mock<() => void> {
+    const sendMock = vi.fn();
     const hl7Connection = {
-      setEncoding: jest.fn(),
-      setEnhancedMode: jest.fn(),
-      setMessagesPerMin: jest.fn(),
+      setEncoding: vi.fn(),
+      setEnhancedMode: vi.fn(),
+      setMessagesPerMin: vi.fn(),
       send: sendMock,
     };
     const connection = {
@@ -2840,6 +2951,27 @@ describe('parseEnhancedMode', () => {
   });
 });
 
+describe('describeAckCode', () => {
+  test('labels the positive commit/app ACK codes', () => {
+    expect(describeAckCode('CA')).toBe('Commit ACK (CA)');
+    expect(describeAckCode('AA')).toBe('App ACK (AA)');
+  });
+
+  // Regression: the enhanced-ACK-sent log used to treat anything that wasn't
+  // 'CA' as "Immediate ACK (AA)", so every NACK (CE/CR/AE/AR) was mislabeled.
+  test('labels the NACK codes distinctly instead of falling through to AA', () => {
+    expect(describeAckCode('CE')).toBe('Commit Error (CE)');
+    expect(describeAckCode('CR')).toBe('Commit Reject (CR)');
+    expect(describeAckCode('AE')).toBe('App Error (AE)');
+    expect(describeAckCode('AR')).toBe('App Reject (AR)');
+  });
+
+  test('falls back gracefully for unknown or missing codes', () => {
+    expect(describeAckCode('ZZ' as AckCode)).toBe('ACK (ZZ)');
+    expect(describeAckCode(undefined)).toBe('ACK (unknown)');
+  });
+});
+
 describe('shouldSendAppLevelAck', () => {
   test.each(APP_LEVEL_ACK_CODES)('non enhanced mode always returns true', (ackCode) => {
     expect(
@@ -2933,21 +3065,21 @@ describe('AgentHl7ChannelConnection enhanced ACK logging', () => {
         remoteAddress: '127.0.0.1',
         remotePort: 12345,
       },
-      addEventListener: jest.fn((event: string, listener: (...args: any[]) => void) => {
+      addEventListener: vi.fn((event: string, listener: (...args: any[]) => void) => {
         const listeners = eventListeners.get(event) ?? [];
         listeners.push(listener);
         eventListeners.set(event, listeners);
       }),
-      dispatchEvent: jest.fn((event: Event) => {
+      dispatchEvent: vi.fn((event: Event) => {
         for (const listener of eventListeners.get(event.type) ?? EMPTY) {
           listener(event);
         }
       }),
-      setEncoding: jest.fn(),
-      setEnhancedMode: jest.fn(),
-      setMessagesPerMin: jest.fn(),
-      send: jest.fn(),
-      close: jest.fn(),
+      setEncoding: vi.fn(),
+      setEnhancedMode: vi.fn(),
+      setMessagesPerMin: vi.fn(),
+      send: vi.fn(),
+      close: vi.fn(),
     } as unknown as Hl7Connection;
   }
 
@@ -2960,13 +3092,17 @@ describe('AgentHl7ChannelConnection enhanced ACK logging', () => {
       log: createMockLogger(),
       channelLog,
       heartbeatEmitter: {
-        addEventListener: jest.fn(),
-        removeEventListener: jest.fn(),
-        dispatchEvent: jest.fn(),
+        addEventListener: vi.fn(),
+        removeEventListener: vi.fn(),
+        dispatchEvent: vi.fn(),
       },
-      getAgentConfig: jest.fn(),
-      addToWebSocketQueue: jest.fn(),
+      getAgentConfig: vi.fn(),
+      addToWebSocketQueue: vi.fn(),
       agentId: 'test-agent',
+      getDurableQueue: vi.fn().mockReturnValue(undefined),
+      getChannelRetrySettings: vi.fn().mockReturnValue({}),
+      getChannelMaxWorkers: vi.fn().mockReturnValue(undefined),
+      getChannelLogicalChannelKey: vi.fn().mockReturnValue(undefined),
     } as unknown as App;
 
     const definition = { name: 'test-channel' } as AgentChannel;
@@ -2998,7 +3134,7 @@ describe('AgentHl7ChannelConnection enhanced ACK logging', () => {
     await connection.close();
   });
 
-  test('logs Immediate ACK (AA) when enhanced ACK with AA is sent', async () => {
+  test('logs App ACK (AA) when enhanced ACK with AA is sent', async () => {
     const { channel, channelLog } = createTestChannelWithMockLogger('mllp://localhost:57201?enhanced=aa');
     const mockConnection = createMockHl7Connection();
 
@@ -3012,7 +3148,25 @@ describe('AgentHl7ChannelConnection enhanced ACK logging', () => {
     const event = new Hl7EnhancedAckSentEvent(mockConnection, ackMessage);
     mockConnection.dispatchEvent(event);
 
-    expect(channelLog.info).toHaveBeenCalledWith(expect.stringContaining('[Sent Immediate ACK (AA) -- ID: MSG00001]'));
+    expect(channelLog.info).toHaveBeenCalledWith(expect.stringContaining('[Sent App ACK (AA) -- ID: MSG00001]'));
+    await connection.close();
+  });
+
+  // Regression: NACK codes used to fall through to the "Immediate ACK (AA)" label.
+  test.each([
+    ['CE', 'Commit Error (CE)'],
+    ['CR', 'Commit Reject (CR)'],
+    ['AE', 'App Error (AE)'],
+    ['AR', 'App Reject (AR)'],
+  ])('logs %s as %s instead of mislabeling it as AA', async (ackCode, label) => {
+    const { channel, channelLog } = createTestChannelWithMockLogger('mllp://localhost:57203?enhanced=true');
+    const mockConnection = createMockHl7Connection();
+    const connection = new AgentHl7ChannelConnection(channel, mockConnection);
+
+    const nackMessage = BASE_MESSAGE.buildAck({ ackCode: ackCode as 'CE' | 'CR' | 'AE' | 'AR' });
+    mockConnection.dispatchEvent(new Hl7EnhancedAckSentEvent(mockConnection, nackMessage));
+
+    expect(channelLog.info).toHaveBeenCalledWith(expect.stringContaining(`[Sent ${label} -- ID: MSG00001]`));
     await connection.close();
   });
 
@@ -3035,5 +3189,364 @@ describe('AgentHl7ChannelConnection enhanced ACK logging', () => {
 
     expect(channelLog.info).toHaveBeenCalledWith(expect.stringContaining('[Sent Commit ACK (CA) -- ID: not provided]'));
     await connection.close();
+  });
+});
+
+describe('resolveRetryPolicy', () => {
+  test('returns the built-in defaults (enabled, guaranteed delivery) with no params and no agent settings', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({}, new URLSearchParams(), logger);
+    expect(policy).toStrictEqual(DEFAULT_RETRY_POLICY);
+    expect(policy.enabled).toBe(true);
+    // guaranteedDelivery is on by default — the server returns 400 for every Bot
+    // failure without disambiguating transient from permanent, so the only safe
+    // default is at-least-once delivery (retry everything, unlimited attempts).
+    expect(policy.guaranteedDelivery).toBe(true);
+    expect(policy.maxAttempts).toBe(0);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test('agent settings override defaults, endpoint params override agent settings, per field', () => {
+    const logger = createMockLogger();
+    // mode:'normal' pins normal mode so the maxAttempts cap is honored (guaranteed
+    // mode would force maxAttempts to 0, masking the precedence check).
+    const agentDefaults = { mode: 'normal' as const, baseDelayMs: 5000, maxAttempts: 4 };
+    const params = new URLSearchParams('autoRetryBaseDelayMs=250&autoRetryBackoffMultiplier=1.5');
+    const policy = resolveRetryPolicy(agentDefaults, params, logger);
+    expect(policy).toStrictEqual({
+      enabled: true, // from agent setting mode (normal)
+      guaranteedDelivery: false, // normal mode (overrides the guaranteed default)
+      baseDelayMs: 250, // endpoint param wins over agent setting
+      maxDelayMs: DEFAULT_RETRY_POLICY.maxDelayMs, // built-in default
+      maxAttempts: 4, // from agent setting
+      backoffMultiplier: 1.5, // from endpoint param
+    });
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test('retryMode=none on the endpoint disables retry even when the agent setting enables it', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({ mode: 'guaranteed' }, new URLSearchParams('retryMode=none'), logger);
+    expect(policy.enabled).toBe(false);
+    expect(policy.guaranteedDelivery).toBe(false);
+  });
+
+  test('invalid param values warn and fall through to the next layer', () => {
+    const logger = createMockLogger();
+    const params = new URLSearchParams('retryMode=sometimes&autoRetryBaseDelayMs=fast&autoRetryMaxAttempts=-1');
+    const policy = resolveRetryPolicy({ baseDelayMs: 3000 }, params, logger);
+    // Invalid retryMode falls through to the built-in default, which is guaranteed.
+    expect(policy.enabled).toBe(true);
+    expect(policy.guaranteedDelivery).toBe(true);
+    expect(policy.baseDelayMs).toBe(3000);
+    expect(policy.maxAttempts).toBe(DEFAULT_RETRY_POLICY.maxAttempts);
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Invalid retryMode value 'sometimes'; expected 'none', 'normal', or 'guaranteed'. Ignoring."
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Invalid autoRetryBaseDelayMs value 'fast'; expected a number >= 1. Ignoring."
+    );
+    expect(logger.warn).toHaveBeenCalledWith(
+      "Invalid autoRetryMaxAttempts value '-1'; expected a number >= 0. Ignoring."
+    );
+  });
+
+  test('clamps out-of-range agent settings and raises maxDelayMs to baseDelayMs', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy(
+      { mode: 'normal', baseDelayMs: 30_000, maxDelayMs: 10_000, backoffMultiplier: 0.5 },
+      new URLSearchParams(),
+      logger
+    );
+    expect(policy.backoffMultiplier).toBe(1);
+    expect(policy.maxDelayMs).toBe(30_000);
+    expect(logger.warn).toHaveBeenCalledWith(
+      'autoRetryMaxDelayMs (10000) is less than autoRetryBaseDelayMs (30000); using autoRetryBaseDelayMs as the cap.'
+    );
+  });
+
+  test('maxAttempts=0 (retry indefinitely) is accepted from the endpoint param', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({}, new URLSearchParams('retryMode=normal&autoRetryMaxAttempts=0'), logger);
+    expect(policy.enabled).toBe(true);
+    expect(policy.maxAttempts).toBe(0);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test('retryMode=guaranteed implies unlimited attempts', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({}, new URLSearchParams('retryMode=guaranteed'), logger);
+    expect(policy.guaranteedDelivery).toBe(true);
+    expect(policy.maxAttempts).toBe(0);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test('retryMode is case-insensitive', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({}, new URLSearchParams('retryMode=Normal'), logger);
+    expect(policy.enabled).toBe(true);
+    expect(policy.guaranteedDelivery).toBe(false);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test('mode flows through from the agent setting', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({ mode: 'guaranteed' }, new URLSearchParams(), logger);
+    expect(policy.guaranteedDelivery).toBe(true);
+    expect(policy.maxAttempts).toBe(0);
+  });
+
+  test('retryMode=normal on the endpoint overrides the agent setting', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({ mode: 'guaranteed' }, new URLSearchParams('retryMode=normal'), logger);
+    expect(policy.enabled).toBe(true);
+    expect(policy.guaranteedDelivery).toBe(false);
+    // Opting out of guaranteed mode falls back to the normal-mode cap, not the
+    // guaranteed default's unlimited (0).
+    expect(policy.maxAttempts).toBe(DEFAULT_NORMAL_MODE_MAX_ATTEMPTS);
+  });
+
+  test('retryMode=none disables retry and guaranteed delivery silently (no warning)', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({}, new URLSearchParams('retryMode=none'), logger);
+    expect(policy.enabled).toBe(false);
+    expect(policy.guaranteedDelivery).toBe(false);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+
+  test('retryMode=guaranteed conflicts with an explicit nonzero maxAttempts — warn and respect the cap', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({}, new URLSearchParams('retryMode=guaranteed&autoRetryMaxAttempts=5'), logger);
+    expect(policy.guaranteedDelivery).toBe(true);
+    expect(policy.maxAttempts).toBe(5);
+    expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('respecting autoRetryMaxAttempts'));
+  });
+
+  test('retryMode=guaranteed with an explicit maxAttempts=0 is not a conflict', () => {
+    const logger = createMockLogger();
+    const policy = resolveRetryPolicy({ maxAttempts: 0 }, new URLSearchParams('retryMode=guaranteed'), logger);
+    expect(policy.guaranteedDelivery).toBe(true);
+    expect(policy.maxAttempts).toBe(0);
+    expect(logger.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveMaxWorkers', () => {
+  test('defaults to 1 with no config', () => {
+    expect(resolveMaxWorkers(new URLSearchParams(), undefined, createMockLogger())).toBe(1);
+  });
+
+  test('endpoint URL param overrides the agent-wide default', () => {
+    expect(resolveMaxWorkers(new URLSearchParams('maxWorkers=4'), 2, createMockLogger())).toBe(4);
+  });
+
+  test('falls back to the agent-wide default when no URL param', () => {
+    expect(resolveMaxWorkers(new URLSearchParams(), 3, createMockLogger())).toBe(3);
+  });
+
+  test('clamps to an integer >= 1', () => {
+    expect(resolveMaxWorkers(new URLSearchParams(), 2.9, createMockLogger())).toBe(2);
+    // A 0 or negative agent setting clamps up to 1 (a channel always has at least one worker).
+    expect(resolveMaxWorkers(new URLSearchParams(), 0, createMockLogger())).toBe(1);
+  });
+
+  test('warns and falls through on an invalid URL param', () => {
+    const logger = createMockLogger();
+    // < 1 and non-numeric are both rejected at the URL layer, then fall back to the agent default.
+    expect(resolveMaxWorkers(new URLSearchParams('maxWorkers=0'), 5, logger)).toBe(5);
+    expect(resolveMaxWorkers(new URLSearchParams('maxWorkers=abc'), 5, logger)).toBe(5);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+  });
+
+  test('clamps a value above the maximum, with a warning (guards against a runaway typo)', () => {
+    const logger = createMockLogger();
+    // A huge URL param (e.g. a typo) is clamped down to the ceiling, not instantiated verbatim.
+    expect(resolveMaxWorkers(new URLSearchParams('maxWorkers=1000000'), undefined, logger)).toBe(MAX_MAX_WORKERS);
+    // Same for an out-of-range agent-wide setting.
+    expect(resolveMaxWorkers(new URLSearchParams(), 1e9, logger)).toBe(MAX_MAX_WORKERS);
+    expect(logger.warn).toHaveBeenCalledTimes(2);
+    // A value exactly at the ceiling is fine and unwarned.
+    const logger2 = createMockLogger();
+    expect(resolveMaxWorkers(new URLSearchParams(`maxWorkers=${MAX_MAX_WORKERS}`), undefined, logger2)).toBe(
+      MAX_MAX_WORKERS
+    );
+    expect(logger2.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('AgentHl7Channel logicalChannelKey partitioning', () => {
+  const ADDR = 'mllp://localhost:59321';
+  const MSG = (facility: string): Hl7Message =>
+    Hl7Message.parse(`MSH|^~\\&|APP|${facility}|R|F|20240101||ADT^A01|MSG1|P|2.5.1`);
+
+  // Builds a channel with a stub durable queue whose recomputeLogicalChannelKeys we
+  // can spy on, plus a helper to re-run config with a new logicalChannelKey spec
+  // (simulating a reload). createMockLogger().clone() returns the same mock, so
+  // `appLog` is the channel's own logger. On a spec change the (leader) channel
+  // recomputes the stored partition of queued/delayed rows under the new spec;
+  // the common paths still key rows at claim time. isLeader is true so the
+  // leader-gated recompute runs.
+  function makeChannel(): {
+    channel: AgentHl7Channel;
+    recompute: Mock;
+    reconfigure: (spec: string) => void;
+    appLog: ReturnType<typeof createMockLogger>;
+  } {
+    const appLog = createMockLogger();
+    // Resolves, not returns: applyLogicalChannelKeySpec fires the rewrite off and
+    // chains its logging / delayed-row fallback onto the promise.
+    const recompute = vi.fn().mockResolvedValue(0);
+    const mockApp = {
+      log: appLog,
+      channelLog: createMockLogger(),
+      heartbeatEmitter: { addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn() },
+      getDurableQueue: vi.fn().mockReturnValue({
+        isLeader: () => true,
+        recomputeLogicalChannelKeys: recompute,
+        flipDelayedToQueued: vi.fn(),
+      }),
+      getChannelRetrySettings: vi.fn().mockReturnValue({}),
+      getChannelMaxWorkers: vi.fn().mockReturnValue(undefined),
+      getChannelLogicalChannelKey: vi.fn().mockReturnValue(undefined),
+    } as unknown as App;
+    const channel = new AgentHl7Channel(
+      mockApp,
+      { name: 'vc-channel' } as AgentChannel,
+      {
+        resourceType: 'Endpoint',
+        status: 'active',
+        address: `${ADDR}?logicalChannelKey=`,
+      } as Endpoint
+    );
+    const reconfigure = (spec: string): void => {
+      (channel as unknown as { endpoint: Endpoint }).endpoint = {
+        resourceType: 'Endpoint',
+        status: 'active',
+        address: `${ADDR}?logicalChannelKey=${spec}`,
+      } as Endpoint;
+      (channel as unknown as { configureHl7ServerAndConnections(): void }).configureHl7ServerAndConnections();
+    };
+    return { channel, recompute, reconfigure, appLog };
+  }
+
+  test('validates before applying, recomputes only on a real change, and keeps the prior spec on invalid input', () => {
+    const { channel, recompute, reconfigure, appLog } = makeChannel();
+
+    // Moving off the default '' spec is a real change, so it recomputes.
+    reconfigure('MSH-4');
+    expect(recompute).toHaveBeenCalledTimes(1);
+    expect(recompute).toHaveBeenLastCalledWith('vc-channel', expect.any(Function));
+    expect(channel.getLogicalChannelKey(MSG('HOSPA'))).toBe('MSH-4:HOSPA');
+
+    // Re-applying the same spec is a no-op — no recompute.
+    recompute.mockClear();
+    reconfigure('MSH-4');
+    expect(recompute).not.toHaveBeenCalled();
+
+    // A changed, valid spec recomputes and takes effect for new intake.
+    reconfigure('MSH-9');
+    expect(recompute).toHaveBeenCalledTimes(1);
+    expect(channel.getLogicalChannelKey(MSG('HOSPA'))).toBe('MSH-9:ADT^A01');
+
+    // An invalid spec is rejected before it takes effect: warn, no recompute,
+    // prior (MSH.9) partitioning retained.
+    recompute.mockClear();
+    vi.mocked(appLog.warn).mockClear();
+    reconfigure('NOTASEGMENT-X');
+    expect(appLog.warn).toHaveBeenCalled();
+    expect(recompute).not.toHaveBeenCalled();
+    expect(channel.getLogicalChannelKey(MSG('HOSPA'))).toBe('MSH-9:ADT^A01');
+  });
+
+  test('a non-leader defers the recompute and runs it on becoming leader', async () => {
+    const recompute = vi.fn().mockResolvedValue(0);
+    const appLog = createMockLogger();
+    let leader = false;
+    const mockApp = {
+      log: appLog,
+      channelLog: createMockLogger(),
+      heartbeatEmitter: { addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn() },
+      getDurableQueue: vi.fn().mockReturnValue({
+        isLeader: () => leader,
+        recomputeLogicalChannelKeys: recompute,
+        flipDelayedToQueued: vi.fn(),
+      }),
+      getChannelRetrySettings: vi.fn().mockReturnValue({}),
+      getChannelMaxWorkers: vi.fn().mockReturnValue(undefined),
+      getChannelLogicalChannelKey: vi.fn().mockReturnValue(undefined),
+    } as unknown as App;
+    const channel = new AgentHl7Channel(
+      mockApp,
+      { name: 'vc-channel' } as AgentChannel,
+      { resourceType: 'Endpoint', status: 'active', address: `${ADDR}?logicalChannelKey=` } as Endpoint
+    );
+    (channel as unknown as { endpoint: Endpoint }).endpoint = {
+      resourceType: 'Endpoint',
+      status: 'active',
+      address: `${ADDR}?logicalChannelKey=MSH-4`,
+    } as Endpoint;
+    (channel as unknown as { configureHl7ServerAndConnections(): void }).configureHl7ServerAndConnections();
+
+    // Non-leader: no recompute, but the spec still takes effect for its own claims.
+    expect(recompute).not.toHaveBeenCalled();
+    expect(channel.getLogicalChannelKey(MSG('HOSPA'))).toBe('MSH-4:HOSPA');
+
+    // The rewrite is owed, not dropped — nothing else would ever re-key the older
+    // rows a claim compares against, so taking the lease has to go back for it.
+    leader = true;
+    channel.onBecameQueueLeader();
+    expect(recompute).toHaveBeenCalledTimes(1);
+    expect(recompute).toHaveBeenLastCalledWith('vc-channel', expect.any(Function));
+
+    // Once it succeeds the debt is settled: a further acquisition is a no-op.
+    await Promise.resolve();
+    channel.onBecameQueueLeader();
+    expect(recompute).toHaveBeenCalledTimes(1);
+  });
+
+  test('a failed recompute stays owed and is retried on the next reload', async () => {
+    const recompute = vi.fn().mockRejectedValueOnce(new Error('rewrite blew up')).mockResolvedValue(3);
+    const flip = vi.fn();
+    const appLog = createMockLogger();
+    const mockApp = {
+      log: appLog,
+      channelLog: createMockLogger(),
+      heartbeatEmitter: { addEventListener: vi.fn(), removeEventListener: vi.fn(), dispatchEvent: vi.fn() },
+      getDurableQueue: vi.fn().mockReturnValue({
+        isLeader: () => true,
+        recomputeLogicalChannelKeys: recompute,
+        flipDelayedToQueued: flip,
+      }),
+      getChannelRetrySettings: vi.fn().mockReturnValue({}),
+      getChannelMaxWorkers: vi.fn().mockReturnValue(undefined),
+      getChannelLogicalChannelKey: vi.fn().mockReturnValue(undefined),
+    } as unknown as App;
+    const channel = new AgentHl7Channel(
+      mockApp,
+      { name: 'vc-channel' } as AgentChannel,
+      { resourceType: 'Endpoint', status: 'active', address: `${ADDR}?logicalChannelKey=` } as Endpoint
+    );
+    const reconfigure = (spec: string): void => {
+      (channel as unknown as { endpoint: Endpoint }).endpoint = {
+        resourceType: 'Endpoint',
+        status: 'active',
+        address: `${ADDR}?logicalChannelKey=${spec}`,
+      } as Endpoint;
+      (channel as unknown as { configureHl7ServerAndConnections(): void }).configureHl7ServerAndConnections();
+    };
+
+    reconfigure('MSH-4');
+    expect(recompute).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(flip).toHaveBeenCalled());
+
+    // Same spec as the failed attempt: without the separate "rewritten" marker this
+    // would read as unchanged and the half-rewritten keys would never be repaired.
+    reconfigure('MSH-4');
+    expect(recompute).toHaveBeenCalledTimes(2);
+
+    // Now that it succeeded, re-applying the same spec really is a no-op.
+    await Promise.resolve();
+    reconfigure('MSH-4');
+    expect(recompute).toHaveBeenCalledTimes(2);
   });
 });

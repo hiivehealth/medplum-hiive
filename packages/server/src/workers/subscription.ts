@@ -1,13 +1,12 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
-import type { BackgroundJobContext, BackgroundJobInteraction, WithId } from '@medplum/core';
+import type { BackgroundJobContext, BackgroundJobInteraction, Filter, Operation, WithId } from '@medplum/core';
 import {
   AccessPolicyInteraction,
   ContentType,
   EMPTY,
   Operator,
   createReference,
-  deepClone,
   getExtension,
   getExtensionValue,
   getReferenceString,
@@ -34,30 +33,32 @@ import type {
   ResourceType,
   Subscription,
 } from '@medplum/fhirtypes';
-import type { AdvancedOptions, Job, MinimalJob, QueueBaseOptions } from 'bullmq';
+import type { Job, MinimalJob } from 'bullmq';
 import { Queue, UnrecoverableError, Worker } from 'bullmq';
-import fetch from 'node-fetch';
 import { createHmac } from 'node:crypto';
-import type { Operation } from 'rfc6902';
 import { executeBot } from '../bots/execute';
+import { getConfig } from '../config/loader';
 import type { SubscriptionAutoDisableTrigger } from '../config/types';
 import { WEBSOCKET_SUB_PUBLISH_CHANNEL } from '../constants';
-import { getRequestContext, runInAuthenticatedContext, tryGetRequestContext, tryRunInRequestContext } from '../context';
+import { getRequestContext, runInRequestContext, tryGetRequestContext } from '../context';
 import { buildAccessPolicy } from '../fhir/accesspolicy';
 import { isPreCommitSubscription } from '../fhir/precommit';
+import { findProjectMembership, getInactiveReason } from '../fhir/projectmembership';
 import type { ResendSubscriptionsOptions, SystemRepository } from '../fhir/repo';
-import { getGlobalSystemRepo, getProjectSystemRepo, getShardSystemRepo } from '../fhir/repo';
+import { getGlobalSystemRepo, getProjectSystemRepo } from '../fhir/repo';
 import { RewriteMode, rewriteAttachments } from '../fhir/rewrite';
-import { PLACEHOLDER_SHARD_ID } from '../fhir/sharding';
 import { getLogger, globalLogger } from '../logger';
 import type { AuthState } from '../oauth/middleware';
 import { recordHistogramValue } from '../otel/otel';
 import type { ActiveSubscriptionEntry } from '../pubsub';
 import { cleanupActiveSubs, getActiveSubscriptions, publish, removeActiveSubscriptions } from '../pubsub';
 import { getCacheRedis } from '../redis';
-import { parseTraceparent } from '../traceparent';
 import { AuditEventOutcome, createSubscriptionAuditEvent } from '../util/auditevent';
-import type { SubEventsOptions } from '../ws/subscriptions';
+import { buildTraceparent } from '../util/tracing';
+import { isAllowedOutboundUrlForQueue, safeFetch } from '../util/url';
+import type { SubEventEntry, SubEventPayload } from '../ws/subscriptions';
+import type { ProjectJobTarget } from './base';
+import { getJobSystemRepo } from './base';
 import {
   clearSubscriptionFailures,
   getSubscriptionAutoDisableTriggers,
@@ -66,16 +67,16 @@ import {
 import type { WorkerInitializer, WorkerInitializerOptions } from './utils';
 import {
   addVerboseQueueLogging,
-  findProjectMembership,
-  getBullmqRedisConnectionOptions,
+  defaultQueueOptions,
   getWorkerBullmqConfig,
   isJobSuccessful,
   queueRegistry,
+  trackJobMetrics,
 } from './utils';
 
 /**
  * The timeout for outbound rest-hook subscription HTTP requests.
- * This is passed into fetch and will make fetch abort the request after REQUEST_TIMEOUT milliseconds.
+ * This is passed into fetch using an AbortSignal and will abort the request after REQUEST_TIMEOUT milliseconds.
  */
 const REQUEST_TIMEOUT = 120_000; // 120 seconds, 2 mins
 
@@ -115,6 +116,7 @@ const MAX_DELAY = 8 * 60 * 60_000;
  */
 
 export interface SubscriptionJobData {
+  readonly target: ProjectJobTarget;
   readonly subscriptionId: string;
   readonly resourceType: ResourceType;
   readonly channelType?: Subscription['channel']['type'];
@@ -124,6 +126,8 @@ export interface SubscriptionJobData {
   readonly requestTime: string;
   readonly requestId?: string;
   readonly traceId?: string;
+  // PENDING{v5.3} Remove, along with where addSubscriptionJobs sets it. Unread by this release; still
+  // written for workers on earlier releases during a rolling deploy.
   readonly authState?: AuthState;
   readonly verbose?: boolean;
 }
@@ -149,41 +153,37 @@ const queueName = 'SubscriptionQueue';
 const jobName = 'SubscriptionJobData';
 
 export const initSubscriptionWorker: WorkerInitializer = (config, options?: WorkerInitializerOptions) => {
-  const defaultOptions: QueueBaseOptions = {
-    connection: getBullmqRedisConnectionOptions(config),
-  };
-
+  const defaultOptions = defaultQueueOptions(config);
   const queue = new Queue<SubscriptionJobData>(queueName, {
     ...defaultOptions,
-    settings: {
-      backoffStrategy: (attemptsMade: number, type?: string, _err?: Error, _job?: MinimalJob) => {
-        if (type !== 'cappedExponential') {
-          throw new Error('Invalid backoff strategy for subscription queue');
-        }
-        const jitterFactor = 0.9 + 0.2 * Math.random(); // 90–110% of the calculated delay is applied
-        return Math.min(BASE_DELAY * Math.pow(2, attemptsMade - 1) * jitterFactor, MAX_DELAY);
-      },
-    } as AdvancedOptions,
     defaultJobOptions: {
+      ...defaultOptions.defaultJobOptions,
       attempts: MAX_JOB_ATTEMPTS, // can be overridden in catchJobError() below
-      backoff: { type: 'cappedExponential' }, // see above
+      backoff: { type: 'cappedExponential' }, // see below
     },
   });
 
   let worker: Worker<SubscriptionJobData> | undefined;
   if (options?.workerEnabled !== false) {
-    const workerBullmq = getWorkerBullmqConfig(config, 'subscription');
     worker = new Worker<SubscriptionJobData>(
       queueName,
-      (job) =>
-        job.data.authState
-          ? runInAuthenticatedContext(job.data.authState, job.data.requestId, job.data.traceId, undefined, () =>
-              execSubscriptionJob(job)
-            )
-          : tryRunInRequestContext(job.data.requestId, job.data.traceId, () => execSubscriptionJob(job)),
+      trackJobMetrics('subscription', (job) =>
+        runInRequestContext(job.data.requestId, job.data.traceId, () => execSubscriptionJob(job), {
+          projectId: job.data.target.projectId,
+          subscriptionId: job.data.subscriptionId,
+        })
+      ),
       {
-        ...defaultOptions,
-        ...workerBullmq,
+        ...getWorkerBullmqConfig(config, 'subscription', defaultOptions),
+        settings: {
+          backoffStrategy: (attemptsMade: number, type?: string, _err?: Error, _job?: MinimalJob) => {
+            if (type !== 'cappedExponential') {
+              throw new Error('Invalid backoff strategy for subscription queue');
+            }
+            const jitterFactor = 0.9 + 0.2 * Math.random(); // 90–110% of the calculated delay is applied
+            return Math.min(BASE_DELAY * Math.pow(2, attemptsMade - 1) * jitterFactor, MAX_DELAY);
+          },
+        },
       }
     );
     addVerboseQueueLogging<SubscriptionJobData>(queue, worker, getLoggingFields);
@@ -242,6 +242,24 @@ async function satisfiesAccessPolicy(
   subscription: Subscription,
   options?: SatisfiesAccessPolicyOpts
 ): Promise<boolean> {
+  // Server-scoped subscriptions live in the system project and have no `meta.project` of their own,
+  // so they are intentionally not bound to any single project's access policy. Skip the check and
+  // allow the notification.
+  //
+  // SECURITY NOTE (for future audits, human or LLM): This early return bypasses access-policy
+  // enforcement, but it is only reachable for a Subscription with no `meta.project`, which is safe
+  // on two independent grounds:
+  //   1. Creation is restricted. A normal user's write always has `meta.project` defaulted to their
+  //      own project context (see Repository.getProjectId in fhir/repo.ts), so only a super admin
+  //      (operating with no project context) can create a project-less Subscription at all.
+  //   2. Evaluation is gated. Project-less subscriptions are only ever loaded and evaluated when the
+  //      `serverScopedSubscriptionsEnabled` server config flag is enabled (see getSubscriptions below);
+  //      when it is off they are never matched against any resource.
+  // A normal project-scoped Subscription always has `meta.project` set and is fully checked below.
+  if (!subscription.meta?.project) {
+    return true;
+  }
+
   let satisfied = true;
   try {
     // We can assert author because any time a resource is updated, the author will be set to the previous author or if it doesn't exist
@@ -315,6 +333,10 @@ export async function addSubscriptionJobs(
   context: BackgroundJobContext,
   options?: ResendSubscriptionsOptions
 ): Promise<void> {
+  if (!getConfig().subscriptionsEnabled) {
+    return;
+  }
+
   if (resource.resourceType === 'AuditEvent') {
     // Never send subscriptions for audit events
     return;
@@ -334,6 +356,12 @@ export async function addSubscriptionJobs(
 
   const project = context?.project;
   if (!project) {
+    // system resources do not have subscriptions evaluated against them.
+    return;
+  }
+
+  if (getInactiveReason(project)) {
+    logFn('Project is not active, skipping subscriptions');
     return;
   }
 
@@ -341,7 +369,7 @@ export async function addSubscriptionJobs(
   const subscriptions = await getSubscriptions(resource, project);
   logFn(`Evaluate ${subscriptions.length} subscription(s)`);
 
-  const wsSubEvents = [] as [string, SubEventsOptions][];
+  const wsSubEvents: SubEventEntry[] = [];
   // Cache access policy results per (author, channel type) for the duration of this evaluation.
   // Within one addSubscriptionJobs() call, `resource` and `project` are constant,
   // so the boolean result is identical for all subscriptions sharing the same author AND channel type.
@@ -393,7 +421,15 @@ export async function addSubscriptionJobs(
         wsSubEvents.push([subscription.id, { includeResource: true }]);
         continue;
       }
+      if (subscription.channel.type === 'rest-hook') {
+        const endpoint = subscription.channel.endpoint;
+        if (!endpoint?.startsWith('Bot/') && !isAllowedOutboundUrlForQueue(endpoint ?? '', getConfig())) {
+          logFn(`Subscription rest-hook URL is not allowed for outbound fetch`);
+          continue;
+        }
+      }
       await addSubscriptionJobData({
+        target: { kind: 'project', projectId: project.id },
         subscriptionId: subscription.id,
         resourceType: resource.resourceType,
         channelType: subscription.channel.type,
@@ -403,6 +439,7 @@ export async function addSubscriptionJobs(
         requestTime,
         requestId: ctx?.requestId,
         traceId: ctx?.traceId,
+        // PENDING{v5.3} Remove with SubscriptionJobData.authState
         authState: ctx?.authState,
         verbose: options?.verbose,
       });
@@ -410,7 +447,10 @@ export async function addSubscriptionJobs(
   }
 
   if (wsSubEvents.length) {
-    await publish(WEBSOCKET_SUB_PUBLISH_CHANNEL, JSON.stringify({ resource, events: wsSubEvents }));
+    await publish(
+      WEBSOCKET_SUB_PUBLISH_CHANNEL,
+      JSON.stringify({ resource, events: wsSubEvents } satisfies SubEventPayload)
+    );
   }
 }
 
@@ -464,21 +504,21 @@ interface SubscriptionWithMetadata {
 async function getSubscriptions(resource: Resource, project: WithId<Project>): Promise<SubscriptionWithMetadata[]> {
   const projectId = project.id;
   const systemRepo = await getProjectSystemRepo(projectId);
+
+  // By default only subscriptions in the resource's own project are evaluated. When server-scoped
+  // subscriptions are enabled, also evaluate "server-scoped" subscriptions — those not scoped to
+  // any project (stored in the system project) — so a single set of subscriptions can apply across
+  // every project on the server. The two sets are matched by different `_project` operators
+  // (EQUALS `<projectId>` vs MISSING), which Medplum cannot OR within a single ordinary filter, so
+  // the server-scoped case uses a `_filter` expression to combine them into one query.
+  const projectFilter: Filter = getConfig().serverScopedSubscriptionsEnabled
+    ? { code: '_filter', operator: Operator.EQUALS, value: `_project eq ${projectId} or _project pr false` }
+    : { code: '_project', operator: Operator.EQUALS, value: projectId };
+
   const restHookSubscriptions = await systemRepo.searchResources<Subscription>({
     resourceType: 'Subscription',
     count: 1000,
-    filters: [
-      {
-        code: '_project',
-        operator: Operator.EQUALS,
-        value: projectId,
-      },
-      {
-        code: 'status',
-        operator: Operator.EQUALS,
-        value: 'active',
-      },
-    ],
+    filters: [projectFilter, { code: 'status', operator: Operator.EQUALS, value: 'active' }],
   });
 
   const subscriptionsWithMetadata: SubscriptionWithMetadata[] = restHookSubscriptions.map((subscription) => ({
@@ -582,12 +622,14 @@ async function getSubscriptions(resource: Resource, project: WithId<Project>): P
  */
 export async function execSubscriptionJob(job: Job<SubscriptionJobData>): Promise<void> {
   let systemRepo: SystemRepository;
+  // The subscription's project, not the writer's: AuditEvents are recorded there and follow its redaction setting.
+  let project: WithId<Project> | undefined;
   let subscription: WithId<Subscription> | undefined;
   let rewrittenResource: Resource;
 
   try {
     const { subscriptionId, resourceType, id, versionId, verbose } = job.data;
-    systemRepo = getShardSystemRepo(PLACEHOLDER_SHARD_ID); // job.data will eventually include shardId
+    systemRepo = await getJobSystemRepo(job.data.target);
     const logger = getLogger();
     const logFn = verbose ? logger.info : logger.debug;
 
@@ -610,6 +652,15 @@ export async function execSubscriptionJob(job: Job<SubscriptionJobData>): Promis
       return;
     }
 
+    // Jobs queued before the project was deactivated are dropped, not delivered late.
+    if (!job.data.target.system) {
+      project = await systemRepo.readResource<Project>('Project', job.data.target.projectId);
+      if (getInactiveReason(project)) {
+        logFn(`Project ${project.id} is not active`);
+        return;
+      }
+    }
+
     if (job.data.interaction !== 'delete') {
       const currentVersion = await tryGetCurrentVersion(systemRepo, resourceType, id);
       if (!currentVersion) {
@@ -628,7 +679,7 @@ export async function execSubscriptionJob(job: Job<SubscriptionJobData>): Promis
     const versionedResource = await systemRepo.readVersion(resourceType, id, versionId);
     // We use the resource with rewritten attachments here since we want subscribers to get the resource with the same attachment URLs
     // They would get if they did a search
-    rewrittenResource = await rewriteAttachments(RewriteMode.PRESIGNED_URL, systemRepo, deepClone(versionedResource));
+    rewrittenResource = await rewriteAttachments(RewriteMode.PRESIGNED_URL, systemRepo, versionedResource);
   } catch (err) {
     if (job.attemptsMade < MAX_PREAMBLE_ATTEMPTS) {
       throw err;
@@ -643,14 +694,30 @@ export async function execSubscriptionJob(job: Job<SubscriptionJobData>): Promis
     // Errors in this try/catch are considered to be issues in the client's rest hook or bot
     // and should trigger retries according to the subscription's max attempts
     if (subscription.channel?.endpoint?.startsWith('Bot/')) {
-      await execBot(systemRepo, job, subscription, rewrittenResource, job.data.interaction, job.data.requestTime);
+      await execBot(
+        systemRepo,
+        project,
+        job,
+        subscription,
+        rewrittenResource,
+        job.data.interaction,
+        job.data.requestTime
+      );
     } else {
-      await sendRestHook(job, subscription, rewrittenResource, job.data.interaction, job.data.requestTime);
+      await sendRestHook(
+        systemRepo,
+        project,
+        job,
+        subscription,
+        rewrittenResource,
+        job.data.interaction,
+        job.data.requestTime
+      );
     }
     // Success - reset the failure counter
     await clearSubscriptionFailures(subscription.id);
   } catch (err) {
-    await catchJobError(systemRepo, subscription, job, err);
+    await catchJobError(systemRepo, project, subscription, job, err);
   }
 }
 
@@ -696,6 +763,8 @@ async function tryGetCurrentVersion<T extends Resource = Resource>(
 
 /**
  * Sends a rest-hook subscription.
+ * @param systemRepo - The system repository.
+ * @param project - The subscription's project; undefined for a system subscription.
  * @param job - The subscription job details.
  * @param subscription - The subscription.
  * @param resource - The resource that triggered the subscription.
@@ -703,6 +772,8 @@ async function tryGetCurrentVersion<T extends Resource = Resource>(
  * @param requestTime - The request time.
  */
 async function sendRestHook(
+  systemRepo: SystemRepository,
+  project: WithId<Project> | undefined,
   job: Job<SubscriptionJobData>,
   subscription: WithId<Subscription>,
   resource: Resource,
@@ -723,12 +794,6 @@ async function sendRestHook(
 
   const fetchStartTime = Date.now();
   let fetchEndTime: number;
-  let systemRepo: SystemRepository;
-  if (subscription.meta?.project) {
-    systemRepo = await getProjectSystemRepo(subscription.meta.project);
-  } else {
-    systemRepo = getGlobalSystemRepo(); // SHARDING is global correct if no project?
-  }
   try {
     log.info('Sending rest hook', {
       url,
@@ -736,7 +801,12 @@ async function sendRestHook(
       projectId: subscription.meta?.project,
     });
     log.debug('Rest hook headers: ' + JSON.stringify(headers, undefined, 2));
-    const response = await fetch(url, { method: 'POST', headers, body, timeout: REQUEST_TIMEOUT });
+    const response = await safeFetch(url, {
+      method: 'POST',
+      headers,
+      body,
+      signal: AbortSignal.timeout(REQUEST_TIMEOUT),
+    });
     fetchEndTime = Date.now();
     log.info('Received rest hook response', {
       status: response.status,
@@ -746,6 +816,7 @@ async function sendRestHook(
     const success = isJobSuccessful(subscription, response.status);
     await createSubscriptionAuditEvent(
       systemRepo,
+      project,
       resource,
       requestTime,
       success ? AuditEventOutcome.Success : AuditEventOutcome.MinorFailure,
@@ -765,6 +836,7 @@ async function sendRestHook(
     });
     await createSubscriptionAuditEvent(
       systemRepo,
+      project,
       resource,
       requestTime,
       AuditEventOutcome.MinorFailure,
@@ -831,8 +903,9 @@ function buildRestHookHeaders(
   const traceId = job.data.traceId;
   if (traceId) {
     headers['x-trace-id'] = traceId;
-    if (parseTraceparent(traceId)) {
-      headers['traceparent'] = traceId;
+    const traceparent = buildTraceparent(traceId);
+    if (traceparent) {
+      headers['traceparent'] = traceparent;
     }
   }
 
@@ -842,6 +915,7 @@ function buildRestHookHeaders(
 /**
  * Executes a Bot subscription.
  * @param systemRepo - The system repository.
+ * @param project - The subscription's project.
  * @param job - The subscription job.
  * @param subscription - The subscription.
  * @param resource - The resource that triggered the subscription.
@@ -850,6 +924,7 @@ function buildRestHookHeaders(
  */
 async function execBot(
   systemRepo: SystemRepository,
+  project: WithId<Project> | undefined,
   job: Job<SubscriptionJobData>,
   subscription: WithId<Subscription>,
   resource: Resource,
@@ -865,17 +940,25 @@ async function execBot(
   }
 
   // URL should be a Bot reference string
+  // SHARDING: this reads the Bot through the triggering project's shard, but the Bot can live in another
+  // project (a linked project, or any project for a server-scoped Subscription), and `Bot/<id>` doesn't
+  // say which. Proposed fix: search the global shard for `ProjectMembership?profile=Bot/<id>`, read the
+  // Bot from each candidate project's shard until found, and cache Bot ID -> project since Bots don't move.
+  // Alternatives considered: store the Bot's project on the Subscription at write time (a per-write
+  // lookup, but a field that can go stale and needs a migration, and linked-project Subscriptions would
+  // need it too), or try every shard (simple, but one read per shard per job unless cached).
   const bot = await systemRepo.readReference<Bot>({ reference: url });
 
-  const project = subscription.meta?.project as string;
+  // A project-scoped Subscription only fires for its own project, so the Bot runs there. A
+  // server-scoped one has no project: a runAsUser Bot runs where the requester is a member (the
+  // triggering project), and any other Bot runs as itself in its home project.
+  const projectId = subscription.meta?.project ?? (bot.runAsUser ? job.data.target.projectId : bot.meta?.project);
   const requester = resource.meta?.author as Reference<
     Bot | ClientApplication | Patient | Practitioner | RelatedPerson
   >;
   let runAs: WithId<ProjectMembership> | undefined;
-  if (bot.runAsUser) {
-    runAs = await findProjectMembership(project, requester);
-  } else {
-    runAs = await findProjectMembership(project, createReference(bot));
+  if (projectId) {
+    runAs = await findProjectMembership(projectId, bot.runAsUser ? requester : createReference(bot));
   }
 
   if (!runAs) {
@@ -889,6 +972,7 @@ async function execBot(
     subscription,
     bot,
     runAs,
+    runAsProject: project,
     requester,
     input: body,
     contentType: ContentType.FHIR_JSON,
@@ -900,6 +984,7 @@ async function execBot(
 
 async function catchJobError(
   systemRepo: SystemRepository,
+  project: WithId<Project> | undefined,
   subscription: WithId<Subscription>,
   job: Job<SubscriptionJobData>,
   err: unknown
@@ -914,7 +999,7 @@ async function catchJobError(
     const triggers = await getSubscriptionAutoDisableTriggers(systemRepo, subscription.meta?.project);
     const result = await recordSubscriptionFailure(subscription.id, triggers);
     if (result) {
-      await autoDisableSubscription(systemRepo, result.trigger, subscription, result.failureCount);
+      await autoDisableSubscription(systemRepo, project, result.trigger, subscription, result.failureCount);
     }
     // Throw a special error type to force BullMQ to move the job to failed state, instead of retrying again
     throw new UnrecoverableError(err instanceof Error ? err.message : 'Subscription exhausted available retries');
@@ -931,6 +1016,7 @@ async function catchJobError(
 
 async function autoDisableSubscription(
   systemRepo: SystemRepository,
+  project: WithId<Project> | undefined,
   trigger: SubscriptionAutoDisableTrigger,
   subscription: WithId<Subscription>,
   failureCount: number
@@ -948,18 +1034,22 @@ async function autoDisableSubscription(
       { op: 'add', path: '/error', value: errorMessage },
     ];
 
-    await systemRepo.withTransaction(async () => {
-      await systemRepo.patchResource('Subscription', subscription.id, patch);
+    await systemRepo.withTransaction(
+      async (txRepo) => {
+        await txRepo.patchResource('Subscription', subscription.id, patch);
 
-      await createSubscriptionAuditEvent(
-        systemRepo,
-        subscription,
-        new Date().toISOString(),
-        AuditEventOutcome.SeriousFailure,
-        errorMessage,
-        subscription
-      );
-    });
+        await createSubscriptionAuditEvent(
+          txRepo,
+          project,
+          subscription,
+          new Date().toISOString(),
+          AuditEventOutcome.SeriousFailure,
+          errorMessage,
+          subscription
+        );
+      },
+      { resourceTypes: ['AuditEvent', 'Subscription'], source: 'autoDisableSubscription' }
+    );
 
     await clearSubscriptionFailures(subscription.id);
 
@@ -971,7 +1061,10 @@ async function autoDisableSubscription(
   } catch (err) {
     globalLogger.warn('Failed to auto-disable subscription', {
       subscription: subscription.id,
+      projectId: subscription?.meta?.project,
+      failureCount,
       error: err,
+      timeWindowSeconds: trigger.timeWindowSeconds,
     });
   }
 }

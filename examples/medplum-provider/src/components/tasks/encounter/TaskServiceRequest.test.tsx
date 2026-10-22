@@ -89,6 +89,7 @@ describe('TaskServiceRequest', () => {
       state: {
         performingLab: undefined,
         performingLabAccountNumber: undefined,
+        performingLabPhysicianAccountNumber: undefined,
         selectedTests: [],
         testMetadata: {},
         diagnoses: [],
@@ -114,6 +115,7 @@ describe('TaskServiceRequest', () => {
       searchAvailableTests: vi.fn().mockResolvedValue([]),
       setPerformingLab: vi.fn(),
       setPerformingLabAccountNumber: vi.fn(),
+      setPerformingLabPhysicianAccountNumber: vi.fn(),
       addTest: vi.fn(),
       removeTest: vi.fn(),
       setTests: vi.fn(),
@@ -253,6 +255,7 @@ describe('TaskServiceRequest', () => {
       state: {
         performingLab: undefined,
         performingLabAccountNumber: undefined,
+        performingLabPhysicianAccountNumber: undefined,
         selectedTests: [],
         testMetadata: {},
         diagnoses: [],
@@ -278,6 +281,7 @@ describe('TaskServiceRequest', () => {
       searchAvailableTests: vi.fn().mockResolvedValue([]),
       setPerformingLab: vi.fn(),
       setPerformingLabAccountNumber: vi.fn(),
+      setPerformingLabPhysicianAccountNumber: vi.fn(),
       addTest: vi.fn(),
       removeTest: vi.fn(),
       setTests: setTestsSpy,
@@ -320,6 +324,7 @@ describe('TaskServiceRequest', () => {
       state: {
         performingLab: undefined,
         performingLabAccountNumber: undefined,
+        performingLabPhysicianAccountNumber: undefined,
         selectedTests: [],
         testMetadata: {},
         diagnoses: [],
@@ -339,6 +344,7 @@ describe('TaskServiceRequest', () => {
       searchAvailableTests: vi.fn().mockResolvedValue([]),
       setPerformingLab: vi.fn(),
       setPerformingLabAccountNumber: vi.fn(),
+      setPerformingLabPhysicianAccountNumber: vi.fn(),
       addTest: vi.fn(),
       removeTest: vi.fn(),
       setTests: vi.fn(),
@@ -396,6 +402,57 @@ describe('TaskServiceRequest', () => {
       expect(viewLink).toHaveAttribute('href', `/Patient/${HomerSimpson.id}/ServiceRequest/lab-order-456`);
       expect(viewLink).toHaveAttribute('target', '_blank');
     });
+  });
+
+  test('shows DiagnosticReportDisplay and View Report link when a report exists', async () => {
+    const activeServiceRequest: ServiceRequest = {
+      ...mockServiceRequest,
+      status: 'active',
+      requisition: { value: 'REQ-12345' },
+    };
+    vi.spyOn(medplum, 'readReference').mockResolvedValue(activeServiceRequest as WithId<ServiceRequest>);
+    const report = await medplum.createResource<DiagnosticReport>({
+      resourceType: 'DiagnosticReport',
+      status: 'final',
+      code: { text: 'Complete Blood Count' },
+      basedOn: [{ reference: 'ServiceRequest/service-request-123' }],
+      subject: { reference: `Patient/${HomerSimpson.id}` },
+    });
+    setup();
+
+    await waitFor(() => {
+      expect(screen.getByText('Diagnostic Report')).toBeInTheDocument();
+    });
+
+    const viewLink = screen.getByRole('link', { name: 'View Report' });
+    expect(viewLink).toHaveAttribute('href', `/Patient/${HomerSimpson.id}/DiagnosticReport/${report.id}`);
+    expect(viewLink).toHaveAttribute('target', '_blank');
+    expect(screen.queryByText(/✅ Order Sent/)).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'View in Labs' })).not.toBeInTheDocument();
+  });
+
+  test('keeps order sent message when the only report is cancelled', async () => {
+    const activeServiceRequest: ServiceRequest = {
+      ...mockServiceRequest,
+      status: 'active',
+      requisition: { value: 'REQ-12345' },
+    };
+    vi.spyOn(medplum, 'readReference').mockResolvedValue(activeServiceRequest as WithId<ServiceRequest>);
+    await medplum.createResource<DiagnosticReport>({
+      resourceType: 'DiagnosticReport',
+      status: 'cancelled',
+      code: { text: 'Complete Blood Count' },
+      basedOn: [{ reference: 'ServiceRequest/service-request-123' }],
+      subject: { reference: `Patient/${HomerSimpson.id}` },
+    });
+    setup();
+
+    await waitFor(() => {
+      expect(screen.getByText(/✅ Order Sent/)).toBeInTheDocument();
+    });
+
+    expect(screen.queryByText('Diagnostic Report')).not.toBeInTheDocument();
+    expect(screen.queryByRole('link', { name: 'View Report' })).not.toBeInTheDocument();
   });
 
   test('handles task without encounter reference', async () => {

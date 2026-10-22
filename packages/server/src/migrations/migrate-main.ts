@@ -5,15 +5,16 @@ import { readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import { Client } from 'pg';
 import * as semver from 'semver';
+import packageJson from '../../package.json';
+import { exitAfterStdoutDrain, globalLogger } from '../logger';
 import type { BuildMigrationOptions } from './migrate';
 import {
-  generateMigrationActions,
   buildSchema,
+  generateMigrationActions,
   indexStructureDefinitionsAndSearchParameters,
-  writePreDeployActionsToBuilder,
   writePostDeployActionsToBuilder,
+  writePreDeployActionsToBuilder,
 } from './migrate';
-import packageJson from '../../package.json';
 
 export const SCHEMA_DIR = resolve('./src/migrations/schema');
 export const DATA_DIR = resolve('./src/migrations/data');
@@ -48,7 +49,7 @@ export async function main(): Promise<void> {
       writePreDeployActionsToBuilder(preDeployBuilder, actions.preDeploy);
 
       if (dryRun) {
-        console.log(preDeployBuilder.toString());
+        globalLogger.write(preDeployBuilder.toString());
       } else {
         writeFileSync(`${SCHEMA_DIR}/v${getNextVersion(SCHEMA_DIR)}.ts`, preDeployBuilder.toString(), 'utf8');
         rewriteMigrationExports(SCHEMA_DIR);
@@ -60,7 +61,7 @@ export async function main(): Promise<void> {
       writePostDeployActionsToBuilder(postDeployBuilder, actions.postDeploy);
 
       if (dryRun) {
-        console.log(postDeployBuilder.toString());
+        globalLogger.write(postDeployBuilder.toString());
       } else {
         const id = `v${getNextVersion(DATA_DIR)}`;
         writeFileSync(`${DATA_DIR}/${id}.ts`, postDeployBuilder.toString(), 'utf8');
@@ -74,7 +75,7 @@ export async function main(): Promise<void> {
     const schemaBuilder = new FileBuilder();
     buildSchema(schemaBuilder);
     if (dryRun) {
-      console.log(schemaBuilder.toString());
+      globalLogger.write(schemaBuilder.toString());
     } else {
       writeFileSync(`${SCHEMA_DIR}/schema.sql`, schemaBuilder.toString(), 'utf8');
     }
@@ -89,26 +90,34 @@ function getNextVersion(dir: string = SCHEMA_DIR): number {
   return lastVersion + 1;
 }
 
-function rewriteMigrationExports(dir: string): void {
+export function buildMigrationExports(versions: number[]): string {
   const b = new FileBuilder();
   b.append(
     '// organize-imports-ignore - https://github.com/simonhaenisch/prettier-plugin-organize-imports?tab=readme-ov-file#skip-files'
   );
   b.newLine();
-  const filenamesWithoutExt = getMigrationFilenames(dir)
-    .map(getVersionFromFilename)
-    .sort((a, b) => a - b)
-    .map((version) => `v${version}`);
-  for (const filename of filenamesWithoutExt) {
-    b.append(`export * as ${filename} from './${filename}';`);
-    if (filename === 'v9') {
+
+  let previousDigits = 0;
+  for (const version of versions) {
+    const digits = version.toString().length;
+    if (previousDigits && digits !== previousDigits) {
       b.append('/* CAUTION: LOAD-BEARING COMMENT */');
       b.append(
         '/* This comment prevents auto-organization of imports in VSCode which would break the numeric ordering of the migrations. */'
       );
     }
+    b.append(`export * as v${version} from './v${version}';`);
+    previousDigits = digits;
   }
-  writeFileSync(`${dir}/index.ts`, b.toString(), { flag: 'w' });
+
+  return b.toString();
+}
+
+function rewriteMigrationExports(dir: string): void {
+  const versions = getMigrationFilenames(dir)
+    .map(getVersionFromFilename)
+    .sort((a, b) => a - b);
+  writeFileSync(`${dir}/index.ts`, buildMigrationExports(versions), { flag: 'w' });
 }
 
 export function addDataMigrationToManifest(version: string): void {
@@ -118,7 +127,7 @@ export function addDataMigrationToManifest(version: string): void {
   writeFileSync(path, JSON.stringify(manifest, null, 2) + '\n');
 }
 
-function getMigrationFilenames(dir: string = SCHEMA_DIR): string[] {
+export function getMigrationFilenames(dir: string = SCHEMA_DIR): string[] {
   return readdirSync(dir).filter((filename) => /^v\d+\.ts$/.test(filename));
 }
 
@@ -126,9 +135,16 @@ function getVersionFromFilename(filename: string): number {
   return Number.parseInt(filename.replace('v', '').replace('.ts', ''), 10);
 }
 
+export async function runFromCli(): Promise<void> {
+  try {
+    await main();
+  } catch (reason) {
+    globalLogger.error('Migration failed', reason as Error);
+    await exitAfterStdoutDrain();
+  }
+}
+
 if (import.meta.main) {
-  main().catch((reason) => {
-    console.error(reason);
-    process.exit(1);
-  });
+  // We should never hit the catch block here but we can't do top-level await due to how we transpile to CJS for Jest
+  runFromCli().catch(console.error);
 }

@@ -8,7 +8,8 @@ import express from 'express';
 import request from 'supertest';
 import { initApp, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
-import { initTestAuth } from '../../test.setup';
+import { getSuperAdminTestProject, initTestAuth } from '../../test.setup';
+import type { Repository } from '../repo';
 import { validateCodings } from './codesystemvalidatecode';
 
 const app = express();
@@ -26,20 +27,20 @@ const testCodeSystem: CodeSystem = {
 describe('CodeSystem validate-code', () => {
   let codeSystem: WithId<CodeSystem>;
   let accessToken: string;
+  let repo: Repository;
 
   beforeAll(async () => {
     const config = await loadTestConfig();
     await initApp(app, config);
 
-    accessToken = await initTestAuth({ superAdmin: true });
-    expect(accessToken).toBeDefined();
+    ({ accessToken, repo } = await getSuperAdminTestProject());
 
     const res = await request(app)
       .post('/fhir/R4/CodeSystem')
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', ContentType.FHIR_JSON)
       .send(testCodeSystem);
-    expect(res.status).toStrictEqual(201);
+    expect(res).toHaveStatus(201);
     codeSystem = res.body;
 
     const res2 = await request(app)
@@ -68,7 +69,7 @@ describe('CodeSystem validate-code', () => {
           { name: 'concept', valueCoding: { code: '2', display: 'Biopsy of head' } },
         ],
       });
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
   });
 
   afterAll(async () => {
@@ -87,7 +88,7 @@ describe('CodeSystem validate-code', () => {
           { name: 'code', valueCode: '1' },
         ],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [
@@ -106,7 +107,7 @@ describe('CodeSystem validate-code', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system: codeSystem.url, code: '1' } }],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [
@@ -128,7 +129,7 @@ describe('CodeSystem validate-code', () => {
           { name: 'code', valueCode: 'wrong code' },
         ],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [{ name: 'result', valueBoolean: false }],
@@ -144,7 +145,7 @@ describe('CodeSystem validate-code', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'code', valueCode: 'wrong code' }],
       });
-    expect(res.status).toStrictEqual(400);
+    expect(res).toHaveStatus(400);
     expect(res.body).toMatchObject<OperationOutcome>({
       resourceType: 'OperationOutcome',
       issue: [{ severity: 'error', code: 'invalid', details: { text: 'No code system specified' } }],
@@ -161,7 +162,7 @@ describe('CodeSystem validate-code', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system: codeSystem.url, code: '1' } }],
       });
-    expect(res.status).toBe(404);
+    expect(res).toHaveStatus(404);
   });
 
   test('Falls back to validating system URL', async () => {
@@ -176,7 +177,7 @@ describe('CodeSystem validate-code', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system, code: '1' } }],
       });
-    expect(resY.status).toBe(200);
+    expect(resY).toHaveStatus(200);
     expect(resY.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [{ name: 'result', valueBoolean: true }],
@@ -194,7 +195,7 @@ describe('CodeSystem validate-code', () => {
           { name: 'coding', valueCoding: { system, code: '1' } },
         ],
       });
-    expect(resN.status).toBe(200);
+    expect(resN).toHaveStatus(200);
     expect(resN.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [{ name: 'result', valueBoolean: false }],
@@ -202,19 +203,25 @@ describe('CodeSystem validate-code', () => {
   });
 
   test('Lookup using specific CodeSystem version', async () => {
-    const updatedCodeSystem: CodeSystem = {
-      ...testCodeSystem,
-      content: 'complete',
-      version: '3.1.4',
-      concept: [{ code: '5', display: 'Neologism' }],
-    };
-    const res = await request(app)
-      .post('/fhir/R4/CodeSystem')
-      .set('Authorization', 'Bearer ' + accessToken)
-      .set('Content-Type', ContentType.FHIR_JSON)
-      .send(updatedCodeSystem);
-    expect(res.status).toStrictEqual(201);
-    const codeSystem = res.body as CodeSystem;
+    const versionedUrl = 'http://example.com/versioned-code-system-' + randomUUID();
+    for (const [version, display] of [
+      ['2.7.1', 'Archaism'],
+      ['3.1.4', 'Neologism'],
+    ]) {
+      const versionedCodeSystem: CodeSystem = {
+        ...testCodeSystem,
+        url: versionedUrl,
+        content: 'complete',
+        version,
+        concept: [{ code: '5', display }],
+      };
+      const res = await request(app)
+        .post('/fhir/R4/CodeSystem')
+        .set('Authorization', 'Bearer ' + accessToken)
+        .set('Content-Type', ContentType.FHIR_JSON)
+        .send(versionedCodeSystem);
+      expect(res).toHaveStatus(201);
+    }
 
     const res2 = await request(app)
       .post('/fhir/R4/CodeSystem/$validate-code')
@@ -223,16 +230,16 @@ describe('CodeSystem validate-code', () => {
       .send({
         resourceType: 'Parameters',
         parameter: [
-          { name: 'coding', valueCoding: { system: codeSystem.url, code: '5' } },
-          { name: 'version', valueString: '3.1.4' },
+          { name: 'coding', valueCoding: { system: versionedUrl, code: '5' } },
+          { name: 'version', valueString: '2.7.1' },
         ],
       });
-    expect(res2.status).toStrictEqual(200);
+    expect(res2).toHaveStatus(200);
     expect(res2.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [
         { name: 'result', valueBoolean: true },
-        { name: 'display', valueString: 'Neologism' },
+        { name: 'display', valueString: 'Archaism' },
       ],
     });
   });
@@ -243,7 +250,7 @@ describe('CodeSystem validate-code', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', 'application/fhir+json')
       .send();
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [
@@ -259,7 +266,7 @@ describe('CodeSystem validate-code', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', 'application/fhir+json')
       .send();
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [
@@ -275,7 +282,7 @@ describe('CodeSystem validate-code', () => {
       .set('Authorization', 'Bearer ' + accessToken)
       .set('Content-Type', 'application/fhir+json')
       .send();
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [{ name: 'result', valueBoolean: false }],
@@ -291,7 +298,7 @@ describe('CodeSystem validate-code', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { code: '1' } }],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [
@@ -310,7 +317,7 @@ describe('CodeSystem validate-code', () => {
         resourceType: 'Parameters',
         parameter: [{ name: 'coding', valueCoding: { system: 'incorrect', code: '1' } }],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [{ name: 'result', valueBoolean: false }],
@@ -329,7 +336,7 @@ describe('CodeSystem validate-code', () => {
           { name: 'displayLanguage', valueCode: 'fr' },
         ],
       });
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject<Parameters>({
       resourceType: 'Parameters',
       parameter: [
@@ -340,7 +347,7 @@ describe('CodeSystem validate-code', () => {
   });
 
   test('validateCodings', async () => {
-    const result = await validateCodings(codeSystem, [
+    const result = await validateCodings(repo, codeSystem, [
       { system: codeSystem.url, code: '1' }, // valid
       { system: codeSystem.url, code: '2' }, // valid
       { system: codeSystem.url, code: 'invalid-code' }, // invalid

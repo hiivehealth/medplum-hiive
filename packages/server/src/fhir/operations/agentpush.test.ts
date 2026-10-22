@@ -21,6 +21,7 @@ import { loadTestConfig } from '../../config/loader';
 import * as pubsub from '../../pubsub';
 import { initTestAuth, waitForAsyncJob } from '../../test.setup';
 import type { AgentPushParameters } from './agentpush';
+import { getAgentCallbackChannel } from './utils/agentcallback';
 import { cleanupMockAgents, configMockAgents, mockAgentResponse } from './utils/agenttestutils';
 
 describe('Agent Push', () => {
@@ -54,7 +55,7 @@ describe('Agent Push', () => {
         name: 'Test Agent',
         status: 'active',
       });
-    expect(res1.status).toBe(201);
+    expect(res1).toHaveStatus(201);
     agent = res1.body as WithId<Agent>;
 
     const res2 = await request(app)
@@ -66,7 +67,7 @@ describe('Agent Push', () => {
         modelNumber: randomUUID(),
         url: 'mllp://192.168.50.10:56001',
       });
-    expect(res2.status).toBe(201);
+    expect(res2).toHaveStatus(201);
     device = res2.body as WithId<Device>;
 
     configMockAgents(port);
@@ -87,7 +88,7 @@ describe('Agent Push', () => {
         body: 'input',
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject(allOk);
   });
 
@@ -104,7 +105,7 @@ describe('Agent Push', () => {
         },
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.headers['content-type']).toBe('application/fhir+json; charset=utf-8');
   });
 
@@ -122,7 +123,7 @@ describe('Agent Push', () => {
         body: text,
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject(allOk);
   });
 
@@ -136,7 +137,7 @@ describe('Agent Push', () => {
         body: 'input',
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject(allOk);
   });
 
@@ -154,7 +155,7 @@ describe('Agent Push', () => {
         body: text,
         destination: 'Device?model=' + device.modelNumber,
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject(allOk);
   });
 
@@ -168,7 +169,7 @@ describe('Agent Push', () => {
         body: 'input',
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Must specify agent ID or identifier');
   });
 
@@ -181,7 +182,7 @@ describe('Agent Push', () => {
         body: 'input',
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Missing contentType parameter');
   });
 
@@ -194,7 +195,7 @@ describe('Agent Push', () => {
         contentType: ContentType.TEXT,
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Missing body parameter');
   });
 
@@ -207,7 +208,7 @@ describe('Agent Push', () => {
         contentType: ContentType.TEXT,
         body: 'input',
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Missing destination parameter');
   });
 
@@ -221,7 +222,7 @@ describe('Agent Push', () => {
         body: 'input',
         destination: 'foo',
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Destination device not found');
   });
 
@@ -235,7 +236,7 @@ describe('Agent Push', () => {
         body: 'input',
         destination: 'Device/' + randomUUID(),
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Destination device not found');
   });
 
@@ -246,7 +247,7 @@ describe('Agent Push', () => {
       .set('Content-Type', ContentType.FHIR_JSON)
       .set('Authorization', 'Bearer ' + accessToken)
       .send({ resourceType: 'Device' });
-    expect(res1.status).toBe(201);
+    expect(res1).toHaveStatus(201);
 
     const device2 = res1.body as WithId<Device>;
 
@@ -259,7 +260,7 @@ describe('Agent Push', () => {
         body: 'input',
         destination: getReferenceString(device2),
       });
-    expect(res2.status).toBe(400);
+    expect(res2).toHaveStatus(400);
     expect(res2.body.issue[0].details.text).toStrictEqual('Destination device missing url');
   });
 
@@ -274,12 +275,12 @@ describe('Agent Push', () => {
         destination: getReferenceString(device),
         waitTimeout: 60 * 60 * 1000,
       });
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body.issue[0].details.text).toStrictEqual('Invalid wait timeout');
   });
 
   test('Ping -- Successful ping to IP', async () => {
-    const publishSpy = jest.spyOn(pubsub, 'publish');
+    const publishSpy = vi.spyOn(pubsub, 'publish');
 
     let resolve!: (value: request.Response) => void | PromiseLike<void>;
     let reject!: (err: Error) => void;
@@ -320,7 +321,7 @@ describe('Agent Push', () => {
     const transmitRequest = JSON.parse(transmitRequestStr) as AgentTransmitRequest;
 
     await pubsub.publish(
-      transmitRequest.callback as string,
+      getAgentCallbackChannel(),
       JSON.stringify({
         ...transmitRequest,
         type: 'agent:transmit:response',
@@ -337,14 +338,14 @@ round-trip min/avg/max/stddev = 10.316/10.316/10.316/nan ms`,
     );
 
     const res = await deferredResponse;
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.text).toStrictEqual(expect.stringMatching(/ping statistics/i));
 
     publishSpy.mockRestore();
   });
 
   test('Ping -- Successful ping to hostname', async () => {
-    const publishSpy = jest.spyOn(pubsub, 'publish');
+    const publishSpy = vi.spyOn(pubsub, 'publish');
 
     let resolve!: (value: request.Response) => void | PromiseLike<void>;
     let reject!: (err: Error) => void;
@@ -385,7 +386,7 @@ round-trip min/avg/max/stddev = 10.316/10.316/10.316/nan ms`,
     const transmitRequest = JSON.parse(transmitRequestStr) as AgentTransmitRequest;
 
     await pubsub.publish(
-      transmitRequest.callback as string,
+      getAgentCallbackChannel(),
       JSON.stringify({
         ...transmitRequest,
         type: 'agent:transmit:response',
@@ -402,14 +403,14 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
     );
 
     const res = await deferredResponse;
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.text).toStrictEqual(expect.stringMatching(/ping statistics/i));
 
     publishSpy.mockRestore();
   });
 
   test('Ping -- Error', async () => {
-    const publishSpy = jest.spyOn(pubsub, 'publish');
+    const publishSpy = vi.spyOn(pubsub, 'publish');
 
     let resolve!: (value: request.Response) => void | PromiseLike<void>;
     let reject!: (err: Error) => void;
@@ -450,7 +451,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
     const transmitRequest = JSON.parse(transmitRequestStr) as AgentTransmitRequest;
 
     await pubsub.publish(
-      transmitRequest.callback as string,
+      getAgentCallbackChannel(),
       JSON.stringify({
         ...transmitRequest,
         type: 'agent:transmit:response',
@@ -461,7 +462,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
     );
 
     const res = await deferredResponse;
-    expect(res.status).toStrictEqual(400);
+    expect(res).toHaveStatus(400);
 
     const body = res.body as OperationOutcome;
     expect(body).toBeDefined();
@@ -472,7 +473,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
   });
 
   test('Prefer: respond-async', async () => {
-    const publishSpy = jest.spyOn(pubsub, 'publish');
+    const publishSpy = vi.spyOn(pubsub, 'publish');
 
     let resolve!: (value: request.Response) => void | PromiseLike<void>;
     let reject!: (err: Error) => void;
@@ -514,7 +515,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
     const transmitRequest = JSON.parse(transmitRequestStr) as AgentTransmitRequest;
 
     await pubsub.publish(
-      transmitRequest.callback as string,
+      getAgentCallbackChannel(),
       JSON.stringify({
         ...transmitRequest,
         type: 'agent:transmit:response',
@@ -532,7 +533,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
 
     const res = await deferredResponse;
 
-    expect(res.status).toStrictEqual(202);
+    expect(res).toHaveStatus(202);
     expect(res.headers['content-location']).toBeDefined();
     const asyncJob = await waitForAsyncJob(res.headers['content-location'], app, accessToken);
     expect(asyncJob).toMatchObject<Partial<AsyncJob>>({
@@ -569,7 +570,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
         name: 'Test Agent',
         status: 'off',
       } satisfies Agent);
-    expect(res1.status).toBe(201);
+    expect(res1).toHaveStatus(201);
 
     const agent = res1.body as WithId<Agent>;
 
@@ -594,7 +595,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
         waitForResponse: true,
       } satisfies AgentPushParameters);
 
-    expect(res.status).toBe(400);
+    expect(res).toHaveStatus(400);
     expect(res.body).toMatchObject<Partial<OperationOutcome>>({
       resourceType: 'OperationOutcome',
       issue: expect.arrayContaining([
@@ -612,7 +613,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
   });
 
   test('Submit with returnAck parameter', async () => {
-    const publishSpy = jest.spyOn(pubsub, 'publish');
+    const publishSpy = vi.spyOn(pubsub, 'publish');
 
     const res = await request(app)
       .post(`/fhir/R4/Agent/${agent.id}/$push`)
@@ -624,7 +625,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
         destination: getReferenceString(device),
         returnAck: 'application',
       } satisfies AgentPushParameters);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject(allOk);
 
     // Verify the returnAck was included in the transmit request
@@ -638,7 +639,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
   });
 
   test('Submit with returnAck=first parameter', async () => {
-    const publishSpy = jest.spyOn(pubsub, 'publish');
+    const publishSpy = vi.spyOn(pubsub, 'publish');
 
     const res = await request(app)
       .post(`/fhir/R4/Agent/${agent.id}/$push`)
@@ -650,7 +651,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
         destination: getReferenceString(device),
         returnAck: 'first',
       } satisfies AgentPushParameters);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject(allOk);
 
     // Verify the returnAck was included in the transmit request
@@ -664,7 +665,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
   });
 
   test('Submit without returnAck parameter does not include it in request', async () => {
-    const publishSpy = jest.spyOn(pubsub, 'publish');
+    const publishSpy = vi.spyOn(pubsub, 'publish');
 
     const res = await request(app)
       .post(`/fhir/R4/Agent/${agent.id}/$push`)
@@ -675,7 +676,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
         body: 'input',
         destination: getReferenceString(device),
       });
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
     expect(res.body).toMatchObject(allOk);
 
     // Verify the returnAck was NOT included in the transmit request
@@ -700,7 +701,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
         name: 'Test Agent',
         status: 'off',
       } satisfies Agent);
-    expect(res1.status).toBe(201);
+    expect(res1).toHaveStatus(201);
 
     const agent = res1.body as WithId<Agent>;
 
@@ -726,7 +727,7 @@ round-trip min/avg/max/stddev = 0.081/0.081/0.081/nan ms`,
         waitForResponse: true,
       } satisfies AgentPushParameters);
 
-    expect(res.status).toStrictEqual(200);
+    expect(res).toHaveStatus(200);
     expect(res.text).toStrictEqual(expect.stringMatching(/ping statistics/i));
 
     cleanup();

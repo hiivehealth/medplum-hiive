@@ -10,6 +10,12 @@ Medplum's integrations the most commonly used features of the platform, and the 
 
 Medplum supports the following first party integrations.
 
+:::info[Self-hosted deployments]
+
+Premium integrations, such as [Health Gorilla Lab Orders](/docs/integration/health-gorilla) and [ScriptSure](/docs/integration/scriptsure), are also available to self-hosted deployments on the [Medplum Enterprise](https://www.medplum.com/enterprise) plan. Contact us at [hello@medplum.com](mailto:hello@medplum.com) to get started, or see [pricing](/pricing).
+
+:::
+
 <table>
   <thead>
     <tr>
@@ -48,10 +54,10 @@ Medplum supports the following first party integrations.
       <td><a href="/docs/auth/external-identity-providers">Entra Auth Setup</a></td>
     </tr>
     <tr>
-      <td><a href="https://www.google.com/recaptcha/about/">Recaptcha</a></td>
+      <td><a href="https://www.google.com/recaptcha/about/">reCAPTCHA</a></td>
       <td>Security</td>
-      <td>Enable recaptcha on patient registration</td>
-      <td><a href="/docs/user-management/custom-emails#setup-recaptcha">Setup recaptcha</a></td>
+      <td>Enable reCAPTCHA on patient registration</td>
+      <td><a href="/docs/user-management/custom-emails#setup-recaptcha">Set up reCAPTCHA</a></td>
     </tr>
     <tr style={{backgroundColor: '#f6f8fa'}}>
       <td colspan="4"><strong>Clinical Systems (EHR, HIE, Labs)</strong></td>
@@ -93,6 +99,21 @@ Medplum supports the following first party integrations.
       <td><a href="https://github.com/medplum/medplum/tree/main/examples/medplum-health-gorilla-demo">Bot and setup</a></td>
     </tr>
     <tr style={{backgroundColor: '#f6f8fa'}}>
+      <td colspan="4"><strong>E-Prescribe</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://www.dosespot.com/">DoseSpot</a></td>
+      <td>E-Prescribe</td>
+      <td>Embedded iFrame e-prescribing, including EPCS</td>
+      <td><a href="/docs/integration/dosespot">DoseSpot Integration</a></td>
+    </tr>
+    <tr>
+      <td><a href="https://www.dawsystems.com/">ScriptSure</a></td>
+      <td>E-Prescribe</td>
+      <td>Custom prescribing workflows with FHIR operations and bots, plus a hosted iframe</td>
+      <td><a href="/docs/integration/scriptsure">ScriptSure Integration</a></td>
+    </tr>
+    <tr style={{backgroundColor: '#f6f8fa'}}>
       <td colspan="4"><strong>Communications</strong></td>
     </tr>
     <tr>
@@ -100,6 +121,12 @@ Medplum supports the following first party integrations.
       <td>Communications</td>
       <td>Send and receive faxes via FHIR Communication resources</td>
       <td><a href="/docs/integration/efax">eFax Integration</a></td>
+    </tr>
+    <tr>
+      <td><a href="https://www.twilio.com/">Twilio SMS</a></td>
+      <td>Communications</td>
+      <td>Send and receive SMS messages via FHIR Communication resources</td>
+      <td><a href="/docs/integration/twilio-sms">Twilio SMS Integration</a></td>
     </tr>
     <tr style={{backgroundColor: '#f6f8fa'}}>
       <td colspan="4"><strong>Billing</strong></td>
@@ -109,6 +136,12 @@ Medplum supports the following first party integrations.
       <td>Billing</td>
       <td>Revenue cycle and insurance eligibility check</td>
       <td><a href="https://github.com/medplum/medplum/tree/main/examples/medplum-demo-bots/src/candid-health">Candid bot</a></td>
+    </tr>
+    <tr>
+      <td><a href="https://www.stedi.com/">Stedi</a></td>
+      <td>Billing</td>
+      <td>Insurance eligibility checks (X12 270/271) and professional claim submission (X12 837P/277/835)</td>
+      <td><a href="/docs/integration/stedi">Stedi Integration</a></td>
     </tr>
     <tr style={{backgroundColor: '#f6f8fa'}}>
       <td colspan="4"><strong>Data and Observability</strong></td>
@@ -129,7 +162,7 @@ Medplum supports the following first party integrations.
       <td><a href="https://www.snowflake.com/">Snowflake</a></td>
       <td>Data warehouse</td>
       <td>Synchronize data to datawarehouse</td>
-      <td>Documentation coming soon</td>
+      <td><a href="/docs/analytics/snowflake">Snowflake sync</a></td>
     </tr>
     <tr style={{backgroundColor: '#f6f8fa'}}>
       <td colspan="4"><strong>Artificial Intelligence</strong></td>
@@ -139,6 +172,15 @@ Medplum supports the following first party integrations.
       <td>AI</td>
       <td>Large language models</td>
       <td><a href="/docs/ai">Medplum AI</a></td>
+    </tr>
+    <tr style={{backgroundColor: '#f6f8fa'}}>
+      <td colspan="4"><strong>Devices and Remote Monitoring</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://www.anybiosignal.com/">AnyBio</a></td>
+      <td>Remote Monitoring</td>
+      <td>Cardiac and biosignal monitoring data as FHIR Observations</td>
+      <td>Documentation coming soon</td>
     </tr>
   </tbody>
 </table>
@@ -255,7 +297,7 @@ Medplum provides templates and playbooks for common medical integrations.
 
 ## Custom built integrations
 
-Medplum provides building blocks for custom integrations. Some examples are below.
+Medplum provides building blocks for custom integrations. **Any system that exposes an API (REST/FHIR), HL7, or SFTP interface can be connected to Medplum** - you are not limited to a fixed catalog of vendors. Because the integration logic is built with [Bots](/docs/bots) that run on your own project, you own and control it. This makes custom built integrations both flexible and portable. 
 
 <table>
   <thead>
@@ -297,6 +339,12 @@ Medplum provides building blocks for custom integrations. Some examples are belo
       <td>Prescribe and check medications</td>
       <td><a href="https://drive.google.com/drive/folders/1tkkKREaeCj8UOZErTHm28_y7jPfYn4Tb">Medication related integration</a></td>
     </tr>
+    <tr>
+      <td><a href="https://npiregistry.cms.hhs.gov/api-page">NPPES NPI Registry</a></td>
+      <td>Bot API</td>
+      <td>Look up National Provider Identifier (NPI) records from the public CMS registry</td>
+      <td><a href="https://github.com/medplum/medplum/tree/main/examples/medplum-demo-bots/src/nppes-lookup.ts">NPPES Lookup Bot</a></td>
+    </tr>
     <tr style={{backgroundColor: '#f6f8fa'}}>
       <td colspan="4"><strong>Documents and Forms (Bot PDF)</strong></td>
     </tr>
@@ -312,6 +360,21 @@ Medplum provides building blocks for custom integrations. Some examples are belo
       <td>Create PDF for Superbill</td>
       <td><a href="https://github.com/medplum/medplum/blob/main/examples/medplum-demo-bots/src/create-pdf.ts">PDF Bot</a></td>
     </tr>
+    <tr style={{backgroundColor: '#f6f8fa'}}>
+      <td colspan="4"><strong>Consent and E-signature (Bot Webhooks)</strong></td>
+    </tr>
+    <tr>
+      <td><a href="https://www.docusign.com/">DocuSign</a></td>
+      <td>Bot Webhooks</td>
+      <td>Send documents for signature and store completed agreements</td>
+      <td><a href="/docs/bots/consuming-webhooks">Consuming webhooks</a></td>
+    </tr>
+    <tr>
+      <td><a href="https://sign.dropbox.com/">Dropbox Sign</a></td>
+      <td>Bot Webhooks</td>
+      <td>Send documents for signature and store completed agreements</td>
+      <td><a href="/docs/bots/consuming-webhooks">Consuming webhooks</a></td>
+    </tr>
   </tbody>
 </table>
 
@@ -321,7 +384,7 @@ Complex integrations are built by composing [bots](/docs/bots/), [subscriptions]
 
 - [Running on localhost](/docs/contributing/run-the-stack) is useful for testing integrations
 - [CLI](/docs/cli/external-fhir-servers) is commonly used to test connectivity to external FHIR Servers
-- [Integration Features and Fixes](https://github.com/medplum/medplum/pulls?q=is%3Apr+label%3Aintegration) on Github show the code that powers many of the integrations.
+- [Integration Features and Fixes](https://github.com/medplum/medplum/pulls?q=is%3Apr+label%3Aintegration) on GitHub show the code that powers many of the integrations.
 - [Audit and Logging Features](https://github.com/medplum/medplum/pulls?q=is%3Apr+label%3Aaudit-logging) show several security and observability integrations.
 - [Bot Pull Requests](https://github.com/medplum/medplum/issues?q=label%3Abots) can be good reference material for how integrations work.
 - [Auth Pull Requests](https://github.com/medplum/medplum/pulls?q=is%3Apr+label%3Aauth) can also be good reference material for integration planning and learning.

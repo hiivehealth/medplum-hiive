@@ -3,7 +3,6 @@
 import { PropertyType } from '@medplum/core';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
-import { MemoryRouter } from 'react-router';
 import { act, fireEvent, render, screen } from '../test-utils/render';
 import type { FhirPathTableField, FhirPathTableProps } from './FhirPathTable';
 import { FhirPathTable } from './FhirPathTable';
@@ -95,11 +94,9 @@ describe('FhirPathTable', () => {
   async function setup(args: FhirPathTableProps): Promise<void> {
     await act(async () => {
       render(
-        <MemoryRouter>
-          <MedplumProvider medplum={new MockClient()}>
-            <FhirPathTable {...args} />
-          </MedplumProvider>
-        </MemoryRouter>
+        <MedplumProvider medplum={new MockClient()}>
+          <FhirPathTable {...args} />
+        </MedplumProvider>
       );
     });
   }
@@ -129,7 +126,7 @@ describe('FhirPathTable', () => {
   });
 
   test('Bulk button', async () => {
-    const onBulk = jest.fn();
+    const onBulk = vi.fn();
 
     await setup({
       resourceType: 'ServiceRequest',
@@ -154,8 +151,8 @@ describe('FhirPathTable', () => {
       resourceType: 'ServiceRequest',
       query,
       fields,
-      onClick: jest.fn(),
-      onAuxClick: jest.fn(),
+      onClick: vi.fn(),
+      onAuxClick: vi.fn(),
     };
 
     await setup(props);
@@ -174,8 +171,8 @@ describe('FhirPathTable', () => {
       resourceType: 'ServiceRequest',
       query,
       fields,
-      onClick: jest.fn(),
-      onAuxClick: jest.fn(),
+      onClick: vi.fn(),
+      onAuxClick: vi.fn(),
     };
 
     await setup(props);

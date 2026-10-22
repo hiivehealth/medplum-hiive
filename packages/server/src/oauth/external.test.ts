@@ -1,23 +1,25 @@
 // SPDX-FileCopyrightText: Copyright Orangebot, Inc. and Medplum contributors
 // SPDX-License-Identifier: Apache-2.0
 import type { ProfileResource, WithId } from '@medplum/core';
-import { ContentType, encodeBase64Url, getReferenceString } from '@medplum/core';
+import { encodeBase64Url, getReferenceString } from '@medplum/core';
 import type { Practitioner, Project, ProjectMembership } from '@medplum/fhirtypes';
 import { randomUUID } from 'crypto';
 import express from 'express';
-import fetch from 'node-fetch';
+import { exportJWK, generateKeyPair, SignJWT } from 'jose';
 import request from 'supertest';
+import { vi } from 'vitest';
 import { inviteUser } from '../admin/invite';
 import { initApp, shutdownApp } from '../app';
-import { loadTestConfig } from '../config/loader';
+import { getConfig, loadTestConfig } from '../config/loader';
+import type { MedplumExternalAuthConfig } from '../config/types';
 import type { SystemRepository } from '../fhir/repo';
 import { getProjectSystemRepo } from '../fhir/repo';
 import { createTestProject } from '../test.setup';
-
-jest.mock('node-fetch');
+import { mockFetchJson } from '../test.setup.fetch';
 
 // RFC 7662 - External auth
 
+const fetchMock = vi.spyOn(globalThis, 'fetch');
 describe('External auth', () => {
   const app = express();
   const npi = randomUUID();
@@ -73,7 +75,7 @@ describe('External auth', () => {
 
   test('Not a JWT', async () => {
     const res = await request(app).get(`/oauth2/userinfo`).set('Authorization', 'Bearer opaque_string');
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Missing issuer', async () => {
@@ -81,7 +83,7 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Unknown issuer', async () => {
@@ -89,7 +91,7 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Missing fhirUser and sub', async () => {
@@ -97,15 +99,158 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
+  });
+
+  test('Rejects provider without a verification URL', async () => {
+    await withExternalAuthProviders(
+      [
+        {
+          issuer: 'https://external-auth.example.com',
+          identityProvider: { issuer: 'https://external-auth.example.com' },
+        },
+      ],
+      async () => {
+        const jwt = createFakeJwt({
+          iss: 'https://external-auth.example.com',
+          sub: externalSub,
+          nonce: randomUUID(),
+        });
+        const res = await request(app)
+          .get('/oauth2/userinfo')
+          .set('Authorization', 'Bearer ' + jwt);
+        expect(res).toHaveStatus(401);
+      }
+    );
+  });
+
+  test('Project-scoped request maps an identity-less token to the issuer client', async () => {
+    const keyPair = await generateKeyPair('ES256');
+    const publicJwk = await exportJWK(keyPair.publicKey);
+    const jwksUrl = 'https://external-auth.example.com/.well-known/project-jwks.json';
+    const { client, project } = await createTestProject({
+      withClient: true,
+      client: {
+        identityProvider: {
+          issuer: 'https://external-auth.example.com',
+          jwksUrl,
+        },
+      },
+    });
+    await withExternalAuthProviders(undefined, async () => {
+      fetchMock.mockImplementationOnce(() => mockFetchJson({ keys: [publicJwk] }));
+
+      const jwt = await new SignJWT({ nonce: randomUUID() })
+        .setProtectedHeader({ alg: 'ES256' })
+        .setIssuer('https://external-auth.example.com')
+        .setSubject('external-client-subject')
+        .setIssuedAt()
+        .setExpirationTime('2h')
+        .sign(keyPair.privateKey);
+      const res = await request(app)
+        .get(`/projects/${project.id}/oauth2/userinfo`)
+        .set('Authorization', 'Bearer ' + jwt);
+
+      expect(res).toHaveStatus(200);
+      expect(res.body.sub).toBe(client.id);
+    });
+  });
+
+  test('Identity-less token cache is scoped by URL project', async () => {
+    const first = await createTestProject({
+      withClient: true,
+      client: {
+        identityProvider: {
+          issuer: 'https://external-auth.example.com',
+          userInfoUrl: 'https://external-auth.example.com/oauth2/userinfo',
+        },
+      },
+    });
+    const second = await createTestProject({
+      withClient: true,
+      client: {
+        identityProvider: {
+          issuer: 'https://external-auth.example.com',
+          userInfoUrl: 'https://external-auth.example.com/oauth2/userinfo',
+        },
+      },
+    });
+    await withExternalAuthProviders(undefined, async () => {
+      fetchMock
+        .mockImplementationOnce(() => mockFetchJson({ ok: true }))
+        .mockImplementationOnce(() => mockFetchJson({ ok: true }));
+
+      const jwt = createFakeJwt({
+        iss: 'https://external-auth.example.com',
+        nonce: randomUUID(),
+      });
+      const firstResponse = await request(app)
+        .get(`/projects/${first.project.id}/oauth2/userinfo`)
+        .set('Authorization', 'Bearer ' + jwt);
+      const secondResponse = await request(app)
+        .get(`/projects/${second.project.id}/oauth2/userinfo`)
+        .set('Authorization', 'Bearer ' + jwt);
+
+      expect(firstResponse).toHaveStatus(200);
+      expect(firstResponse.body.sub).toBe(first.client.id);
+      expect(secondResponse).toHaveStatus(200);
+      expect(secondResponse.body.sub).toBe(second.client.id);
+    });
+  });
+
+  test('Global provider resolves an identity-less token to the project client', async () => {
+    const { client, project } = await createTestProject({
+      withClient: true,
+      client: {
+        identityProvider: {
+          issuer: 'https://external-auth.example.com',
+          userInfoUrl: 'https://external-auth.example.com/oauth2/userinfo',
+        },
+      },
+    });
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
+
+    const jwt = createFakeJwt({ iss: 'https://external-auth.example.com', nonce: randomUUID() });
+    const res = await request(app)
+      .get(`/projects/${project.id}/oauth2/userinfo`)
+      .set('Authorization', 'Bearer ' + jwt);
+
+    expect(res).toHaveStatus(200);
+    expect(res.body.sub).toBe(client.id);
+  });
+
+  test('Rejects ambiguous project clients for an external issuer', async () => {
+    const { project } = await createTestProject({
+      withClient: true,
+      client: {
+        identityProvider: {
+          issuer: 'https://ambiguous.example.com',
+          userInfoUrl: 'https://ambiguous.example.com/oauth2/userinfo',
+        },
+      },
+    });
+    const projectRepo = await getProjectSystemRepo(project);
+    await projectRepo.createResource({
+      resourceType: 'ClientApplication',
+      meta: { project: project.id },
+      name: 'Duplicate external issuer',
+      identityProvider: {
+        issuer: 'https://ambiguous.example.com',
+        userInfoUrl: 'https://ambiguous.example.com/oauth2/userinfo',
+      },
+    });
+
+    await withExternalAuthProviders(undefined, async () => {
+      const jwt = createFakeJwt({ iss: 'https://ambiguous.example.com', nonce: randomUUID() });
+      const res = await request(app)
+        .get(`/projects/${project.id}/oauth2/userinfo`)
+        .set('Authorization', 'Bearer ' + jwt);
+      expect(res).toHaveStatus(401);
+    });
   });
 
   test('Remote call to userinfo fails', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 401,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: false }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: false }, { status: 401 }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -114,15 +259,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Profile not found', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -131,15 +272,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Profile without membership', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     // Create a Practitioner profile that is not a member of the project
     const p2 = await systemRepo.createResource<Practitioner>({ resourceType: 'Practitioner' });
@@ -150,15 +287,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Success by reference', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -169,21 +302,17 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     // Call it again to ensure caching works
     const res2 = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
   });
 
   test('Success by search string', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -192,15 +321,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
   });
 
   test('Success by absolute URL', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -209,15 +334,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
   });
 
   test('Success by ext.fhirUser', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -226,15 +347,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
   });
 
   test('Success by sub claim', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -245,15 +362,90 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
+  });
+
+  test('Success by JWKS verification', async () => {
+    const keyPair = await generateKeyPair('ES256');
+    const publicJwk = await exportJWK(keyPair.publicKey);
+    const jwksUrl = 'https://external-auth.example.com/.well-known/jwks.json';
+
+    await withExternalAuthProviders(
+      [
+        {
+          issuer: 'https://external-auth.example.com',
+          identityProvider: {
+            issuer: 'https://external-auth.example.com',
+            jwksUrl,
+          },
+        },
+      ],
+      async () => {
+        fetchMock.mockImplementationOnce(() => mockFetchJson({ keys: [publicJwk] }));
+
+        const jwt = await new SignJWT({
+          nonce: randomUUID(),
+        })
+          .setProtectedHeader({ alg: 'ES256' })
+          .setIssuer('https://external-auth.example.com')
+          .setSubject(externalSub)
+          .setIssuedAt()
+          .setExpirationTime('2h')
+          .sign(keyPair.privateKey);
+
+        const res = await request(app)
+          .get(`/oauth2/userinfo`)
+          .set('Authorization', 'Bearer ' + jwt);
+        expect(res.status).toBe(200);
+        expect(fetchMock).toHaveBeenCalledWith(jwksUrl, expect.anything());
+      }
+    );
+  });
+
+  test('JWKS verification enforces configured audience', async () => {
+    const keyPair = await generateKeyPair('ES256');
+    const publicJwk = await exportJWK(keyPair.publicKey);
+    const jwksUrl = 'https://external-auth.example.com/.well-known/audience-jwks.json';
+
+    await withExternalAuthProviders(
+      [
+        {
+          issuer: 'https://external-auth.example.com',
+          identityProvider: {
+            issuer: 'https://external-auth.example.com',
+            audience: 'medplum-client',
+            jwksUrl,
+          },
+        },
+      ],
+      async () => {
+        fetchMock.mockImplementation(() => mockFetchJson({ keys: [publicJwk] }));
+
+        const createJwt = (audience: string): Promise<string> =>
+          new SignJWT({ nonce: randomUUID() })
+            .setProtectedHeader({ alg: 'ES256' })
+            .setIssuer('https://external-auth.example.com')
+            .setAudience(audience)
+            .setSubject(externalSub)
+            .setIssuedAt()
+            .setExpirationTime('2h')
+            .sign(keyPair.privateKey);
+
+        const rejected = await request(app)
+          .get('/oauth2/userinfo')
+          .set('Authorization', 'Bearer ' + (await createJwt('other-client')));
+        expect(rejected).toHaveStatus(401);
+
+        const accepted = await request(app)
+          .get('/oauth2/userinfo')
+          .set('Authorization', 'Bearer ' + (await createJwt('medplum-client')));
+        expect(accepted).toHaveStatus(200);
+      }
+    );
   });
 
   test('Sub claim with caching', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -262,21 +454,17 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
 
     // Call again - should use cache (no second fetch mock needed)
     const res2 = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res2.status).toBe(200);
+    expect(res2).toHaveStatus(200);
   });
 
   test('Sub claim with unknown externalId', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -285,15 +473,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Sub claim with remote userinfo failure', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 401,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: false }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: false }, { status: 401 }));
 
     // Use a unique nonce to avoid cache hits from prior tests
     const jwt = createFakeJwt({
@@ -304,15 +488,11 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('fhirUser takes precedence over sub', async () => {
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     // JWT has both fhirUser and sub; fhirUser should be used
     // Use a unique nonce to avoid cache hits from prior tests
@@ -325,7 +505,7 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(200);
+    expect(res).toHaveStatus(200);
   });
 
   test('Sub claim with inactive membership', async () => {
@@ -342,11 +522,7 @@ describe('External auth', () => {
       active: false,
     });
 
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -355,7 +531,7 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 
   test('Sub claim with duplicate externalId returns 401', async () => {
@@ -378,11 +554,7 @@ describe('External auth', () => {
       externalId: duplicateSub,
     });
 
-    (fetch as unknown as jest.Mock).mockImplementationOnce(() => ({
-      status: 200,
-      headers: { get: () => ContentType.JSON },
-      json: () => ({ ok: true }),
-    }));
+    fetchMock.mockImplementationOnce(() => mockFetchJson({ ok: true }));
 
     const jwt = createFakeJwt({
       iss: 'https://external-auth.example.com',
@@ -391,10 +563,24 @@ describe('External auth', () => {
     const res = await request(app)
       .get(`/oauth2/userinfo`)
       .set('Authorization', 'Bearer ' + jwt);
-    expect(res.status).toBe(401);
+    expect(res).toHaveStatus(401);
   });
 });
 
 function createFakeJwt(claims: Record<string, unknown>): string {
   return `header.${encodeBase64Url(JSON.stringify(claims))}.signature`;
+}
+
+async function withExternalAuthProviders(
+  externalAuthProviders: MedplumExternalAuthConfig[] | undefined,
+  fn: () => Promise<void>
+): Promise<void> {
+  const savedExternalAuthProviders = getConfig().externalAuthProviders;
+  getConfig().externalAuthProviders = externalAuthProviders;
+
+  try {
+    await fn();
+  } finally {
+    getConfig().externalAuthProviders = savedExternalAuthProviders;
+  }
 }

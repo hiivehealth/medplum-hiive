@@ -2,18 +2,22 @@
 // SPDX-License-Identifier: Apache-2.0
 import type { BackgroundJobContext, WithId } from '@medplum/core';
 import type { Resource } from '@medplum/fhirtypes';
-import type { MedplumServerConfig, WorkerName } from '../config/types';
+import type { WorkerName } from '../config/types';
+import type { ServerConfig } from '../config/utils';
 import { getLogger, globalLogger } from '../logger';
 import { initBatchWorker } from './batch';
+import { initBulkExportWorker } from './bulk-export';
 import { initCronWorker } from './cron';
+import { initDicomWorker } from './dicom';
 import { addDispatchJobs, initDispatchWorker } from './dispatch';
 import { initDownloadWorker } from './download';
+import { initLambdaCleanerWorker } from './lambda-cleaner';
 import { initPostDeployMigrationWorker } from './post-deploy-migration';
 import { initReindexWorker } from './reindex';
 import { initSetAccountsWorker } from './set-accounts';
 import { initSubscriptionWorker } from './subscription';
 import type { WorkerInitializer } from './utils';
-import { queueRegistry } from './utils';
+import { applyGlobalConcurrency, getMedplumBullmqConfig, queueRegistry } from './utils';
 
 const workerDefs: { name: WorkerName; init: WorkerInitializer }[] = [
   { name: 'dispatch', init: initDispatchWorker },
@@ -22,15 +26,18 @@ const workerDefs: { name: WorkerName; init: WorkerInitializer }[] = [
   { name: 'cron', init: initCronWorker },
   { name: 'reindex', init: initReindexWorker },
   { name: 'batch', init: initBatchWorker },
+  { name: 'bulk-export', init: initBulkExportWorker },
   { name: 'post-deploy-migration', init: initPostDeployMigrationWorker },
   { name: 'set-accounts', init: initSetAccountsWorker },
+  { name: 'lambda-cleaner', init: initLambdaCleanerWorker },
+  { name: 'dicom', init: initDicomWorker },
 ];
 
 /**
  * Initializes all background workers.
  * @param config - The config to initialize the workers with. Should contain `redis` and optionally `bullmq` fields.
  */
-export function initWorkers(config: MedplumServerConfig): void {
+export async function initWorkers(config: ServerConfig): Promise<void> {
   globalLogger.debug('Initializing workers...');
   const enabledWorkers = config.workers?.enabled;
   const enableAll = config.workers?.enabled?.includes('*');
@@ -38,7 +45,13 @@ export function initWorkers(config: MedplumServerConfig): void {
   for (const { name, init } of workerDefs) {
     const workerEnabled = enableAll || enabledWorkers === undefined || enabledWorkers.includes(name);
     const { name: queueName, queue, worker } = init(config, { workerEnabled });
-    queueRegistry.add(queueName, queue, worker);
+    // a queue can be disabled, in which case, don't register it
+    if (queue) {
+      queueRegistry.add(queueName, queue, worker);
+      // Fail startup if the global concurrency limit cannot be applied: it is unsafe to run the
+      // workers without it configured correctly.
+      await applyGlobalConcurrency(queue, getMedplumBullmqConfig(config, name));
+    }
   }
   globalLogger.debug('Workers initialized');
 }
@@ -47,7 +60,7 @@ export function initWorkers(config: MedplumServerConfig): void {
  * Shuts down all background workers.
  */
 export async function closeWorkers(): Promise<void> {
-  await Promise.all(queueRegistry.closeAll());
+  await queueRegistry.closeAll();
 }
 
 /**

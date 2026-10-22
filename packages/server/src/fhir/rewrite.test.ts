@@ -7,14 +7,16 @@ import { randomUUID } from 'crypto';
 import { URL } from 'url';
 import { initAppServices, shutdownApp } from '../app';
 import { loadTestConfig } from '../config/loader';
-import type { MedplumServerConfig } from '../config/types';
+import type { ServerConfig } from '../config/utils';
 import { withTestContext } from '../test.setup';
-import { Repository, getGlobalSystemRepo } from './repo';
+import { Repository, getShardSystemRepo } from './repo';
 import { RewriteMode, rewriteAttachments } from './rewrite';
+import { PLACEHOLDER_SHARD_ID } from './sharding';
 
 describe('URL rewrite', () => {
-  const systemRepo = getGlobalSystemRepo();
-  let config: MedplumServerConfig;
+  const shardId = PLACEHOLDER_SHARD_ID;
+  const systemRepo = getShardSystemRepo(shardId);
+  let config: ServerConfig;
   let binary: WithId<Binary>;
 
   beforeAll(async () => {
@@ -58,6 +60,50 @@ describe('URL rewrite', () => {
 
     const output = await rewriteAttachments(RewriteMode.PRESIGNED_URL, systemRepo, input);
     expect(output).toMatchObject(input);
+  });
+
+  test('Returns input unchanged when there are no attachments', async () => {
+    const patient: Patient = {
+      resourceType: 'Patient',
+      name: [{ given: ['Alice'], family: 'Smith' }],
+      extension: [{ url: 'http://hl7.org/fhir/us/core/StructureDefinition/us-core-birthsex', valueCode: 'F' }],
+    };
+
+    const result = await rewriteAttachments(RewriteMode.PRESIGNED_URL, systemRepo, patient);
+    expect(result).toBe(patient);
+  });
+
+  test('Does not mutate the input when rewriting', async () => {
+    const url = `Binary/${binary.id}`;
+    const practitioner: Practitioner = {
+      resourceType: 'Practitioner',
+      photo: [{ contentType: 'image/jpeg', url }],
+    };
+
+    const result = await rewriteAttachments(RewriteMode.PRESIGNED_URL, systemRepo, practitioner);
+    expect(result).not.toBe(practitioner);
+    expect(result.photo?.[0].url).not.toBe(url);
+    expect(practitioner.photo?.[0].url).toBe(url);
+  });
+
+  test('Finds attachments nested below a non-binary url property', async () => {
+    const bundle: Bundle = {
+      resourceType: 'Bundle',
+      type: 'searchset',
+      entry: [
+        {
+          resource: {
+            resourceType: 'Practitioner',
+            extension: [{ url: 'http://example.com/not-a-binary' }],
+            photo: [{ contentType: 'image/jpeg', url: `Binary/${binary.id}` }],
+          },
+        },
+      ],
+    };
+
+    const result = await rewriteAttachments(RewriteMode.PRESIGNED_URL, systemRepo, bundle);
+    const photo = (result.entry?.[0].resource as Practitioner).photo?.[0];
+    expect(photo?.url).toContain('Signature');
   });
 
   test('Other URL', async () => {
@@ -265,6 +311,7 @@ describe('URL rewrite', () => {
     // Repo1: Can read both Binary and Patient
     // This should successfully rewrite the binary to a presigned URL
     const repo1 = new Repository({
+      routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
       author: createReference(patient),
       accessPolicy: {
         resourceType: 'AccessPolicy',
@@ -278,6 +325,7 @@ describe('URL rewrite', () => {
     // Repo2: Can only read Binary, not Patient
     // This should not rewrite the binary to a presigned URL
     const repo2 = new Repository({
+      routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
       author: createReference(patient),
       accessPolicy: {
         resourceType: 'AccessPolicy',
@@ -291,6 +339,7 @@ describe('URL rewrite', () => {
     // Repo3: AccessPolicy limits to specific Patient
     // This should successfully rewrite the binary to a presigned URL
     const repo3 = new Repository({
+      routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
       author: createReference(patient),
       accessPolicy: {
         resourceType: 'AccessPolicy',
@@ -304,6 +353,7 @@ describe('URL rewrite', () => {
     // Repo3: AccessPolicy limits to different Patient
     // This should not rewrite the binary to a presigned URL
     const repo4 = new Repository({
+      routing: { kind: 'project-shard', shardId: PLACEHOLDER_SHARD_ID },
       author: createReference(patient),
       accessPolicy: {
         resourceType: 'AccessPolicy',

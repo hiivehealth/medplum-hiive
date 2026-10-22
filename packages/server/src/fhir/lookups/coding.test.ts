@@ -5,10 +5,10 @@ import { initAppServices, shutdownApp } from '../../app';
 import { loadTestConfig } from '../../config/loader';
 import { DatabaseMode, getDatabasePool } from '../../database';
 import { withTestContext } from '../../test.setup';
-import { getGlobalSystemRepo } from '../repo';
+import { getTestProjectSystemRepo } from '../repository/test-utils';
 
 describe('Coding lookup table', () => {
-  const systemRepo = getGlobalSystemRepo();
+  const systemRepo = getTestProjectSystemRepo();
 
   beforeAll(async () => {
     const config = await loadTestConfig();
@@ -35,9 +35,9 @@ describe('Coding lookup table', () => {
 
       const systemResource = await systemRepo.createResource(codeSystem);
 
-      const db = getDatabasePool(DatabaseMode.READER);
+      const db = getDatabasePool(DatabaseMode.READER, systemRepo.shardId);
       const results = await db.query('SELECT id, code, display FROM "Coding" WHERE system = $1', [systemResource.id]);
-      expect(results.rows.map((r) => `${r.code} (${r.display})`).sort()).toStrictEqual([
+      expect(results.rows.map((r) => `${r.code} (${r.display})`)).toContainExactly([
         'AB (Ambulance)',
         'CD (Cardiology)',
         'E (Emergency)',
@@ -54,7 +54,7 @@ describe('Coding lookup table', () => {
       expect(properties.rows[0].target).toStrictEqual(targetId);
     }));
 
-  test('Omits codings from incomplete CodeSystem resource', () =>
+  test('Indexes codings from fragment CodeSystem resource', () =>
     withTestContext(async () => {
       const codeSystem: CodeSystem = {
         resourceType: 'CodeSystem',
@@ -70,8 +70,13 @@ describe('Coding lookup table', () => {
 
       const systemResource = await systemRepo.createResource(codeSystem);
 
-      const db = getDatabasePool(DatabaseMode.READER);
+      const db = getDatabasePool(DatabaseMode.READER, systemRepo.shardId);
       const results = await db.query('SELECT code, display FROM "Coding" WHERE system = $1', [systemResource.id]);
-      expect(results.rowCount).toStrictEqual(0);
+      expect(results.rows.map((r) => `${r.code} (${r.display})`)).toContainExactly([
+        'AB (Ambulance)',
+        'CD (Cardiology)',
+        'E (Emergency)',
+        'F (Fibrillation)',
+      ]);
     }));
 });

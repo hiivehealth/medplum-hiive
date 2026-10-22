@@ -6,7 +6,6 @@ import { allOk } from '@medplum/core';
 import type { Patient } from '@medplum/fhirtypes';
 import { MockClient } from '@medplum/mock';
 import { MedplumProvider } from '@medplum/react-hooks';
-import { MemoryRouter } from 'react-router';
 import { act, fireEvent, render, screen } from '../test-utils/render';
 import { PatientAccountsForm } from './PatientAccountsForm';
 
@@ -27,7 +26,7 @@ const testPatientNoAccounts: Patient = {
 
 function createAdminMockClient(): MockClient {
   const medplum = new MockClient();
-  jest.spyOn(medplum, 'isProjectAdmin').mockReturnValue(true);
+  vi.spyOn(medplum, 'isProjectAdmin').mockReturnValue(true);
   medplum.router.add('POST', '/Patient/:id/$set-accounts', async () => [
     allOk,
     {
@@ -44,14 +43,12 @@ describe('PatientAccountsForm', () => {
 
     await act(async () => {
       render(
-        <MemoryRouter>
-          <MantineProvider>
-            <Notifications />
-            <MedplumProvider medplum={client}>
-              <PatientAccountsForm patient={patient} />
-            </MedplumProvider>
-          </MantineProvider>
-        </MemoryRouter>
+        <MantineProvider>
+          <Notifications />
+          <MedplumProvider medplum={client}>
+            <PatientAccountsForm patient={patient} />
+          </MedplumProvider>
+        </MantineProvider>
       );
     });
     return client;
@@ -59,8 +56,8 @@ describe('PatientAccountsForm', () => {
 
   test('Renders non-admin message when user is not admin', async () => {
     const medplum = new MockClient();
-    jest.spyOn(medplum, 'isProjectAdmin').mockReturnValue(false);
-    jest.spyOn(medplum, 'isSuperAdmin').mockReturnValue(false);
+    vi.spyOn(medplum, 'isProjectAdmin').mockReturnValue(false);
+    vi.spyOn(medplum, 'isSuperAdmin').mockReturnValue(false);
     await setup(testPatientWithAccounts, medplum);
 
     expect(screen.getByText('Admin access required')).toBeInTheDocument();
@@ -180,7 +177,7 @@ describe('PatientAccountsForm', () => {
 
   test('Confirm triggers $set-accounts call', async () => {
     const medplum = createAdminMockClient();
-    const postSpy = jest.spyOn(medplum, 'post');
+    const postSpy = vi.spyOn(medplum, 'post');
     await setup(testPatientWithAccounts, medplum);
 
     // Remove an account
@@ -216,7 +213,7 @@ describe('PatientAccountsForm', () => {
 
   test('Confirm without propagate does not send async header', async () => {
     const medplum = createAdminMockClient();
-    const postSpy = jest.spyOn(medplum, 'post');
+    const postSpy = vi.spyOn(medplum, 'post');
     await setup(testPatientWithAccounts, medplum);
 
     // Remove an account

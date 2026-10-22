@@ -13,15 +13,21 @@ This is a living document, and we continually update our resources. We welcome f
 ## Compliance Resources
 
 - [ONC Certification](/docs/compliance/onc)
+- [HITRUST e1 Certification](/docs/compliance/hitrust)
 - [CLIA/CAP](/docs/compliance/clia-cap)
 - [SOC2 Type II](/docs/compliance/soc2)
 - [HIPAA compliance](/docs/compliance/hipaa)
 - [CFR Part 11](/docs/compliance/cfr11)
 - [ISO 9001](/docs/compliance/iso9001)
-- [HTI-4/CMS-0057-F](/docs/compliance/hti-4)
+- [HTI-4](/docs/compliance/hti-4)
+- [CMS-0057-F and Drummond FHIRplace Validation](/docs/compliance/cms-0057-f)
 - [Good Manufacturing Practices (GMP)](/docs/compliance/gmp)
-- [HITRUST](/docs/compliance/hitrust)
 - ISO 27001 Certification (coming soon)
+
+## Platform Controls
+
+- [High Availability, Backup, and Retention](/docs/compliance/backup-and-recovery)
+- [Uptime, Availability, and SLAs](/docs/uptime)
 
 ## Materials and Usage
 
@@ -33,6 +39,5 @@ The materials in this section can be used in multiple contexts, and depend on yo
 
 ## Reference
 
-- [Medplum's Trust Center on Vanta](https://app.vanta.com/medplum.com/trust/ybe9my9rkc6ok8yijm04h)
-- [Medplum Compliance](https://github.com/orgs/medplum/projects/17) on Github
+- [Medplum's Trust Center on Vanta](https://trust.medplum.com)
 - [Medplum Audit and Logging](https://github.com/medplum/medplum/pulls?q=is%3Apr+label%3Aaudit-logging) on Github

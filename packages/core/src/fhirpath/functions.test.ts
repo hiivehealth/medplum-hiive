@@ -5,7 +5,7 @@ import type { Atom, AtomContext } from '../fhirlexer/parse';
 import type { TypedValue } from '../types';
 import { PropertyType } from '../types';
 import { createReference, getReferenceString } from '../utils';
-import { LiteralAtom } from './atoms';
+import { LiteralAtom, SymbolAtom } from './atoms';
 import type { FhirPathFunction } from './functions';
 import { functions } from './functions';
 import { booleanToTypedValue, toTypedValue } from './utils';
@@ -732,9 +732,31 @@ describe('FHIRPath functions', () => {
   });
 
   test('as', () => {
-    expect(functions.as(context, [toTypedValue({ resourceType: 'Patient', id: '123' })])).toStrictEqual([
+    const typeAtom = new SymbolAtom('Patient');
+    expect(functions.as(context, [toTypedValue({ resourceType: 'Patient', id: '123' })], typeAtom)).toStrictEqual([
       toTypedValue({ resourceType: 'Patient', id: '123' }),
     ]);
+  });
+
+  // SQL-on-FHIR utilities
+
+  test('getResourceKey', () => {
+    expect(functions.getResourceKey(context, [toTypedValue({ resourceType: 'Patient', id: '123' })])).toStrictEqual([
+      { type: PropertyType.id, value: '123' },
+    ]);
+    expect(functions.getResourceKey(context, [])).toStrictEqual([]);
+  });
+
+  test('getReferenceKey', () => {
+    const reference = toTypedValue({ reference: 'Patient/123' });
+    expect(functions.getReferenceKey(context, [reference], undefined as unknown as Atom)).toStrictEqual([
+      { type: PropertyType.id, value: '123' },
+    ]);
+    expect(functions.getReferenceKey(context, [reference], new SymbolAtom('Patient'))).toStrictEqual([
+      { type: PropertyType.id, value: '123' },
+    ]);
+    expect(functions.getReferenceKey(context, [reference], new SymbolAtom('Observation'))).toStrictEqual([]);
+    expect(functions.getReferenceKey(context, [], undefined as unknown as Atom)).toStrictEqual([]);
   });
 
   // 12. Formal Specifications
